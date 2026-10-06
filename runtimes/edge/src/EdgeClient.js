@@ -1,5 +1,6 @@
 'use strict';
 
+import { createTlsTransport, resolveTls } from '@augmentd-labs/canvas-api-client/tls';
 import { io } from 'socket.io-client';
 
 const CHUNK_SIZE = 256 * 1024;
@@ -15,6 +16,7 @@ const CHUNK_SIZE = 256 * 1024;
  * See docs/canvas-edge-protocol.md for the frame protocol.
  */
 export default class EdgeClient {
+    #transport;
     #serverUrl;
     #token;
     #localApp;
@@ -23,10 +25,11 @@ export default class EdgeClient {
     #announced = false;
     #forwarded = [];
 
-    constructor({ serverUrl, token, localApp, announce }) {
+    constructor({ serverUrl, token, localApp, announce, tls }) {
         if (!serverUrl || !token || !localApp?.inject || !announce?.instanceId) {
             throw new Error('EdgeClient requires serverUrl, token, localApp (fastify) and announce.instanceId');
         }
+        this.#transport = createTlsTransport(serverUrl, resolveTls(tls));
         this.#serverUrl = serverUrl.replace(/\/+$/, '');
         this.#token = token;
         this.#localApp = localApp;
@@ -38,17 +41,20 @@ export default class EdgeClient {
    * existing device registration endpoint. Persist the result locally and
    * never touch the user token again.
    */
-    static async pair({ serverUrl, userToken, name, type = 'edge', ...deviceInfo }) {
-        const res = await fetch(`${serverUrl.replace(/\/+$/, '')}/rest/v2/auth/devices/register`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` },
-            body: JSON.stringify({ name, type, ...deviceInfo }),
-        });
-        const json = await res.json().catch(() => null);
-        if (!res.ok || !json?.payload?.token) {
-            throw new Error(`Edge pairing failed: ${json?.message || res.statusText}`);
-        }
-        return { token: json.payload.token, deviceId: json.payload.deviceId || json.payload.id };
+    static async pair({ serverUrl, userToken, name, type = 'edge', tls, ...deviceInfo }) {
+        const transport = createTlsTransport(serverUrl, resolveTls(tls));
+        try {
+            const res = await transport.fetch(`${serverUrl.replace(/\/+$/, '')}/rest/v2/auth/devices/register`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` },
+                body: JSON.stringify({ name, type, ...deviceInfo }),
+            });
+            const json = await res.json().catch(() => null);
+            if (!res.ok || !json?.payload?.token) {
+                throw new Error(`Edge pairing failed: ${json?.message || res.statusText}`);
+            }
+            return { token: json.payload.token, deviceId: json.payload.deviceId || json.payload.id };
+        } finally { await transport.dispose(); }
     }
 
     get connected() {
@@ -58,8 +64,9 @@ export default class EdgeClient {
     connect() {
         if (this.#socket) return this;
         this.#socket = io(this.#serverUrl, {
+            ...this.#transport.socketOptions,
             auth: { token: this.#token },
-            transports: ['websocket'],
+            transports: this.#transport.socketOptions.transports || ['websocket'],
         });
         // Announce on every (re)connect — announce is idempotent full state.
         this.#socket.on('connect', () => this.#socket.emit('edge:announce', this.#announce));
@@ -121,6 +128,7 @@ export default class EdgeClient {
     }
 
     close() {
+        void this.#transport.dispose().catch(() => {});
         for (const [emitter, listener] of this.#forwarded) emitter.off('**', listener);
         this.#forwarded = [];
         this.#socket?.disconnect();

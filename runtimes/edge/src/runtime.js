@@ -45,6 +45,7 @@ export function connectRemotes({ dir, localApp, events, clientFactory } = {}) {
             const client = createClient({
                 serverUrl: remote.url,
                 token: remote.token,
+                tls: remote.tls,
                 localApp,
                 announce,
             });

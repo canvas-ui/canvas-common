@@ -1,6 +1,6 @@
 {
     "name": "@augmentd-labs/canvas-api-client",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": "Fetch-based Canvas REST client over @augmentd-labs/canvas-protocol",
     "license": "AGPL-3.0-or-later",
     "type": "module",
@@ -8,6 +8,10 @@
         ".": {
             "types": "./types/index.d.ts",
             "default": "./src/index.js"
+        },
+        "./tls": {
+            "types": "./types/tls.d.ts",
+            "default": "./src/tls.js"
         }
     },
     "files": [
@@ -21,11 +25,17 @@
         "node": ">=20"
     },
     "dependencies": {
-        "@augmentd-labs/canvas-protocol": "workspace:*"
+        "@augmentd-labs/canvas-protocol": "workspace:*",
+        "undici": "^6.21.3",
+        "engine.io-client": "^6.6.6"
     },
     "repository": {
         "type": "git",
         "url": "git+https://github.com/canvas-ui/canvas-common.git",
         "directory": "packages/api-client"
+    },
+    "devDependencies": {
+        "socket.io": "^4.8.3",
+        "socket.io-client": "^4.8.3"
     }
 }

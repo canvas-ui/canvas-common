@@ -1,5 +1,6 @@
 'use strict';
 
+import { resolveTls } from '@augmentd-labs/canvas-api-client/tls';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -81,7 +82,7 @@ export function ensureEnvConfig(env = process.env) {
     const prior = remotes[hubId] || {};
     // A device token minted for this remote stays authoritative; env only
     // seeds the user/API token it started from.
-    remotes[hubId] = { ...prior, url, apiBase: prior.apiBase || '/rest/v2', auth: { ...(prior.auth || {}), token }, source: 'env' };
+    remotes[hubId] = { ...prior, url, apiBase: prior.apiBase || '/rest/v2', auth: { ...(prior.auth || {}), token }, source: 'env', ...(resolveTls(prior.url && new URL(prior.url).origin !== new URL(url).origin ? undefined : prior.tls, env) ? { tls: resolveTls(prior.url && new URL(prior.url).origin !== new URL(url).origin ? undefined : prior.tls, env) } : { tls: undefined }) };
     writeJson(EDGE_PATHS.remotes, remotes);
 
     const cfg = readJson(EDGE_PATHS.mirrors, { version: 1, mirrors: [] }) || { version: 1, mirrors: [] };
@@ -142,7 +143,7 @@ export async function ensureDeviceToken(remoteId, { logger = null } = {}) {
     if (!r?.url || r.source !== 'env' || r.device?.token || !r.auth?.token) return hubFor(remoteId);
     const identity = deviceIdentity(null);
     const paired = await EdgeClient.pair({
-        serverUrl: r.url, userToken: r.auth.token, name: identity.deviceName, type: 'edge',
+        serverUrl: r.url, tls: resolveTls(r.tls), userToken: r.auth.token, name: identity.deviceName, type: 'edge',
         deviceId: identity.deviceId, hostname: os.hostname(), platform: process.platform, arch: process.arch,
     });
     remotes[remoteId] = { ...r, device: { deviceId: paired.deviceId || identity.deviceId, token: paired.token, registeredAt: new Date().toISOString() } };
@@ -161,6 +162,7 @@ export function hubFor(remoteId) {
     return {
         id: remoteId,
         url: String(r.url).replace(/\/+$/, ''),
+        tls: resolveTls(r.tls),
         apiBase: r.apiBase || '/rest/v2',
         token,
         deviceId: deviceToken && r.device?.deviceId ? String(r.device.deviceId) : null,

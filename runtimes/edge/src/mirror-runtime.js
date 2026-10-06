@@ -1,5 +1,6 @@
 'use strict';
 
+import { createTlsTransport } from '@augmentd-labs/canvas-api-client/tls';
 import fs from 'fs';
 import path from 'path';
 import { io } from 'socket.io-client';
@@ -29,6 +30,7 @@ const STATUS_HEARTBEAT_MS = 60000;
  * ledger as `full` so a hub that lost its replica table rebuilds it.
  */
 export class MirrorRuntime {
+    #transport;
     #mirror;
     #hub;
     #identity;
@@ -45,6 +47,7 @@ export class MirrorRuntime {
     constructor({ mirror, hub, identity, logger }) {
         this.#mirror = mirror;
         this.#hub = hub;
+        this.#transport = createTlsTransport(hub.url, hub.tls);
         this.#identity = identity;
         this.#logger = logger;
     }
@@ -87,6 +90,7 @@ export class MirrorRuntime {
         this.#stored.addBackend('trash', { driver: 'file', root: path.join(internal, 'trash'), watch: false });
         this.#stored.addBackend('conflicts', { driver: 'file', root: path.join(internal, 'conflicts'), watch: false });
         this.#stored.addBackend('canvas:hub', {
+            fetch: this.#transport.fetch,
             driver: 'canvas', url: this.#hub.url, apiBase: this.#hub.apiBase, token: this.#hub.token,
             workspaceId: this.#mirror.workspaceId || this.#mirror.workspaceName, backend: 'workspace:home',
             deviceId: this.#identity.deviceId, deviceName: this.#identity.deviceName, prefixes: this.#mirror.pins || [], pollInterval: 30000,
@@ -113,6 +117,7 @@ export class MirrorRuntime {
     }
 
     async stop() {
+        // Close pooled TLS connections after stopping mirror activity below.
         clearInterval(this.#reporter);
         clearTimeout(this.#reportTimer);
         this.#socket?.close();
@@ -121,6 +126,7 @@ export class MirrorRuntime {
         await this.#stored?.stop().catch(() => {});
         this.#engine = null;
         this.#stored = null;
+        await this.#transport.dispose();
     }
 
     status() {
@@ -133,7 +139,7 @@ export class MirrorRuntime {
 
     async #fetchHubExclusions() {
         try {
-            const res = await fetch(`${this.#hub.url}${this.#hub.apiBase}/workspaces/${encodeURIComponent(this.#mirror.workspaceName)}/backends/file/workspace%3Ahome`, {
+            const res = await this.#transport.fetch(`${this.#hub.url}${this.#hub.apiBase}/workspaces/${encodeURIComponent(this.#mirror.workspaceName)}/backends/file/workspace%3Ahome`, {
                 headers: { authorization: `Bearer ${this.#hub.token}` },
             });
             const json = await res.json();
@@ -147,7 +153,7 @@ export class MirrorRuntime {
     async #resolveWorkspaceId() {
         if (this.#mirror.workspaceId && /^[0-9a-f-]{36}$/i.test(this.#mirror.workspaceId)) return this.#mirror.workspaceId;
         try {
-            const res = await fetch(`${this.#hub.url}${this.#hub.apiBase}/workspaces/${encodeURIComponent(this.#mirror.workspaceName)}`, { headers: { authorization: `Bearer ${this.#hub.token}` } });
+            const res = await this.#transport.fetch(`${this.#hub.url}${this.#hub.apiBase}/workspaces/${encodeURIComponent(this.#mirror.workspaceName)}`, { headers: { authorization: `Bearer ${this.#hub.token}` } });
             const json = await res.json();
             return json?.payload?.workspace?.id || json?.payload?.id || this.#mirror.workspaceId || this.#mirror.workspaceName;
         } catch { return this.#mirror.workspaceId || this.#mirror.workspaceName; }
@@ -156,7 +162,7 @@ export class MirrorRuntime {
     async #connectSocket() {
         try {
             const wsId = await this.#resolveWorkspaceId();
-            const socket = io(this.#hub.url, { auth: { token: this.#hub.token }, transports: ['websocket'], reconnection: true, reconnectionDelay: 1000, reconnectionDelayMax: 30000 });
+            const socket = io(this.#hub.url, { ...this.#transport.socketOptions, auth: { token: this.#hub.token }, transports: this.#transport.socketOptions.transports || ['websocket'], reconnection: true, reconnectionDelay: 1000, reconnectionDelayMax: 30000 });
             this.#socket = socket;
             socket.on('connect', () => { socket.emit('subscribe', { channel: `workspace:${wsId}` }); this.resync().catch(() => {}); });
             socket.on('backend.changed', (e) => { if (!e?.backend || e.backend === 'workspace:home') this.nudge(); });
@@ -188,7 +194,7 @@ export class MirrorRuntime {
         this.#pendingApplied = full ? [] : mergePairs(this.#pendingApplied, delta);
         const applied = full ? (typeof engine.appliedSnapshot === 'function' ? engine.appliedSnapshot() : []) : this.#pendingApplied;
         try {
-            const res = await fetch(`${this.#hub.url}${this.#hub.apiBase}/workspaces/${ws}/mirrors/${encodeURIComponent(this.#identity.deviceId)}/status`, {
+            const res = await this.#transport.fetch(`${this.#hub.url}${this.#hub.apiBase}/workspaces/${ws}/mirrors/${encodeURIComponent(this.#identity.deviceId)}/status`, {
                 method: 'POST',
                 headers: { authorization: `Bearer ${this.#hub.token}`, 'content-type': 'application/json' },
                 body: JSON.stringify({

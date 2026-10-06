@@ -75,3 +75,12 @@ mirrors.json). `CANVAS_DIRECTION=pull` makes the container a backup target
 
 Protocol: canvas-server `docs/canvas-edge-protocol.md` (tunnel) and
 `docs/sync-protocol.md` (file plane).
+
+### Client certificates (0.5.0+)
+
+Hub remotes retain `tls: { certFile, keyFile }` from the shared client config.
+Workspace remotes can carry the same optional fields. Pairing, tunnel sockets,
+mirror status calls, and object transfers all use the identity. Container bootstrap
+accepts `CANVAS_TLS_CERT`/`CANVAS_TLS_KEY` as a complete pair of file paths; mount
+these files read-only. Use leaf-first PEM chains and protected unencrypted RSA/EC
+keys. Server verification is enabled. Restart the daemon/container after renewal.

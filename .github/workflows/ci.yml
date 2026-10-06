@@ -16,9 +16,11 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - uses: oven-sh/setup-bun@v2
+      - run: sudo apt-get update && sudo apt-get install -y nginx openssl
       - run: pnpm install --frozen-lockfile
       - run: pnpm run lint
-      - run: pnpm run test
+      - run: CANVAS_TEST_BUN=$(command -v bun) pnpm run test
       # Every npm package must stage as a self-contained package on every PR
       # (registry mode, exactly what release.yml publishes), so a broken
       # package fails review, not the publish.

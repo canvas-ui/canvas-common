@@ -1,5 +1,6 @@
 'use strict';
 
+import { normalizeTls } from '@augmentd-labs/canvas-api-client/tls';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -35,11 +36,12 @@ export function listRemotes(config = {}) {
             url: remote.url.replace(/\/+$/, ''),
             token: remote.token,
             enabled: remote.enabled !== false,
+            ...(remote.tls ? { tls: normalizeTls(remote.tls) } : {}),
         }));
 }
 
 /** Add or update (matched by url) a remote entry, persisting workspace.json. */
-export function saveRemote(dir, { url, token, enabled = true }) {
+export function saveRemote(dir, { url, token, enabled = true, tls }) {
     if (!url || !token) throw new Error('remote requires url and token');
     const file = workspaceConfigPath(dir);
     const config = readWorkspaceConfig(dir);
@@ -50,8 +52,9 @@ export function saveRemote(dir, { url, token, enabled = true }) {
         existing.url = normalizedUrl;
         existing.token = token;
         existing.enabled = enabled;
+        if (tls !== undefined) existing.tls = normalizeTls(tls);
     } else {
-        remotes.push({ url: normalizedUrl, token, enabled });
+        remotes.push({ url: normalizedUrl, token, enabled, ...(tls ? { tls: normalizeTls(tls) } : {}) });
     }
     config.remotes = remotes;
     fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
