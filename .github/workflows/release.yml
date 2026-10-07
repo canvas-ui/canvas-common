@@ -1,7 +1,7 @@
 name: release
 
 # Publishes the shared packages (protocol, schemas, wallpapers, api-client,
-# edge, runtime-core, workspaced) to npm under @augmentd-labs — every version npm does not
+# edge, agent) to npm under @augmentd-labs — every version npm does not
 # have yet (scripts/publish-npm.mjs), so an unbumped push publishes nothing.
 # Release = bump the package version and push main.
 #
@@ -18,6 +18,10 @@ on:
       - 'runtimes/**'
       - 'scripts/pack-dist.mjs'
       - 'scripts/publish-npm.mjs'
+      - 'scripts/public-packages.mjs'
+      - 'scripts/check-public-package.mjs'
+      - 'scripts/install-public.mjs'
+      - 'package.json'
       - 'pnpm-lock.yaml'
       - '.github/workflows/release.yml'
   workflow_dispatch:
@@ -33,6 +37,9 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .public-workspace
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -42,6 +49,9 @@ jobs:
           registry-url: https://registry.npmjs.org
       # Trusted publishing needs npm >= 11.5.1; node 22 ships npm 10.
       - run: npm install -g npm@latest
+        working-directory: .
       # pack-dist bundles edge's git dep (canvas-stored) from node_modules.
-      - run: pnpm install --frozen-lockfile
+      - run: node scripts/install-public.mjs
+        working-directory: .
+      - run: node --test scripts/tests/*.test.mjs
       - run: node scripts/publish-npm.mjs

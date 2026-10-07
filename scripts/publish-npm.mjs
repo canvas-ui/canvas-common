@@ -19,8 +19,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stage } from './pack-dist.mjs';
+import { PUBLIC_PACKAGES } from './public-packages.mjs';
 
-export const PACKAGES = ['protocol', 'schemas', 'wallpapers', 'api-client', 'edge', 'runtime-core', 'workspaced'];
+export const PACKAGES = PUBLIC_PACKAGES;
 
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');

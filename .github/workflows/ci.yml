@@ -8,6 +8,9 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .public-workspace
     steps:
       - uses: actions/checkout@v4
       # No version input: pnpm/action-setup reads the packageManager field.
@@ -18,9 +21,12 @@ jobs:
           cache: pnpm
       - uses: oven-sh/setup-bun@v2
       - run: sudo apt-get update && sudo apt-get install -y nginx openssl
-      - run: pnpm install --frozen-lockfile
+        working-directory: .
+      - run: node scripts/install-public.mjs
+        working-directory: .
       - run: pnpm run lint
       - run: CANVAS_TEST_BUN=$(command -v bun) pnpm run test
+      - run: node --test scripts/tests/*.test.mjs
       # Every npm package must stage as a self-contained package on every PR
       # (registry mode, exactly what release.yml publishes), so a broken
       # package fails review, not the publish.
@@ -31,16 +37,20 @@ jobs:
       - name: Smoke-test the edge package from its tarball
         run: |
           set -e
-          tgz=$(ls "$PWD"/artifacts/augmentd-labs-canvas-edge-*.tgz)
+          # Sibling API-client/protocol versions may not be published yet.
+          node scripts/pack-dist.mjs edge --out edge-artifacts --pack
+          tgz=$(ls "$PWD"/edge-artifacts/augmentd-labs-canvas-edge-*.tgz)
           consumer=$(mktemp -d); cd "$consumer"; npm init -y >/dev/null
           npm install --ignore-scripts --no-audit --no-fund "$tgz"
           test -d node_modules/@augmentd-labs/canvas-edge/node_modules/canvas-stored
           CANVAS_USER_HOME=/tmp/edge-ci timeout 8 node node_modules/.bin/canvas-edge --foreground || [ $? -eq 124 ]
-      - name: Smoke-test the local runtime distribution
+      - name: Smoke-test the standalone agent distribution
         run: |
           set -e
-          node scripts/pack-dist.mjs workspaced --out runtime-artifacts --pack
-          tgz=$(ls "$PWD"/runtime-artifacts/augmentd-labs-canvas-workspaced-*.tgz)
+          node scripts/pack-dist.mjs agent --out runtime-artifacts --pack
+          tgz=$(ls "$PWD"/runtime-artifacts/augmentd-labs-canvas-agent-runtime-*.tgz)
           consumer=$(mktemp -d)
-          npm install --prefix "$consumer" --no-audit --no-fund "$tgz"
-          node scripts/smoke-runtime.mjs "$consumer/node_modules/@augmentd-labs/canvas-workspaced"
+          # Exercise a different host undici version: the bundled client uses 6.
+          npm install --prefix "$consumer" --no-audit --no-fund "$tgz" 'undici@^8.7.0'
+          node scripts/check-public-package.mjs "$consumer/node_modules/@augmentd-labs/canvas-agent-runtime"
+          node scripts/smoke-runtime.mjs "$consumer/node_modules/@augmentd-labs/canvas-agent-runtime"

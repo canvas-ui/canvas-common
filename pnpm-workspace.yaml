@@ -19,3 +19,6 @@ onlyBuiltDependencies:
 # Match the server override: fast-jwt 3 excludes Node 22.
 overrides:
   fast-jwt: 6.2.4
+
+# Resolve the Git distribution root against sibling public packages during development.
+linkWorkspacePackages: true

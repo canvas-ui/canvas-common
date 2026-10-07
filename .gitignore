@@ -1,4 +1,5 @@
 node_modules/
+.public-workspace/
 dist/
 coverage/
 *.log

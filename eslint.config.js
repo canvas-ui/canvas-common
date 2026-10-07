@@ -6,7 +6,7 @@ import globals from 'globals';
 // the repos share one style.
 export default [
     {
-        ignores: ['apps/**', '**/node_modules/**', '**/dist/**', '**/coverage/**']
+        ignores: ['apps/**', '.public-workspace/**', '**/node_modules/**', '**/dist/**', '**/coverage/**']
     },
     js.configs.recommended,
     {

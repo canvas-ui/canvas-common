@@ -14,13 +14,15 @@
 // Usage:
 //   node scripts/pack-dist.mjs <target|all> [--out artifacts] [--pack] [--registry]
 //
-// Targets: protocol schemas wallpapers api-client edge (see TARGETS).
+// Targets: protocol schemas wallpapers api-client edge agent (see TARGETS).
 // Output: <out>/dist/<target>/; --pack also writes <out>/<name>-<version>.tgz.
 
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { PUBLIC_PACKAGES } from './public-packages.mjs';
+import { assertPublicDependencies, assertPublicArtifact } from './check-public-package.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -31,8 +33,7 @@ export const TARGETS = {
     wallpapers: { dir: 'packages/wallpapers' },
     'api-client': { dir: 'packages/api-client' },
     edge: { dir: 'runtimes/edge' },
-    'runtime-core': { dir: 'packages/runtime-core' },
-    workspaced: { dir: 'runtimes/workspaced' },
+    agent: { dir: 'runtimes/agent' },
 };
 
 const META_FILES = ['package.json', 'LICENSE', 'LICENSE.md', 'NOTICE', 'README.md'];
@@ -102,8 +103,12 @@ function bundleDep(parentDir, name, spec, fromDir) {
     const manifest = { ...pkg };
     delete manifest.scripts; delete manifest.devDependencies; delete manifest.publishConfig;
     // Same rule as the top level: a bundled copy must be a declared dep at its concrete version.
-    manifest.dependencies = { ...(pkg.dependencies || {}) };
-    for (const [n, v] of nested) manifest.dependencies[n] = v;
+    // Registry dependencies belong to the artifact's manifest, where npm
+    // actually installs them. Keeping them on a bundled child's manifest makes
+    // npm classify missing nested versions as inBundle and skip extraction when
+    // another consumer needs a different version (e.g. undici 6 versus 8).
+    manifest.dependencies = Object.fromEntries(nested);
+    delete manifest.optionalDependencies;
     if (nested.length) manifest.bundleDependencies = nested.map(([n]) => n);
     writeFileSync(join(dest, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
     // A git dep's optional deps (e.g. lmdb's platform binaries) travel too.
@@ -124,6 +129,7 @@ export async function stage(targetName, { out = join(root, 'artifacts'), registr
     const t = TARGETS[targetName];
     if (!t) throw new Error(`unknown target '${targetName}' (${Object.keys(TARGETS).join(', ')})`);
     const srcDir = join(root, t.dir);
+    assertPublicDependencies(srcDir);
     const pkg = readPkg(srcDir);
     const stageDir = join(out, 'dist', targetName);
     rmSync(stageDir, { recursive: true, force: true });
@@ -158,6 +164,7 @@ export async function stage(targetName, { out = join(root, 'artifacts'), registr
     manifest.canvasRev = rev;
     manifest.canvasSource = t.dir;
     writeFileSync(join(stageDir, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
+    assertPublicArtifact(stageDir);
     return { stageDir, name: manifest.name, version: manifest.version, bundled };
 }
 
@@ -175,7 +182,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const out = outIdx >= 0 ? resolve(args[outIdx + 1]) : join(root, 'artifacts');
     const doPack = args.includes('--pack');
     const registry = args.includes('--registry');
-    const names = which === 'all' ? Object.keys(TARGETS) : which.split(',');
+    const names = which === 'all' ? PUBLIC_PACKAGES : which.split(',');
     for (const n of names) {
         const res = await stage(n, { out, registry });
         const extra = res.bundled?.length ? ` (bundled: ${res.bundled.join(', ')})` : '';

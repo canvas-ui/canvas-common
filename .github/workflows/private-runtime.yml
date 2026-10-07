@@ -1,0 +1,28 @@
+name: private-workspace-runtime
+
+# Explicit Git-based testing; never stages or publishes a workspace npm package.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CANVAS_PRIVATE_REPO_TOKEN }}
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The checkout token needs read access to canvas-common and canvas-synapsd.
+      - run: |
+          git config --global credential.helper '!gh auth git-credential'
+          pnpm install --frozen-lockfile
+        env:
+          GH_TOKEN: ${{ secrets.CANVAS_PRIVATE_REPO_TOKEN }}
+      - name: Test private workspace from Git sources
+        run: node scripts/smoke-workspace.mjs

@@ -8,60 +8,20 @@ overrides:
   fast-jwt: 6.2.4
 
 importers:
-
   .:
-    devDependencies:
-      '@eslint/js':
-        specifier: ^9.39.4
-        version: 9.39.5
-      eslint:
-        specifier: ^9.39.4
-        version: 9.39.5(jiti@2.7.0)
-      globals:
-        specifier: ^16.5.0
-        version: 16.5.0
-      prettier:
-        specifier: ^3.6.2
-        version: 3.9.6
-
-  packages/api-client:
     dependencies:
+      '@augmentd-labs/canvas-agent-runtime':
+        specifier: ^0.1.0
+        version: link:runtimes/agent
       '@augmentd-labs/canvas-protocol':
-        specifier: workspace:*
-        version: link:../protocol
-      engine.io-client:
-        specifier: ^6.6.6
-        version: 6.6.6
-      undici:
-        specifier: ^6.21.3
-        version: 6.29.0
-    devDependencies:
-      socket.io:
-        specifier: ^4.8.3
-        version: 4.8.4
-      socket.io-client:
-        specifier: ^4.8.3
-        version: 4.8.3
-
-  packages/protocol: {}
-
-  packages/runtime-core:
-    dependencies:
-      '@augmentd-labs/canvas-protocol':
-        specifier: workspace:*
-        version: link:../protocol
+        specifier: ^0.5.0
+        version: link:packages/protocol
       '@augmentd-labs/canvas-web':
         specifier: ^2.15.0
         version: 2.15.0
       '@azure/identity':
         specifier: ^4.13.0
         version: 4.13.3
-      '@earendil-works/pi-ai':
-        specifier: 0.74.2
-        version: 0.74.2(@opentelemetry/api@1.9.1)(ws@8.21.3)(zod@3.25.76)
-      '@earendil-works/pi-coding-agent':
-        specifier: 0.74.2
-        version: 0.74.2(@opentelemetry/api@1.9.1)(ws@8.21.3)(zod@3.25.76)
       '@fastify/auth':
         specifier: ^4.6.1
         version: 4.6.1
@@ -108,8 +68,198 @@ importers:
         specifier: github:canvas-ui/canvas-stored#main
         version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/67e724e116a48f8d5bbd101d78538399e8510ee5
       canvas-synapsd:
-        specifier: github:canvas-ui/canvas-synapsd#main
-        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#d1e3edc0a001e1b3810e8602a92bb0989f3b8d71(@types/node@26.6.4)
+        specifier: git+https://github.com/canvas-ui/canvas-synapsd.git#main
+        version: git+https://github.com/canvas-ui/canvas-synapsd.git#d1e3edc0a001e1b3810e8602a92bb0989f3b8d71(@types/node@26.6.4)
+      conf:
+        specifier: ^14.0.0
+        version: 14.0.0
+      cross-env:
+        specifier: ^10.1.0
+        version: 10.1.0
+      debug:
+        specifier: ^4.4.3
+        version: 4.4.3
+      dockerode:
+        specifier: ^4.0.9
+        version: 4.0.12
+      dotenv:
+        specifier: ^17.3.1
+        version: 17.4.2
+      eventemitter2:
+        specifier: ^6.4.9
+        version: 6.4.9
+      fastify:
+        specifier: ^4.29.1
+        version: 4.29.1
+      fastify-socket.io:
+        specifier: ^5.1.0
+        version: 5.1.0(fastify@4.29.1)(socket.io@4.8.4)
+      get-folder-size:
+        specifier: ^5.0.0
+        version: 5.0.0
+      html-to-text:
+        specifier: ^10.0.1
+        version: 10.0.1
+      imap:
+        specifier: ^0.8.19
+        version: 0.8.19
+      imapflow:
+        specifier: ^1.4.0
+        version: 1.7.8
+      jsonwebtoken:
+        specifier: ^9.0.3
+        version: 9.0.3
+      ldapjs:
+        specifier: ^3.0.7
+        version: 3.0.7
+      lmdb:
+        specifier: 3.5.6
+        version: 3.5.6
+      mailparser:
+        specifier: ^3.9.9
+        version: 3.9.36
+      nanoid:
+        specifier: ^5.1.7
+        version: 5.1.16
+      nodemailer:
+        specifier: ^9.0.3
+        version: 9.1.1
+      pdfjs-dist:
+        specifier: ^6.2.108
+        version: 6.4.299
+      pino:
+        specifier: ^10.3.1
+        version: 10.3.1
+      pino-pretty:
+        specifier: ^13.1.3
+        version: 13.2.0
+      proper-lockfile:
+        specifier: ^4.1.2
+        version: 4.1.2
+      qrcode:
+        specifier: 1.5.4
+        version: 1.5.4
+      randomcolor:
+        specifier: ^0.6.2
+        version: 0.6.2
+      sharp:
+        specifier: ^0.35.3
+        version: 0.35.5(@types/node@26.6.4)
+      socket.io:
+        specifier: ^4.8.3
+        version: 4.8.4
+      socket.io-client:
+        specifier: ^4.8.3
+        version: 4.8.3
+      ulid:
+        specifier: ^3.0.2
+        version: 3.0.2
+      undici:
+        specifier: ^8.7.0
+        version: 8.11.2
+      uuid:
+        specifier: ^11.1.1
+        version: 11.1.1
+      validator:
+        specifier: ^13.15.26
+        version: 13.15.35
+      zod:
+        specifier: ^3.25.76
+        version: 3.25.76
+    devDependencies:
+      '@eslint/js':
+        specifier: ^9.39.4
+        version: 9.39.5
+      eslint:
+        specifier: ^9.39.4
+        version: 9.39.5(jiti@2.7.0)
+      globals:
+        specifier: ^16.5.0
+        version: 16.5.0
+      prettier:
+        specifier: ^3.6.2
+        version: 3.9.6
+  packages/api-client:
+    dependencies:
+      '@augmentd-labs/canvas-protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      engine.io-client:
+        specifier: ^6.6.6
+        version: 6.6.6
+      socket.io-client:
+        specifier: ^4.8.3
+        version: 4.8.3
+      undici:
+        specifier: ^6.21.3
+        version: 6.29.0
+    devDependencies:
+      socket.io:
+        specifier: ^4.8.3
+        version: 4.8.4
+  packages/protocol: {}
+  packages/runtime-core:
+    dependencies:
+      '@augmentd-labs/canvas-agent-runtime':
+        specifier: workspace:*
+        version: link:../../runtimes/agent
+      '@augmentd-labs/canvas-protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@augmentd-labs/canvas-web':
+        specifier: ^2.15.0
+        version: 2.15.0
+      '@azure/identity':
+        specifier: ^4.13.0
+        version: 4.13.3
+      '@fastify/auth':
+        specifier: ^4.6.1
+        version: 4.6.1
+      '@fastify/compress':
+        specifier: ^7.0.3
+        version: 7.0.3
+      '@fastify/cors':
+        specifier: ^8.5.0
+        version: 8.5.0
+      '@fastify/error':
+        specifier: ^3.4.1
+        version: 3.4.1
+      '@fastify/jwt':
+        specifier: ^7.2.4
+        version: 7.2.4
+      '@fastify/multipart':
+        specifier: ^8.3.1
+        version: 8.3.1
+      '@fastify/rate-limit':
+        specifier: ^9.1.0
+        version: 9.1.0
+      '@fastify/static':
+        specifier: ^6.12.0
+        version: 6.12.0
+      '@microsoft/microsoft-graph-client':
+        specifier: ^3.0.7
+        version: 3.0.7(@azure/identity@4.13.3)
+      '@napi-rs/canvas':
+        specifier: ^1.0.6
+        version: 1.0.10
+      '@slack/web-api':
+        specifier: ^7.15.0
+        version: 7.19.0(debug@4.4.3)
+      '@whiskeysockets/baileys':
+        specifier: 7.0.0-rc14
+        version: 7.0.0-rc14(sharp@0.35.5(@types/node@26.6.4))
+      bcryptjs:
+        specifier: ^3.0.3
+        version: 3.0.3
+      cacache:
+        specifier: ^20.0.4
+        version: 20.0.4
+      canvas-stored:
+        specifier: github:canvas-ui/canvas-stored#main
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/67e724e116a48f8d5bbd101d78538399e8510ee5
+      canvas-synapsd:
+        specifier: git+https://github.com/canvas-ui/canvas-synapsd.git#main
+        version: git+https://github.com/canvas-ui/canvas-synapsd.git#d1e3edc0a001e1b3810e8602a92bb0989f3b8d71(@types/node@26.6.4)
       conf:
         specifier: ^14.0.0
         version: 14.0.0
@@ -188,9 +338,6 @@ importers:
       socket.io-client:
         specifier: ^4.8.3
         version: 4.8.3
-      typebox:
-        specifier: 1.3.6
-        version: 1.3.6
       ulid:
         specifier: ^3.0.2
         version: 3.0.2
@@ -206,11 +353,8 @@ importers:
       zod:
         specifier: ^3.25.76
         version: 3.25.76
-
   packages/schemas: {}
-
   packages/wallpapers: {}
-
   runtimes/edge:
     dependencies:
       '@augmentd-labs/canvas-api-client':
@@ -231,18 +375,67 @@ importers:
       socket.io-client:
         specifier: ^4.8.3
         version: 4.8.3
-
   runtimes/workspaced:
     dependencies:
-      '@augmentd-labs/canvas-edge':
+      '@augmentd-labs/canvas-agent-runtime':
         specifier: workspace:*
-        version: link:../edge
+        version: link:../agent
       '@augmentd-labs/canvas-runtime-core':
         specifier: workspace:*
         version: link:../../packages/runtime-core
       proper-lockfile:
         specifier: ^4.1.2
         version: 4.1.2
+  runtimes/agent:
+    dependencies:
+      '@augmentd-labs/canvas-api-client':
+        specifier: workspace:*
+        version: link:../../packages/api-client
+      '@augmentd-labs/canvas-web':
+        specifier: ^2.15.0
+        version: 2.15.0
+      '@earendil-works/pi-ai':
+        specifier: 0.74.2
+        version: 0.74.2(@opentelemetry/api@1.9.1)(ws@8.21.3)(zod@3.25.76)
+      '@earendil-works/pi-coding-agent':
+        specifier: 0.74.2
+        version: 0.74.2(@opentelemetry/api@1.9.1)(ws@8.21.3)(zod@3.25.76)
+      '@fastify/error':
+        specifier: ^3.4.1
+        version: 3.4.1
+      '@fastify/multipart':
+        specifier: ^8.3.1
+        version: 8.3.1
+      '@fastify/static':
+        specifier: ^6.12.0
+        version: 6.12.0
+      conf:
+        specifier: ^14.0.0
+        version: 14.0.0
+      eventemitter2:
+        specifier: ^6.4.9
+        version: 6.4.9
+      fastify:
+        specifier: ^4.29.1
+        version: 4.29.1
+      fastify-socket.io:
+        specifier: ^5.1.0
+        version: 5.1.0(fastify@4.29.1)(socket.io@4.8.4)
+      pino:
+        specifier: ^10.3.1
+        version: 10.3.1
+      proper-lockfile:
+        specifier: ^4.1.2
+        version: 4.1.2
+      randomcolor:
+        specifier: ^0.6.2
+        version: 0.6.2
+      typebox:
+        specifier: 1.3.6
+        version: 1.3.6
+      uuid:
+        specifier: ^11.1.1
+        version: 11.1.1
 
 packages:
 
@@ -1584,8 +1777,8 @@ packages:
     version: 1.9.3
     engines: {node: '>=20.0.0'}
 
-  canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#d1e3edc0a001e1b3810e8602a92bb0989f3b8d71:
-    resolution: {commit: d1e3edc0a001e1b3810e8602a92bb0989f3b8d71, repo: git@github.com:canvas-ui/canvas-synapsd.git, type: git}
+  canvas-synapsd@git+https://github.com/canvas-ui/canvas-synapsd.git#d1e3edc0a001e1b3810e8602a92bb0989f3b8d71:
+    resolution: {commit: d1e3edc0a001e1b3810e8602a92bb0989f3b8d71, repo: https://github.com/canvas-ui/canvas-synapsd.git, type: git}
     version: 3.23.3
     engines: {node: '>=22.0.0'}
 
@@ -4886,7 +5079,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#d1e3edc0a001e1b3810e8602a92bb0989f3b8d71(@types/node@26.6.4):
+  canvas-synapsd@git+https://github.com/canvas-ui/canvas-synapsd.git#d1e3edc0a001e1b3810e8602a92bb0989f3b8d71(@types/node@26.6.4):
     dependencies:
       '@lancedb/lancedb': 0.39.0(@types/node@26.6.4)(apache-arrow@18.1.0)
       apache-arrow: 18.1.0
