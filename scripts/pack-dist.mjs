@@ -31,6 +31,8 @@ export const TARGETS = {
     wallpapers: { dir: 'packages/wallpapers' },
     'api-client': { dir: 'packages/api-client' },
     edge: { dir: 'runtimes/edge' },
+    'runtime-core': { dir: 'packages/runtime-core' },
+    workspaced: { dir: 'runtimes/workspaced' },
 };
 
 const META_FILES = ['package.json', 'LICENSE', 'LICENSE.md', 'NOTICE', 'README.md'];

@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stage } from './pack-dist.mjs';
 
-export const PACKAGES = ['protocol', 'schemas', 'wallpapers', 'api-client', 'edge'];
+export const PACKAGES = ['protocol', 'schemas', 'wallpapers', 'api-client', 'edge', 'runtime-core', 'workspaced'];
 
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');

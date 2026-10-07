@@ -1,0 +1,4729 @@
+'use strict';
+
+import { readMessageThread } from './services/messages/thread.js';
+import { readSendReceipt } from './services/messages/outbox.js';
+
+import { emailRecipients } from './services/messages/email.js';
+import { sendWorkspaceMessage, sourceAccount } from './services/messages/index.js';
+import { randomUUID } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import WorkspaceCrypto, { containsSecrets, protectionError, writePrivateJson, redactSecrets } from './lib/WorkspaceCrypto.js';
+import { workspaceStopped } from './lib/errors.js';
+
+// Utils
+import EventEmitter from 'eventemitter2';
+import * as fsPromises from 'fs/promises';
+import path from 'path';
+import getFolderSize from 'get-folder-size';
+import _Conf from 'conf';
+import { v4 as _uuidv4 } from 'uuid';
+// Logging
+import { createLogger } from '../../utils/log.js';
+
+// Includes
+import Db from 'canvas-synapsd';
+import { parseDocumentId, parseDocumentIdArray } from '../../utils/documentId.js';
+import { BACKENDS_TREE_NAME, normalizeBackendsTreePath, normalizeSegment } from '../../utils/backend-documents.js';
+import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
+
+// Sub-modules
+import { WorkspaceTokens } from './lib/WorkspaceTokens.js';
+import { WorkspaceMembers } from './lib/WorkspaceMembers.js';
+import { classifyDocument } from './lib/classifier.js';
+import { extract as extractBlobMetadata } from 'canvas-stored/src/extractors/index.js';
+import { detectMountSync } from 'canvas-stored/src/utils/mount.js';
+import { instrumentDb } from '../../utils/perf-monitor.js';
+import GdriveBackend from 'canvas-stored/src/backends/gdrive/index.js';
+import { pickGeo } from './lib/geo.js';
+import { WorkspaceStoredIndex } from './lib/WorkspaceStoredIndex.js';
+import { joinKey, transferFilename } from './services/hook/key-utils.js';
+import { WorkspaceMailIndex } from './services/mail/index.js';
+import { ContactExtractor } from './services/contacts/index.js';
+import Identity from 'canvas-synapsd/src/schemas/core/Identity.js';
+import { WorkspaceConnectorIndex, isConnectorDriver, CONNECTOR_SCHEMES, connectorDriverForProvenanceUrl } from './services/connectors/index.js';
+import { SyncConflicts } from './lib/SyncConflicts.js';
+import { getServerDevice } from '../device/ServerDevice.js';
+
+// Constants
+import {
+    WORKSPACE_STATUS_CODES,
+    WORKSPACE_GIT_BARE_DIR,
+    WORKSPACE_INTERNAL_DIRNAME,
+    WORKSPACE_LAYOUTS,
+    normalizeWorkspaceLayout,
+    workspaceDirectories,
+    workspaceInternals,
+    workspaceStoredDefault,
+    workspaceServices,
+    WORKSPACE_STORAGE_BACKENDS,
+} from './lib/constants.js';
+
+/*
+ * Workspace
+ */
+
+class Workspace extends EventEmitter {
+    // Tree names
+    static CONTEXT_TREE_NAME = 'context';
+    static DIRECTORY_TREE_NAME = 'directory';
+    // Dedicated backend-mirror tree (type directory, linkContextRoot:false).
+    // Paths inside it are /<driver>/<resource-address>/<resource-path>.
+    static BACKENDS_TREE_NAME = BACKENDS_TREE_NAME;
+    // Where a document goes when a filesystem-style delete removes its LAST
+    // placement. A real path in the default directory tree — so listing,
+    // restoring and emptying are ordinary tree operations — but dot-prefixed so
+    // it stays out of `Trees/directory/` listings; WebDAV and canvas-fuse
+    // present it as `Trash/` at the workspace root.
+    static TRASH_PATH = '/.trash';
+    // Tree types (used by the db layer)
+    static CONTEXT_TYPE = 'context';
+    static DIRECTORY_TYPE = 'directory';
+    // Default cosine-distance floor for the dense side of vector/hybrid search.
+    // synapsd applies no floor by default (pure mechanism); Workspace sets the
+    // product policy: drop kNN neighbours past this cosine distance so the dense
+    // side can't pollute results with "nearest but irrelevant" hits (kNN always
+    // returns its top-K regardless of absolute similarity). 0.35 distance = 0.65
+    // cosine similarity — a solid relevance bar for bge-small (normalized).
+    // Empirically separates genuinely-related notes (~0.27) from degenerate
+    // near-centroid embeddings of empty/trivial content (~0.40+), which match any
+    // query. Callers may override via an explicit maxDistance (pass 2 to disable).
+    static DEFAULT_MAX_COSINE_DISTANCE = 0.35;
+    // Per-backend enable-lock holder prefix on /<driver>/<address> in the
+    // backends tree
+    static BACKEND_NODE_LOCK_PREFIX = 'system:backend:';
+
+    #crypto;
+    #withoutSecrets = false;
+    #protectionPromise = null;
+    #rootPath = null;
+    #configStore = null;
+    #logger;
+
+    #db = null;
+    #storedIndex = null;
+    #mailIndex = null;
+    #mailRuntimeBinding = null;
+    #connectorIndex = null;
+    #connectorRuntimeBinding = null;
+    #tokens = null;
+    #members = null;
+    #status = WORKSPACE_STATUS_CODES.INACTIVE;
+    #startPromise = null;
+    #runtimeListeners = [];
+    #sessions = new Set();     // live QuerySessions opened over this workspace's db
+
+    // Managers (injected)
+    #configuredInferd = null;
+    #inferd = null;            // InferdClient — the inference daemon over its socket (optional)
+    #inferdRegistered = false;
+    #embedStoreCount = 0;      // storeVectors calls since the last mid-ingest compaction
+
+    constructor(options) {
+        super({
+            wildcard: true,
+            delimiter: '.',
+            newListener: false,
+            maxListeners: 100,
+            ...(options.eventEmitterOptions || {})
+        });
+        this.options = options;
+
+        if (!options.rootPath) throw new Error('Root path is required');
+        if (!options.configStore) throw new Error('Config store is required');
+
+        this.#rootPath = options.rootPath;
+        this.#crypto = new WorkspaceCrypto(options.rootPath);
+        this.#configStore = options.configStore;
+        this.#logger = options.logger || createLogger('workspace');
+        this.#configuredInferd = options.inferd || null;
+        this.#inferd = this.#configuredInferd;
+
+        this.#tokens = new WorkspaceTokens({ configStore: this.#configStore, workspaceId: this.id });
+        this.#members = new WorkspaceMembers({ configStore: this.#configStore });
+
+        // A persisted active flag is not a live runtime after a restart.
+        if (this.#configStore.get('status') === WORKSPACE_STATUS_CODES.ACTIVE) {
+            this.#configStore.set('lastStopReason', 'server-restart');
+            this.#configStore.set('stoppedAt', new Date().toISOString());
+            this.#configStore.set('status', WORKSPACE_STATUS_CODES.INACTIVE);
+        }
+    }
+
+    /*
+    * Getters / Setters
+    */
+    get id() { return this.#configStore.get('id'); }
+    get name() { return this.#configStore.get('name'); }
+    get label() { return this.#configStore.get('label', this.name || this.id); }
+    get description() { return this.#configStore.get('description'); }
+    get color() { return this.#configStore.get('color'); }
+    get icon() { return this.#configStore.get('icon', null); }
+    get homeScreen() { return this.#configStore.get('homeScreen', {}); }
+    get links() { return this.#configStore.get('links', {}); }
+    get type() { return this.#configStore.get('type', 'workspace'); }
+    /**
+     * On-disk folder structure this workspace was created with:
+     *   'full' — visible runtime dirs at the root, user drive in `home/`
+     *   'home' — the root IS the user's roaming drive, internals in `.workspace/`
+     * Fixed at creation; only decides the DEFAULTS behind `internals`/`services`,
+     * which remain the authority for every resolved path.
+     */
+    get layout() { return normalizeWorkspaceLayout(this.#configStore.get('layout')); }
+    /** Hidden internals dir (`home` layout). Null for the `full` layout. */
+    get internalsPath() {
+        return this.layout === WORKSPACE_LAYOUTS.HOME
+            ? path.join(this.#rootPath, WORKSPACE_INTERNAL_DIRNAME)
+            : null;
+    }
+    get owner() { return this.#configStore.get('owner'); }
+    get rootPath() { return this.#rootPath; }
+    get status() { return this.#status; }
+    get isActive() { return this.#status === WORKSPACE_STATUS_CODES.ACTIVE; }
+    get protection() { return { mode: this.#crypto.mode, secretsUnlocked: this.#crypto.unlocked, withoutSecrets: this.#withoutSecrets }; }
+    get lastStopReason() { return this.#configStore.get('lastStopReason', null); }
+    get stoppedAt() { return this.#configStore.get('stoppedAt', null); }
+    assertActive() { if (!this.isActive) throw workspaceStopped(this); }
+
+    async configureProtection(options) {
+        if (this.isActive || this.#startPromise || this.#protectionPromise) throw protectionError('WORKSPACE_MUST_STOP', 'Stop the workspace before changing protection', 409);
+        this.#protectionPromise = (async () => {
+            try {
+                const result = await this.#crypto.configure(options);
+                this.#migrateConfigSchema();
+                this.#migrateSecrets();
+                this.#configStore.set('protection', { mode: result.mode });
+                return result;
+            } finally { this.#crypto.stop(); }
+        })();
+        try { return await this.#protectionPromise; }
+        finally { this.#protectionPromise = null; }
+    }
+
+    #migrateSecrets() {
+        if (!this.#crypto.unlocked) return;
+        const services = this.#crypto.protect(this.#configStore.get('services', {}));
+        this.#crypto.resolve(services);
+        this.#configStore.set('services', services);
+        // Mail and connector accounts use stored.json.
+        const storedFile = path.join(this.configDir, 'stored.json');
+        if (existsSync(storedFile)) {
+            const namespace = path.relative(this.#rootPath, path.join(this.configDir, 'stored')).split(path.sep).join('/');
+            const config = this.#crypto.protect(JSON.parse(readFileSync(storedFile, 'utf8')), namespace);
+            this.#crypto.resolve(config);
+            writePrivateJson(storedFile, config);
+        }
+        // Linked-device auth is credential material, not document data.
+        const sessionRoots = new Set([path.join(this.#rootPath, 'var', 'whatsapp'), path.join(this.varPath, 'whatsapp'), path.join(this.configDir, 'whatsapp')]);
+        for (const sessions of sessionRoots) if (existsSync(sessions)) for (const entry of readdirSync(sessions, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue;
+            const file = path.join(sessions, entry.name, 'session.json');
+            if (!existsSync(file)) continue;
+            const raw = readFileSync(file, 'utf8');
+            const session = JSON.parse(raw);
+            if (session.secretRef) this.#crypto.resolve(session.secretRef);
+            else writePrivateJson(file, { secretRef: this.#crypto.protect({ password: raw }, `whatsapp/${entry.name}`).password });
+        }
+    }
+    #resolveCredentials(config) {
+        if (this.#withoutSecrets && containsSecrets(config)) throw protectionError('WORKSPACE_SECRETS_LOCKED', 'Start with the PIN/password to use authenticated integrations');
+        return this.#crypto.resolve(config);
+    }
+    resolveIntegrationConfig(config) { return this.#resolveCredentials(config); }
+    #runtimeBackends() {
+        return Object.fromEntries(Object.entries(this.dataBackends).map(([name, config]) => [name,
+            this.#withoutSecrets && containsSecrets(config) ? { ...config, enabled: false } : this.#resolveCredentials(config)]));
+    }
+    get config() { return this.#configStore.store; }
+    get acl() { return this.#configStore.get('acl'); }
+    get publicCanvasShares() { return this.#configStore.get('publicCanvasShares', {}); }
+
+    // stored's config (services.stored): { root, cache, sync, backends } —
+    // stored is storage only: its metadata index root, its in-workspace working
+    // store (cache), sync policies, and the storage-backend map. Legacy
+    // workspace.json kept a flat top-level `dataBackends` map with the cache as
+    // a fake 'stored.cache' backend; #migrateConfigSchema rewrites that on
+    // start, the read-side fallback here covers pre-migration reads.
+    #storedConfig() {
+        const defaults = workspaceStoredDefault(this.layout);
+        const configured = (this.#configStore.get('services') || {}).stored;
+        if (configured && typeof configured === 'object') {
+            return {
+                ...defaults,
+                ...configured,
+                // #mergeConfigMap is one level deep — materialize the nested
+                // backends map explicitly against the storage defaults.
+                backends: Workspace.#mergeConfigMap(defaults.backends, configured.backends || {}),
+            };
+        }
+        const legacy = this.#configStore.get('dataBackends') || {};
+        const { 'stored.cache': legacyCache, ...legacyBackends } = legacy;
+        const legacyDirs = this.#configStore.get('directories', {}) || {};
+        return {
+            ...defaults,
+            root: legacyDirs.stored ?? defaults.root,
+            cache: legacyCache?.root ?? legacyDirs.cache ?? defaults.cache,
+            backends: Workspace.#mergeConfigMap(defaults.backends, legacyBackends),
+        };
+    }
+
+    // Storage backends only (services.stored.backends) — the cache is NOT a
+    // backend, it's stored's own working store (see cachePath).
+    get dataBackends() {
+        return this.#storedConfig().backends;
+    }
+
+    // Single write authority for services.stored.backends. Keeps the rest of
+    // the stored config (root/cache/sync) as-is; materializing the full shape
+    // on write is intentional — workspace.json stays self-describing.
+    #writeStoredBackends(backends) {
+        const services = this.#configStore.get('services') || {};
+        this.#configStore.set('services', this.#crypto.protect({ ...services, stored: { ...this.#storedConfig(), backends } }));
+    }
+
+    get services() {
+        return Workspace.#mergeConfigMap(workspaceServices(this.layout), this.#configStore.get('services') || {});
+    }
+
+    /**
+     * inferd's config (`services.inferd`): `{ providers?, spaces?, rules? }`.
+     *
+     * This lives IN workspace.json on purpose. A workspace is meant to be
+     * self-contained and movable — stop it, tar it, scp it, run it under
+     * canvas-edge from a folder with no canvas-server at all — and which model
+     * its vectors were built with is part of what makes it readable elsewhere.
+     * Server and per-user config are *defaults* that a fresh workspace inherits;
+     * once set here, this layer wins and travels with the data.
+     *
+     * Empty ({}) means "inherit everything", which is the normal case.
+     */
+    get inferdConfig() {
+        const configured = (this.#configStore.get('services') || {}).inferd;
+        return configured && typeof configured === 'object' ? configured : {};
+    }
+
+    /**
+     * Progress of the captioning run. The run itself lives in the inference
+     * daemon (canvas-inferd/src/summarize-run.js) — driving a vision model is
+     * its job, not this object's — so this is a read across the socket.
+     */
+    async imageSummaryStatus() {
+        if (!this.#inferd) { return { running: false, total: 0, described: 0, skipped: 0, failed: 0 }; }
+        return this.#inferd.imageSummaryStatus(this.id);
+    }
+
+    /**
+     * Single write authority for `services.inferd`. Validation happens above
+     * this (the route asks inferd to resolve the candidate first) — a workspace
+     * must never persist a config its own runtime would refuse.
+     */
+    setInferdConfig(config = {}) {
+        const services = this.#configStore.get('services') || {};
+        this.#configStore.set('services', this.#crypto.protect({ ...services, inferd: config }));
+        this.emit('services.changed', { service: 'inferd' });
+        return this.inferdConfig;
+    }
+
+    /**
+     * Caption this workspace's images into `metadata.summary`.
+     *
+     * The run is executed by the inference daemon: it owns the vision model, so
+     * it owns the loop, the failure policy and the decision to abort when a
+     * model worker dies. This workspace supplies only what the daemon cannot
+     * know — which documents are images, their bytes, and where a caption is
+     * stored (see the adapter in #registerInferd). Returns immediately; poll
+     * `imageSummaryStatus()`.
+     */
+    async startImageSummaries({ force = false } = {}) {
+        if (!this.isActive) { throw new Error('Workspace is not active'); }
+        if (!this.#inferd) { throw new Error('Inference service is not available'); }
+        return this.#inferd.startImageSummaries(this.id, { force: force === true });
+    }
+
+    /**
+     * Ask a running caption run to stop.
+     *
+     * Cooperative rather than abortive: the in-flight image is allowed to
+     * finish (a caption takes seconds, and killing the worker mid-generation
+     * would just cost the model reload), then the loop exits at the next
+     * boundary. Images not yet attempted stay untouched, so a later run picks
+     * them up — nothing is half-written.
+     */
+    async stopImageSummaries() {
+        if (!this.#inferd) { throw new Error('Inference service is not available'); }
+        return this.#inferd.stopImageSummaries(this.id);
+    }
+
+    /** Document ids of every image in this workspace — the caption run's input set. */
+    async imageDocumentIds() {
+        const bitmap = await this.getBitmap('data/mime/image', { includeData: true });
+        return Array.isArray(bitmap?.ids) ? bitmap.ids : [];
+    }
+
+    /** Store a caption the daemon produced. */
+    async setDocumentSummary(docId, text) {
+        return this.#getActiveDb().put({
+            id: docId,
+            metadata: { summary: text },
+            updatedAt: new Date().toISOString(),
+        }, { context: null });
+    }
+
+    get db() {
+        if (!this.#db) throw new Error('Database not initialized');
+        return this.#db;
+    }
+
+    get stats() {
+        if (!this.isActive || !this.#db) return null;
+        return this.#db.stats;
+    }
+
+    /**
+     * Async stats superset including LanceDB FTS + dense-vector internals
+     * (row counts, embedded-doc count, embedder/model state, queue backlog).
+     * Used by the Workspace Settings UI. Returns null when inactive.
+     */
+    async getStats() {
+        if (!this.isActive || !this.#db) return null;
+        const stats = await this.#db.getStats();
+        // Embedding progress. The queue is this workspace's own, so the backlog
+        // shown here is genuinely its work — re-indexing a 3-doc workspace no
+        // longer reports the server's other 800 pending jobs. Combined with the
+        // per-space embeddedDocs (semantic.vectorSpaces) the UI can show a
+        // re-embed in flight and how far it's got.
+        if (this.#inferd?.workspaceStatus) {
+            try {
+                // Actual routing (what really embeds where) from the inferd router
+                // rules — notes/emails + text-file blobs → text, image/* → image.
+                // Surfaced so the UI shows reality, not synapsd's note-only gap default.
+                // This workspace's own router — what it actually embeds with,
+                // after workspace.json overrides the user/server defaults.
+                const router = (await this.#inferd.contextForWorkspace(this.id)).router;
+                const routing = {};
+                for (const r of (router?.rules || [])) {
+                    const m = r.match || {};
+                    const desc = m.schema != null ? String(m.schema)
+                        : (m.contentType != null ? `mime ${String(m.contentType)}` : 'any');
+                    (routing[r.space] ||= []).push(desc);
+                }
+                // Which provider/model fills each space — now that both are config,
+                // the UI should say what is actually running rather than imply the
+                // old hardcoded pair.
+                const spaces = {};
+                for (const sp of (router?.spaces || [])) {
+                    const rule = router.spaceRule(sp);
+                    if (rule) { spaces[sp] = { provider: rule.provider, model: rule.model, dim: rule.dim }; }
+                }
+                stats.inferd = { queue: await this.#inferd.workspaceStatus(this.id), routing, spaces };
+            } catch (_) { /* best effort */ }
+        }
+        return stats;
+    }
+
+    /**
+     * Live-tune search knobs (persisted to workspace.json `semantic`, applied to
+     * the running DB without a restart): image relevance floor + RRF fusion weights.
+     * @param {{imageMaxDistance?: number|null, searchWeights?: {fts?:number, dense?:number, image?:number}}} tuning
+     */
+    async setSearchTuning(tuning = {}) {
+        const current = this.#configStore.get('semantic', {}) || {};
+        const next = { ...current };
+        if (Object.prototype.hasOwnProperty.call(tuning, 'imageMaxDistance')) {
+            next.imageMaxDistance = tuning.imageMaxDistance;
+        }
+        // Persisted alongside the ceiling so the mode survives a restart — the
+        // db applies them live, the config store is what replays them on start.
+        if (tuning.imageFloorMode === 'relative' || tuning.imageFloorMode === 'absolute') {
+            next.imageFloorMode = tuning.imageFloorMode;
+        }
+        if (Number.isFinite(tuning.imageRelativeMargin) && tuning.imageRelativeMargin > 0) {
+            next.imageRelativeMargin = tuning.imageRelativeMargin;
+        }
+        if (tuning.searchWeights && typeof tuning.searchWeights === 'object') {
+            next.searchWeights = { ...(current.searchWeights || {}), ...tuning.searchWeights };
+        }
+        this.#configStore.set('semantic', next);
+        const applied = this.#db?.setSearchTuning ? this.#db.setSearchTuning(tuning) : null;
+        this.emit('semantic.changed', { id: this.id, semantic: next });
+        return { semantic: next, applied };
+    }
+
+    // Resolve a config path value (absolute / `{WORKSPACE_ROOT}` template /
+    // workspace-relative) to an absolute path.
+    #resolveWorkspacePath(value) {
+        if (!value) return null;
+        const resolved = value.includes('{WORKSPACE_ROOT}')
+            ? value.replaceAll('{WORKSPACE_ROOT}', this.#rootPath)
+            : (path.isAbsolute(value) ? value : path.join(this.#rootPath, value));
+        return path.resolve(resolved);
+    }
+
+    // Workspace INTERNALS (db/config/var/tmp …). The workspace.json `internals`
+    // map overrides the defaults (legacy `directories` maps are still honored
+    // below it). Storage locations (home/data/cache) are NOT here — those are
+    // stored's config (see #storedConfig/#backendRoot); this is only the
+    // non-service runtime dirs.
+    #resolveDir(key) {
+        const internals = this.#configStore.get('internals', {}) || {};
+        const legacy = this.#configStore.get('directories', {}) || {};
+        // internals uses `tmp` for what the legacy directories map called varTmp.
+        const internalsKey = key === 'varTmp' ? 'tmp' : key;
+        // Layout only supplies the fallback: an explicit internals/directories
+        // entry always wins, so a hand-edited workspace.json stays authoritative.
+        return this.#resolveWorkspacePath(internals[internalsKey] ?? legacy[key] ?? workspaceDirectories(this.layout)[key]);
+    }
+
+    // Single authority for a storage backend's byte-root: stored's backend config
+    // (dataBackends). home/data/cache resolve through here so WebDAV, the /home
+    // API, and stored's indexer can never point at different dirs.
+    #backendRoot(backendName, fallbackDirKey) {
+        return this.#resolveWorkspacePath(this.dataBackends[backendName]?.root) ?? this.#resolveDir(fallbackDirKey);
+    }
+
+    get homePath() {
+        return this.#backendRoot('workspace:home', 'home');
+    }
+
+    get dataPath() {
+        return this.#backendRoot('workspace:data', 'data');
+    }
+
+    /** stored's in-workspace working store (thumbnails, staging) — NOT a backend. */
+    get cachePath() {
+        return this.#resolveWorkspacePath(this.#storedConfig().cache) ?? this.#resolveDir('cache');
+    }
+
+    get dbPath() {
+        return this.#resolveDir('db');
+    }
+
+    /** Stored's runtime root (metadata index; blob cache lives at cachePath). */
+    get storedRootPath() {
+        return this.#resolveWorkspacePath(this.#storedConfig().root) ?? this.#resolveDir('stored');
+    }
+
+    get gitPath() {
+        return this.#resolveWorkspacePath(this.services.git?.root) ?? this.#resolveDir('git');
+    }
+
+    get gitBarePath() {
+        return path.join(this.gitPath, WORKSPACE_GIT_BARE_DIR);
+    }
+
+    // Derived from gitPath, not resolved independently: hooks live INSIDE the
+    // git working dir, so a remapped/relocated git root (or the `home` layout's
+    // .workspace/git) must take them with it.
+    get hooksPath() {
+        const configured = (this.#configStore.get('internals', {}) || {}).hooks
+            ?? (this.#configStore.get('directories', {}) || {}).hooks;
+        return configured ? this.#resolveWorkspacePath(configured) : path.join(this.gitPath, 'hooks');
+    }
+
+    /** Git working-dir scripts (rule/hook scripts), sibling of hooks/. */
+    get scriptsPath() {
+        return path.join(this.gitPath, 'scripts');
+    }
+
+    /** Per-workspace service config dir (`config/*.json`). */
+    get configDir() {
+        return this.#resolveDir('config');
+    }
+
+    get rolesPath() {
+        return this.#resolveDir('roles');
+    }
+
+    get varPath() {
+        return this.#resolveDir('var');
+    }
+
+    /** Hook/rule run + pending-action logs (runs.jsonl, pending.jsonl). */
+    get varHooksPath() {
+        return this.#resolveDir('varHooks');
+    }
+
+    /**
+     * Every absolute path this workspace uses for its own runtime state. The
+     * indexed file backends exclude anything in here that falls under their
+     * root — the workspace must never index its own db/cache/git, which is what
+     * would otherwise happen in the `home` layout where the home backend's root
+     * IS the workspace root.
+     */
+    get internalPaths() {
+        return [
+            path.join(this.#rootPath, '.workspace'),
+            path.join(this.#rootPath, '.agent'),
+            this.dbPath,
+            this.storedRootPath,
+            this.cachePath,
+            this.dataPath,
+            this.gitPath,
+            this.configDir,
+            this.varPath,
+            this.rolesPath,
+        ].filter(Boolean);
+    }
+
+    // Cheap start-time sanity check. A hand-edited (or half-migrated) config can
+    // point an internal dir at a place the home backend would happily index; the
+    // exclusions above already neutralise it, so this only warns — a workspace
+    // must still start.
+    #assertLayoutSane() {
+        const home = this.homePath;
+        if (this.layout !== WORKSPACE_LAYOUTS.HOME) { return; }
+        if (path.resolve(home) !== path.resolve(this.#rootPath)) {
+            this.#logger.warn({ workspaceId: this.id, home, root: this.#rootPath },
+                'home-layout workspace: workspace:home root is not the workspace root');
+        }
+        const internals = this.internalsPath;
+        for (const dir of this.internalPaths) {
+            if (dir === internals) { continue; }
+            if (!path.resolve(dir).startsWith(path.resolve(internals) + path.sep)) {
+                this.#logger.warn({ workspaceId: this.id, dir },
+                    'home-layout workspace: internal dir lives outside .workspace/ (excluded from indexing, but visible to the user)');
+            }
+        }
+    }
+
+    isDataBackendEnabled(backendName) {
+        return this.dataBackends[backendName]?.enabled === true;
+    }
+
+    isServiceEnabled(serviceName) {
+        return this.services[serviceName]?.enabled === true;
+    }
+
+    // Structural local stores every workspace depends on: workspace:data is the
+    // managed blob target (persistBlob/stored:// addressing). It can't be
+    // disabled, and as a managed (non-browseable, never exported) store the
+    // readOnly knob is meaningless. (stored's cache is not a backend at all —
+    // see services.stored.cache.)
+    static #ALWAYS_ON_BACKENDS = new Set([WorkspaceStoredIndex.DATA_BLOB_BACKEND]);
+
+    async setDataBackendConfig(backendName, patch) {
+        if (Workspace.#ALWAYS_ON_BACKENDS.has(backendName)) {
+            if (patch?.enabled === false) {
+                throw new Error(`Data backend "${backendName}" is structural and cannot be disabled`);
+            }
+            if (patch && 'readOnly' in patch) {
+                throw new Error(`Data backend "${backendName}" is a managed store — read-only does not apply`);
+            }
+        }
+        if (patch && 'scanOnStart' in patch && typeof patch.scanOnStart !== 'boolean') {
+            throw new Error('scanOnStart must be a boolean');
+        }
+        const dataBackends = this.dataBackends;
+        const next = { ...dataBackends[backendName], ...patch };
+        dataBackends[backendName] = next;
+        this.#writeStoredBackends(dataBackends);
+        this.emit('dataBackends.changed', { backend: backendName, config: this.dataBackends[backendName] });
+        if (this.#storedIndex?.isRunning) {
+            await this.#storedIndex.applyBackendConfig(backendName, this.#runtimeBackends()[backendName], this.#withoutSecrets && containsSecrets(next) ? { ...patch, enabled: false } : patch).catch((err) =>
+                this.#logger.warn({ workspaceId: this.id, backend: backendName, error: err.message }, 'Failed to apply data-backend config'),
+            );
+        }
+    }
+
+    // Database maintenance settings (Workspaces > Settings > Database).
+    // orphanRetentionDays: window before GC purges feature/orphaned docs;
+    // -1 (default) keeps orphans forever — explicit cleanup goes through the
+    // feature/orphaned filter or gcOrphanedDocuments().
+    get databaseSettings() {
+        return { orphanRetentionDays: -1, ...(this.#configStore.get('database') || {}) };
+    }
+
+    setDatabaseSettings(patch = {}) {
+        const next = { ...this.databaseSettings, ...patch };
+        this.#configStore.set('database', next);
+        this.emit('databaseSettings.changed', { workspaceId: this.id, settings: next });
+        return next;
+    }
+
+    /** Purge orphaned (feature/orphaned) documents past the retention window. */
+    async gcOrphanedDocuments(options = {}) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.gcOrphanedDocuments(options);
+    }
+
+    setServiceConfig(serviceName, config) {
+        const services = this.services;
+        services[serviceName] = { ...services[serviceName], ...config };
+        this.#configStore.set('services', this.#crypto.protect(services));
+        this.emit('services.changed', { service: serviceName, config: redactSecrets(this.services[serviceName]) });
+    }
+
+    setPublicCanvasShares(shares) {
+        if (!shares || typeof shares !== 'object' || Array.isArray(shares)) return false;
+        this.#configStore.set('publicCanvasShares', shares);
+        this.emit('publicCanvasShares.changed', { id: this.id, publicCanvasShares: shares });
+        return true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Links
+    // ─────────────────────────────────────────────────────────────────────────
+
+    listLinks(type = null) {
+        const links = this.links || {};
+        if (!type) return links;
+        return Array.isArray(links[type]) ? links[type] : [];
+    }
+
+    addLink(type, ref) {
+        if (!type || typeof type !== 'string') return false;
+        if (!ref || typeof ref !== 'string') return false;
+
+        const links = this.links || {};
+        const arr = Array.isArray(links[type]) ? links[type] : [];
+        if (arr.includes(ref)) return true;
+
+        links[type] = [...arr, ref];
+        this.#configStore.set('links', links);
+        this.emit('links.changed', { id: this.id, type, action: 'add', ref });
+        return true;
+    }
+
+    removeLink(type, ref) {
+        if (!type || typeof type !== 'string') return false;
+        if (!ref || typeof ref !== 'string') return false;
+
+        const links = this.links || {};
+        const arr = Array.isArray(links[type]) ? links[type] : [];
+        if (!arr.length) return true;
+
+        links[type] = arr.filter(r => r !== ref);
+        this.#configStore.set('links', links);
+        this.emit('links.changed', { id: this.id, type, action: 'remove', ref });
+        return true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Pins — per-workspace list of tree paths the user is actively working in
+    // (task containers). Stored in workspace.json `pins`, ordered; the order IS
+    // the arrangement (tiles render in array order). Every client (webui,
+    // desktop overlay, agents) reads the same list, so this is the one home.
+    //
+    // A pin is keyed on tree + path. The layer id captured at pin time is a
+    // self-heal hint: when the path no longer resolves (folder moved/renamed)
+    // the pin is re-pointed at the layer's current path on read; when the
+    // layer is gone the pin stays, flagged `resolvable:false` — never dropped
+    // behind the user's back.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    get pins() {
+        const raw = this.#configStore.get('pins', []);
+        return Array.isArray(raw) ? raw.filter((p) => p && typeof p === 'object' && typeof p.path === 'string') : [];
+    }
+
+    static normalizePinPath(path) {
+        const cleaned = `/${String(path ?? '').trim()}`.replace(/\/+/g, '/').replace(/\/$/, '');
+        return cleaned || '/';
+    }
+
+    #pinKey(tree, path) {
+        return `${tree || Workspace.CONTEXT_TREE_NAME}\0${Workspace.normalizePinPath(path)}`;
+    }
+
+    #savePins(pins, action, detail = {}) {
+        this.#configStore.set('pins', pins);
+        this.emit('pins.changed', { id: this.id, action, pins, ...detail });
+        return pins;
+    }
+
+    /**
+     * Pin a tree path. Idempotent on (tree, path): re-pinning an existing pin
+     * returns it unchanged.
+     * @returns {{ pin: object, created: boolean }}
+     */
+    addPin({ tree = Workspace.CONTEXT_TREE_NAME, path, label = null } = {}) {
+        const normalizedPath = Workspace.normalizePinPath(path);
+        if (normalizedPath === '/') throw new Error('The tree root cannot be pinned');
+        const treeName = typeof tree === 'string' && tree.trim() ? tree.trim() : Workspace.CONTEXT_TREE_NAME;
+        const pins = this.pins;
+        const key = this.#pinKey(treeName, normalizedPath);
+        const existing = pins.find((p) => this.#pinKey(p.tree, p.path) === key);
+        if (existing) return { pin: existing, created: false };
+
+        // A pin on a path that does not exist would dangle from the start —
+        // refuse it (getTree throws on an unknown tree, that bubbles up too).
+        let layerId = null;
+        if (this.isActive) {
+            const layer = this.getTree(treeName)?.getLayerForPath(normalizedPath);
+            if (!layer) throw new Error(`Path not found in tree "${treeName}": ${normalizedPath}`);
+            layerId = layer.id || null;
+        }
+        const pin = {
+            id: randomUUID(),
+            tree: treeName,
+            path: normalizedPath,
+            layerId,
+            label: typeof label === 'string' && label.trim() ? label.trim() : null,
+            createdAt: new Date().toISOString(),
+        };
+        this.#savePins([...pins, pin], 'add', { pin });
+        return { pin, created: true };
+    }
+
+    /**
+     * Unpin by pin id, or by (tree, path).
+     * @returns {boolean} true when a pin was removed
+     */
+    removePin(idOrPath, tree = null) {
+        const pins = this.pins;
+        const key = tree ? this.#pinKey(tree, idOrPath) : null;
+        const remaining = pins.filter((p) => p.id !== idOrPath && (!key || this.#pinKey(p.tree, p.path) !== key));
+        if (remaining.length === pins.length) return false;
+        const removed = pins.filter((p) => !remaining.includes(p));
+        this.#savePins(remaining, 'remove', { removed });
+        return true;
+    }
+
+    /**
+     * Reorder pins. `order` is a list of pin ids; ids not mentioned keep
+     * their relative order after the listed ones, unknown ids are ignored.
+     */
+    reorderPins(order = []) {
+        const pins = this.pins;
+        const byId = new Map(pins.map((p) => [p.id, p]));
+        const ordered = [];
+        for (const id of Array.isArray(order) ? order : []) {
+            const pin = byId.get(id);
+            if (pin && !ordered.includes(pin)) ordered.push(pin);
+        }
+        for (const pin of pins) if (!ordered.includes(pin)) ordered.push(pin);
+        const changed = ordered.some((p, i) => p !== pins[i]);
+        return changed ? this.#savePins(ordered, 'reorder') : pins;
+    }
+
+    /**
+     * Pins resolved against the live trees: each entry carries the layer's
+     * current presentation (label, description, color, icon, metadata) plus
+     * `resolvable`. On a stopped workspace nothing can be resolved and
+     * `resolvable` is null. Self-heals moved/renamed pins via their layer id.
+     */
+    listPins() {
+        const pins = this.pins;
+        if (!this.isActive) return pins.map((pin) => ({ ...pin, name: pin.path.split('/').pop(), resolvable: null }));
+
+        let healed = false;
+        const resolved = pins.map((pin) => {
+            const name = pin.path.split('/').pop();
+            let tree = null;
+            try { tree = this.getTree(pin.tree || Workspace.CONTEXT_TREE_NAME); } catch { tree = null; }
+            if (!tree) return { ...pin, name, resolvable: false };
+
+            let layer = tree.getLayerForPath(pin.path);
+            let path = pin.path;
+            // Path gone but the layer is still around → follow it.
+            if (!layer && pin.layerId && typeof tree.getPathByLayerId === 'function') {
+                const current = tree.getPathByLayerId(pin.layerId);
+                if (current && current !== '/') {
+                    layer = tree.getLayerForPath(current);
+                    if (layer) { path = Workspace.normalizePinPath(current); pin.path = path; healed = true; }
+                }
+            }
+            if (!layer) return { ...pin, name, resolvable: false };
+            const json = typeof layer.toJSON === 'function' ? layer.toJSON() : layer;
+            const metadata = json.metadata && typeof json.metadata === 'object' ? json.metadata : {};
+            const ui = metadata.ui && typeof metadata.ui === 'object' ? metadata.ui : {};
+            if (json.id && pin.layerId !== json.id) { pin.layerId = json.id; healed = true; }
+            return {
+                ...pin,
+                path,
+                name: json.name || name,
+                label: pin.label || json.label || json.name || name,
+                description: json.description || null,
+                type: json.type || null,
+                color: typeof ui.color === 'string' ? ui.color : (json.color || null),
+                icon: typeof ui.icon === 'string' ? ui.icon : null,
+                metadata,
+                locked: !!json.locked,
+                resolvable: true,
+            };
+        });
+        // Persist heals silently (no event: nothing the user did changed).
+        if (healed) this.#configStore.set('pins', pins);
+        return resolved;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Lifecycle
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Concurrent callers (WebDAV auto-start fires one per parallel request)
+    // must share ONE in-flight start: isActive only flips near the end, so an
+    // unserialized second call would re-run the whole sequence against a fresh
+    // #db whose tree registry isn't loaded yet — duplicating the pre-created
+    // trees ("context" et al.) in LMDB.
+    async start(options = {}) {
+        if (this.#protectionPromise) throw protectionError('WORKSPACE_BUSY', 'Workspace protection is being changed', 409);
+        if (this.isActive) return this;
+        if (this.#startPromise) return this.#startPromise;
+        this.#startPromise = this.#doStart(options).finally(() => { this.#startPromise = null; });
+        return this.#startPromise;
+    }
+
+    // One-time workspace.json schema migration (mirrors stored's
+    // #migrateLegacyStoredLayout): flat top-level `dataBackends` — with the
+    // cache as a fake 'stored.cache' backend — becomes services.stored
+    // { root, cache, sync, backends }, and the internals map is materialized
+    // (carrying over any legacy `directories` overrides). Idempotent: the
+    // legacy key is deleted after the rewrite, and every step is guarded on
+    // "target absent". This is the only code that persists a normalized
+    // config back to disk.
+    #migrateConfigSchema() {
+        try {
+            const services = this.#configStore.get('services') || {};
+            const legacy = this.#configStore.get('dataBackends');
+            const legacyDirs = this.#configStore.get('directories', {}) || {};
+            const storedDefaults = workspaceStoredDefault(this.layout);
+            if (!services.stored && legacy && typeof legacy === 'object') {
+                const { 'stored.cache': legacyCache, ...backends } = legacy;
+                const stored = {
+                    ...storedDefaults,
+                    root: legacyDirs.stored ?? storedDefaults.root,
+                    cache: legacyCache?.root ?? legacyDirs.cache ?? storedDefaults.cache,
+                    backends,
+                };
+                this.#configStore.set('services', { ...services, stored });
+                this.#logger.info({ workspaceId: this.id }, 'Migrated workspace.json dataBackends → services.stored');
+            }
+            if (this.#configStore.get('dataBackends') !== undefined && (this.#configStore.get('services') || {}).stored) {
+                this.#configStore.delete('dataBackends');
+            }
+            if (!this.#configStore.get('internals')) {
+                const internalDefaults = workspaceInternals(this.layout);
+                this.#configStore.set('internals', {
+                    db: legacyDirs.db ?? internalDefaults.db,
+                    config: legacyDirs.config ?? internalDefaults.config,
+                    var: legacyDirs.var ?? internalDefaults.var,
+                    tmp: legacyDirs.varTmp ?? internalDefaults.tmp,
+                });
+            }
+            // Pre-layout workspaces have no `layout` key; stamping the resolved
+            // value (always 'full' for them) keeps the file self-describing and
+            // makes the field readable without knowing the default.
+            if (!this.#configStore.get('layout')) {
+                this.#configStore.set('layout', this.layout);
+            }
+        } catch (err) {
+            this.#logger.warn({ workspaceId: this.id, error: err.message }, 'workspace.json schema migration skipped');
+        }
+    }
+
+    async #doStart({ passphrase, withoutSecrets = false } = {}) {
+        this.#logger.debug({ workspaceId: this.id }, 'Starting workspace');
+        try {
+            this.#withoutSecrets = false;
+            if (this.#configStore.get('protection')?.mode && !this.#crypto.protected) throw protectionError('WORKSPACE_KEYS_CORRUPT', 'Workspace keyslot file is missing');
+            if (this.#crypto.protected) {
+                const mode = this.#crypto.mode;
+                if (withoutSecrets && mode === 'secrets' && !passphrase) this.#withoutSecrets = true;
+                else await this.#crypto.unlock(passphrase);
+            } else if (withoutSecrets) this.#withoutSecrets = true;
+            this.#inferd = this.#withoutSecrets ? null : this.#configuredInferd;
+            this.#migrateConfigSchema();
+            this.#migrateSecrets();
+            this.#assertLayoutSane();
+            await Promise.all([
+                // `home` layout: the internals dir must exist before anything
+                // below it is created, and it is the one dir the user's drive
+                // (= the root) must never surface.
+                ...(this.internalsPath ? [fsPromises.mkdir(this.internalsPath, { recursive: true })] : []),
+                fsPromises.mkdir(this.cachePath, { recursive: true }),
+                fsPromises.mkdir(this.dataPath, { recursive: true }),
+                fsPromises.mkdir(this.homePath, { recursive: true }),
+                fsPromises.mkdir(this.hooksPath, { recursive: true }),
+            ]);
+
+            const dbPath = this.dbPath;
+            // Resolve this workspace's embedding backends BEFORE synapsd starts:
+            // the vector spaces (tables + ledger keys) are latched at Db
+            // construction. workspace.json wins over the owner's defaults, so a
+            // moved/standalone workspace keeps embedding as its vectors were built.
+            const inferdSpaces = !this.#withoutSecrets && this.#inferd?.spaceConfigsForWorkspace
+                ? await this.#inferd.spaceConfigsForWorkspace(this.id, { userId: this.owner, config: this.#resolveCredentials(this.inferdConfig) }).catch((err) => {
+                    this.#logger.warn({ workspaceId: this.id, error: err.message }, 'inferd space config resolve failed; using defaults');
+                    return undefined;
+                })
+                : undefined;
+            this.#db = new Db({
+                path: dbPath,
+                // synapsd owns no model; if the inferd service is present, hand it
+                // the query embedder so dense/hybrid search works. Absent → FTS.
+                semantic: !this.#withoutSecrets && this.#inferd
+                    ? {
+                        // Bound to the OWNER: a query must be embedded by the same
+                        // model that filled the space, or the kNN is noise.
+                        embedQuery: (text, space) => this.#inferd.embedQueryForWorkspace(this.id, text, space),
+                        // The inferd router owns each space's model + dim, so it also
+                        // owns where those vectors live: a space on its baseline model
+                        // keeps the original table, any other model gets its own table
+                        // AND its own presence/seen ledger. That is what makes a model
+                        // swap reversible — switch back and the previous vectors are
+                        // still there, still marked embedded, nothing to redo.
+                        spaces: inferdSpaces,
+                        // Workspace-level search tuning (persisted in workspace.json
+                        // under `semantic`). Undefined → synapsd defaults.
+                        imageMaxDistance: (this.#configStore.get('semantic', {}) || {}).imageMaxDistance,
+                        imageFloorMode: (this.#configStore.get('semantic', {}) || {}).imageFloorMode,
+                        imageRelativeMargin: (this.#configStore.get('semantic', {}) || {}).imageRelativeMargin,
+                        searchWeights: (this.#configStore.get('semantic', {}) || {}).searchWeights,
+                    }
+                    : undefined,
+                // Every synapsd write shares one lock, so a 2 ms paste can wait
+                // seconds behind ingest/embedding work. Name the holders when it
+                // does (CANVAS_SLOW_WRITE_MS, default 1000).
+                slowWriteMs: Number(process.env.CANVAS_SLOW_WRITE_MS) || 1000,
+                onSlowWrite: (report) => this.#logger.warn({ workspaceId: this.id, ...report }, 'Slow synapsd write: waited on the write lock'),
+            });
+            instrumentDb(this.#db);
+            await this.#db.start();
+            await this.#ensureContextTree();
+            await this.#ensureDirectoryTree();
+            await this.#ensureBackendsTree();
+            this.#bindRuntimeEvents();
+            this.#registerInferd();
+            // Resume interrupted embedding: the inferd queue is in-memory, so a
+            // restart mid-ingest strands docs in the durable bitmap ledger until
+            // something re-drives them. Reconcile is a cheap idempotent bitmap
+            // read when there is no gap — safe to fire on every start.
+            if (!this.#withoutSecrets && this.#inferd?.reconcile) {
+                this.#inferd.reconcile(this.id).then((r) => {
+                    if (r?.enqueued > 0) {
+                        this.#logger.info({ workspaceId: this.id, enqueued: r.enqueued }, 'Embedding reconcile resumed pending docs');
+                    }
+                }).catch((err) =>
+                    this.#logger.warn({ workspaceId: this.id, error: err.message }, 'Start-time embedding reconcile failed'));
+            }
+            // Mark ACTIVE before booting stored/mail indices: their initial sync
+            // (IMAP scan → ingestMessage → #put → #getActiveDb) needs isActive,
+            // otherwise every fetched message rejects with "Workspace not active".
+            this.#setStatus(WORKSPACE_STATUS_CODES.ACTIVE);
+            if (this.isServiceEnabled('home') || Object.values(this.dataBackends).some(cfg => cfg?.enabled && cfg.supported !== false)) {
+                await this.#startStoredIndex();
+                for (const [name, cfg] of Object.entries(this.dataBackends)) {
+                    if (!cfg?.enabled || !cfg.resync || cfg.supported === false || !(cfg.scanOnStart ?? (cfg.driver === 'file'))) continue;
+                    // Reconcile files changed while the workspace was stopped.
+                    // Keep startup responsive; cached checksums make unchanged
+                    // files cheap, and resync state drives the UI progress indicator.
+                    // Remote mounts retain their existing catch-up behavior.
+                    try { this.#storedIndex.resyncInBackground(name); } catch (err) {
+                        this.#logger.warn({ workspaceId: this.id, backend: name, error: err.message }, 'Start-time resync failed to start');
+                    }
+                }
+            }
+
+            this.#startContactExtraction();
+            // Background, once per workspace: never delays start.
+            this.#runDataMigrations().catch((err) =>
+                this.#logger.warn({ workspaceId: this.id, error: err.message }, 'Data migrations failed; will retry on next start'));
+
+            this.emit('started', { id: this.id });
+            return this;
+        } catch (err) {
+            console.error(`Failed to start workspace "${this.id}": ${err.message}`);
+            try { await this.#stopStoredIndex(); } catch { /* continue cleanup */ }
+            await this.#stopContactExtraction();
+            this.#unregisterInferd();
+            this.#unbindRuntimeEvents();
+            try { await this.#db?.shutdown(); } catch { /* continue cleanup */ }
+            this.#db = null;
+            this.#crypto.stop();
+            this.#withoutSecrets = false;
+            this.#setStatus(WORKSPACE_STATUS_CODES.INACTIVE);
+            throw err;
+        }
+    }
+
+    async stop(reason = 'user-request') {
+        if (this.#protectionPromise) { try { await this.#protectionPromise; } catch { /* release keys below */ } }
+        if (this.#startPromise) { try { await this.#startPromise; } catch { /* already stopped */ } }
+        this.#configStore.set('lastStopReason', reason);
+        this.#configStore.set('stoppedAt', new Date().toISOString());
+        if (this.#status === WORKSPACE_STATUS_CODES.INACTIVE) { this.#crypto.stop(); return true; }
+
+        this.#logger.debug({ workspaceId: this.id }, 'Stopping workspace');
+        try {
+            this.#unregisterInferd();
+            // Sessions subscribe to db events and hold its bitmaps — drop them
+            // before the db goes away, or they keep firing against a dead handle.
+            this.#closeSessions();
+            await this.#stopStoredIndex();
+            await this.#stopContactExtraction();
+            if (this.#db) {
+                this.#unbindRuntimeEvents();
+                await this.#db.shutdown();
+                this.#db = null;
+            }
+            this.#setStatus(WORKSPACE_STATUS_CODES.INACTIVE);
+            this.emit('stopped', { id: this.id });
+            return true;
+        } catch (err) {
+            console.error(`Error stopping workspace "${this.id}": ${err.message}`);
+            this.#setStatus(WORKSPACE_STATUS_CODES.ERROR);
+            return false;
+        } finally {
+            this.#crypto.stop();
+            this.#withoutSecrets = false;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CRUD Methods
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #getActiveDb() {
+        if (!this.isActive || !this.#db) throw workspaceStopped(this);
+        return this.#db;
+    }
+
+    #normalizeFeatureInput(features = [], attributes) {
+        return features.length > 0 ? features : (attributes?.allOf ?? attributes ?? []);
+    }
+
+    // Extract raw path strings from a context/directory input (string | string[] |
+    // { tree?, path }). The tree qualifier is dropped on purpose: a workspace has
+    // exactly one context tree and one directory tree, so the db's ctx:/dir:
+    // default-tree resolution always lands on them.
+    static #extractPaths(value) {
+        if (value == null) { return []; }
+        let paths = value;
+        if (typeof value === 'object' && !Array.isArray(value)) {
+            paths = value.path ?? value.context ?? value.directory ?? '/';
+        }
+        return (Array.isArray(paths) ? paths : [paths]).filter((p) => typeof p === 'string');
+    }
+
+    static #buildPaths(context, directory) {
+        return [
+            ...Workspace.#extractPaths(context).map((p) => `ctx:${p}`),
+            ...Workspace.#extractPaths(directory).map((p) => `dir:${p}`),
+        ];
+    }
+
+    static #isTreeQualified(value) {
+        return Boolean(value && typeof value === 'object' && !Array.isArray(value) && (value.tree ?? value.treeId));
+    }
+
+    // Write-target spec for db.put/link/unlink. The ctx:/dir: paths grammar can
+    // only address the DEFAULT trees, so tree-qualified selectors (e.g. the
+    // backends tree) must be passed through as selector objects instead.
+    static #buildWriteSpec(context, directory) {
+        if (Workspace.#isTreeQualified(context) || Workspace.#isTreeQualified(directory)) {
+            const toSelector = (value) => {
+                if (value == null) { return null; }
+                if (typeof value === 'object' && !Array.isArray(value)) { return value; }
+                return { path: value };
+            };
+            return { context: toSelector(context), directory: toSelector(directory) };
+        }
+        return { paths: Workspace.#buildPaths(context, directory) };
+    }
+
+    #normalizeQuerySpec(spec = {}) {
+        const { attributes, features = null, context, directory, limit = 200, ...rest } = spec;
+        // Tree-qualified selectors survive as selector objects (parseSpec keeps
+        // the tree id per entry); the paths string grammar targets default trees.
+        if (Workspace.#isTreeQualified(context) || Workspace.#isTreeQualified(directory)) {
+            return {
+                limit,
+                ...rest,
+                ...(context != null ? { context } : {}),
+                ...(directory != null ? { directory } : {}),
+                ...(features != null ? { features } : {}),
+                ...(features == null && attributes != null ? { features: attributes } : {}),
+            };
+        }
+        const paths = Workspace.#buildPaths(context, directory);
+        return {
+            limit,
+            ...rest,
+            ...(paths.length ? { paths } : {}),
+            ...(features != null ? { features } : {}),
+            ...(features == null && attributes != null ? { features: attributes } : {}),
+        };
+    }
+
+    #assertBackendsWriteAllowed(directory, allowBackendsWrite = false) {
+        if (allowBackendsWrite || directory == null) { return; }
+        if (this.#isBackendsTreeSelector(directory)) {
+            throw new Error('Backends tree is read-only through the generic document API');
+        }
+    }
+
+    // Does a directory selector target the backends tree? (by tree id or name)
+    #isBackendsTreeSelector(directory) {
+        if (!Workspace.#isTreeQualified(directory)) { return false; }
+        const backends = this.#db?.getTree(Workspace.BACKENDS_TREE_NAME);
+        if (!backends) { return false; }
+        const target = this.#db.getTree(directory.tree ?? directory.treeId);
+        return target?.id === backends.id;
+    }
+
+    async put(record, { context = '/', directory = null, features = [], attributes, emitEvent = true, allowBackendsWrite = false, provenance = null } = {}) {
+        this.#assertBackendsWriteAllowed(directory, allowBackendsWrite);
+        const writtenThrough = allowBackendsWrite
+            ? null
+            : await this.#connectorWriteThrough(record, this.#normalizeFeatureInput(features, attributes));
+        if (writtenThrough) return writtenThrough.id;
+        const result = await this.#getActiveDb().put(record, {
+            ...Workspace.#buildWriteSpec(context, directory),
+            features: this.#normalizeFeatureInput(features, attributes),
+            emitEvent,
+            ...(provenance ? { provenance } : {}),
+        });
+        // A re-put of identical content resolves to the SAME document by
+        // checksum, so this is also the path a copy-then-delete move takes.
+        await this.#untrashOnLink(result).catch(() => {});
+        return result;
+    }
+
+    async link(id, { context = '/', directory = null, features = [], attributes, emitEvent = true, allowBackendsWrite = false, provenance = null } = {}) {
+        this.#assertBackendsWriteAllowed(directory, allowBackendsWrite);
+        const result = await this.#getActiveDb().link(id, {
+            ...Workspace.#buildWriteSpec(context, directory),
+            features: this.#normalizeFeatureInput(features, attributes),
+            emitEvent,
+            ...(provenance ? { provenance } : {}),
+        });
+        await this.#untrashOnLink(id).catch(() => {});
+        await this.#cascadeThreadContext('link', [id], context, emitEvent);
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Threads — the thread is the unit of work, the message is the unit of
+    // storage. See docs/connectors.md "Threads".
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Every message below this one on the `replies-to` incoming axis. Chat
+     * drivers point each reply at the thread ROOT (Slack `thread_ts`, Graph
+     * `replyToId`), so that is one hop; email points at the IMMEDIATE parent
+     * (In-Reply-To), so a thread is a chain and the walk is a bounded BFS.
+     * Each iterator is drained synchronously (LMDB read-txn caveat).
+     */
+    #threadReplyIds(id) {
+        const rootId = parseDocumentId(id, 'Document ID');
+        const seen = new Set([rootId]);
+        const queue = [rootId];
+        const out = [];
+        try {
+            const edges = this.#getActiveDb().edges;
+            while (queue.length && out.length < Workspace.THREAD_CASCADE_LIMIT) {
+                const current = queue.shift();
+                for (const replyId of [...edges.incoming(current, 'replies-to')].map(Number)) {
+                    if (seen.has(replyId)) continue;
+                    seen.add(replyId);
+                    out.push(replyId);
+                    queue.push(replyId);
+                }
+            }
+        } catch { /* no edge plane (degraded db) — nothing to cascade */ }
+        return out;
+    }
+
+    /** Upper bound on replies one link/unlink will drag along. */
+    static THREAD_CASCADE_LIMIT = 1000;
+
+    /**
+     * Filing a thread root into a context pulls its replies along; taking it
+     * out takes them out. CONTEXT tree only: directory (backends) placement is
+     * where the bytes came from, and a reply already lives beside its root
+     * there. Transitive over `replies-to` (bounded), and a reply that fails to
+     * follow never fails the caller's own link. `/` is skipped — every
+     * document is at the context root already and unlink refuses to remove it.
+     */
+    async #cascadeThreadContext(op, ids, context, emitEvent = true) {
+        if (context == null) return;
+        if (typeof context === 'string' && (context.trim() === '' || context.trim() === '/')) return;
+        const db = this.#getActiveDb();
+        for (const id of ids) {
+            const replies = this.#threadReplyIds(id);
+            if (!replies.length) continue;
+            const spec = { ...Workspace.#buildWriteSpec(context, null), features: [], emitEvent };
+            for (const replyId of replies) {
+                if (Number(replyId) === Number(id)) continue;
+                await (op === 'link' ? db.link(replyId, spec) : db.unlink(replyId, spec)).catch((error) =>
+                    this.#logger.warn({ workspaceId: this.id, root: id, reply: replyId, op, error: error.message }, 'Thread membership cascade failed'));
+            }
+        }
+    }
+
+    /** Paths from `paths` that are not a strict prefix (ancestor) of another. */
+    static leafPaths(paths = []) {
+        const list = [...new Set((paths || []).filter(Boolean))];
+        return list.filter((p) => !list.some((q) => q !== p && q.startsWith(p.endsWith('/') ? p : `${p}/`)));
+    }
+
+    /**
+     * Copy a thread root's CONTEXT placements onto a reply. The ingest-side
+     * half of the thread rule: a reply that arrives after its root was curated
+     * lands where the root is. Directory placements are deliberately not
+     * copied — the connector already filed the reply under its channel.
+     */
+    async inheritThreadMemberships(replyId, rootId) {
+        const reply = parseDocumentId(replyId, 'Reply document ID');
+        const root = parseDocumentId(rootId, 'Root document ID');
+        if (reply === root) return 0;
+        let copied = 0;
+        for (const placement of await this.listDocumentPlacements(root)) {
+            if (placement.type !== 'context') continue;
+            // A context path ANDs the layers along it, so memberships list
+            // every ancestor too; linking the leaves ticks those already.
+            for (const treePath of Workspace.leafPaths(placement.paths)) {
+                if (!treePath || treePath === '/') continue;
+                await this.#getActiveDb().link(reply, { context: { tree: placement.treeId, path: treePath }, features: [], emitEvent: true });
+                copied++;
+            }
+        }
+        return copied;
+    }
+
+    /**
+     * Remove a document from a path. Non-destructive: the document survives in
+     * the store and in every other path it is filed under.
+     *
+     * `options.trashIfOrphaned` adds the filesystem-mount rule — if this was the
+     * document's LAST placement it is filed into the trash path instead of
+     * becoming reachable only through the flat workspace-wide list. See
+     * `docs/data-representation.md`.
+     */
+    async unlink(id, { context = null, directory = null, features = [], attributes } = {}, options = {}) {
+        this.#assertBackendsWriteAllowed(directory, options.allowBackendsWrite === true);
+        const { trashIfOrphaned = false, ...dbOptions } = options;
+
+        // Snapshot placements BEFORE the unlink — afterwards the very paths a
+        // restore would have to put the document back into are gone.
+        const placementsBefore = trashIfOrphaned
+            ? await this.listDocumentPlacements(id).catch(() => [])
+            : null;
+
+        const result = await this.#getActiveDb().unlink(id, {
+            ...Workspace.#buildWriteSpec(context, directory),
+            features: this.#normalizeFeatureInput(features, attributes),
+            ...dbOptions,
+        });
+
+        if (trashIfOrphaned) { await this.#trashIfOrphaned(id, placementsBefore); }
+        await this.#cascadeThreadContext('unlink', [id], context);
+        return result;
+    }
+
+    async delete(id, options = {}) {
+        const docId = parseDocumentId(id, 'Document ID');
+        const { managedBlobs, checksums } = await this.#collectDeletionArtifacts([docId]);
+        const result = await this.#getActiveDb().delete(docId, options);
+        if (result) {
+            await this.#cascadeManagedBlobDeletion(managedBlobs);
+            await this.#purgeDeletedDocThumbnails(checksums);
+        }
+        return result;
+    }
+
+    async get(id, options = { parse: true }) {
+        return await this.#getActiveDb().get(parseDocumentId(id, 'Document ID'), options);
+    }
+
+    async has(id, { context = null, directory = null, features = [], attributes } = {}) {
+        return await this.#getActiveDb().has(parseDocumentId(id, 'Document ID'), {
+            ...Workspace.#buildWriteSpec(context, directory),
+            features: this.#normalizeFeatureInput(features, attributes),
+        });
+    }
+
+    async putMany(records, { context = '/', directory = null, features = [], attributes, allowBackendsWrite = false } = {}) {
+        this.#assertBackendsWriteAllowed(directory, allowBackendsWrite);
+
+        // Documents that mirror a remote object go to their source first (see
+        // #connectorWriteThrough). Everything else keeps the single batched
+        // write it always had — the split only happens when the batch actually
+        // contains a mirrored document, which is the rare case.
+        const list = Array.isArray(records) ? records : [records];
+        const normalizedFeatures = this.#normalizeFeatureInput(features, attributes);
+        const writtenThrough = allowBackendsWrite ? [] : await Promise.all(
+            list.map((record) => this.#connectorWriteThrough(record, normalizedFeatures)),
+        );
+        if (!writtenThrough.some(Boolean)) {
+            return await this.#getActiveDb().putMany(list, {
+                ...Workspace.#buildWriteSpec(context, directory),
+                features: this.#normalizeFeatureInput(features, attributes),
+            });
+        }
+
+        const localIndexes = [];
+        const local = [];
+        list.forEach((record, index) => {
+            if (writtenThrough[index]) return;
+            localIndexes.push(index);
+            local.push(record);
+        });
+        const localIds = local.length
+            ? await this.#getActiveDb().putMany(local, {
+                ...Workspace.#buildWriteSpec(context, directory),
+                features: this.#normalizeFeatureInput(features, attributes),
+            })
+            : [];
+
+        // Reassemble in the caller's order — a batch's result array is
+        // positional, and callers match ids back to what they sent.
+        const out = list.map((_, index) => writtenThrough[index]?.id ?? null);
+        localIndexes.forEach((index, i) => { out[index] = Array.isArray(localIds) ? localIds[i] : null; });
+        return out;
+    }
+
+    /**
+     * Write-through to a connector source.
+     *
+     * A document that mirrors a remote object (a synced GitHub issue, a CalDAV
+     * event) must be changed AT THE SOURCE, not in the mirror: the sync cursor
+     * would otherwise overwrite a local-only edit at the next poll and the user
+     * would watch their change silently revert. So an update of such a document
+     * goes to the driver first, and what the source returns is re-ingested —
+     * identity is the provenance URL, so that is a clean upsert of the same
+     * document.
+     *
+     * Returns `{ id }` when it took the write, `null` to fall through to the
+     * ordinary local write. Falls through — rather than failing — whenever the
+     * document is not a live mirror or its backend cannot push updates, so a
+     * read-only connector keeps behaving exactly as before. It does NOT swallow
+     * remote failures: once this path is taken, a driver error propagates,
+     * because an edit that silently landed only locally is worse than an error.
+     */
+    async #connectorWriteThrough(record, features = []) {
+        const id = Number(record?.id);
+        if (!Number.isInteger(id) || id <= 0) return null;
+        const patch = record?.data;
+        if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return null;
+
+        const existing = await this.get(id).catch(() => null);
+        if (!existing) return null;
+
+        const provenanceUrl = (existing.locations || [])
+            .map((location) => (typeof location === 'string' ? location : location?.url))
+            .find((url) => connectorDriverForProvenanceUrl(url));
+        if (!provenanceUrl) return null;
+
+        /*
+         * Falling through with a mirrored document still costs something: a
+         * plain local write recomputes the checksum array from content, which
+         * DESTROYS the identity checksum (sha256 of the provenance URL) the
+         * connector dedups on — so the next sync no longer recognises the
+         * document and forks a duplicate beside it. Re-stamping the identity
+         * keeps the document a mirror: the local edit stands until the source
+         * next contradicts it, which is the honest outcome for something the
+         * user cannot actually write to.
+         */
+        const fallThroughLocally = () => {
+            if (record.checksumArray === undefined) {
+                record.checksumArray = [WorkspaceConnectorIndex.identityChecksum(provenanceUrl)];
+            }
+            return null;
+        };
+
+        // Boot the connector service only now — the provenance URL already
+        // proves this document mirrors a source, so the cost lands on the one
+        // update that needs it rather than on every document write. (The
+        // service does not auto-start unless the home backend is enabled.)
+        const connectors = await this.#connectors().catch(() => null);
+        if (!connectors) return fallThroughLocally();
+
+        const target = await connectors
+            .resolveBackendForProvenance(provenanceUrl, existing.metadata?.connector)
+            .catch(() => null);
+        if (!target) return fallThroughLocally();
+        if (!connectors.supportsWrite(target.driver, target.address, 'update')) return fallThroughLocally();
+
+        let result;
+        try {
+            result = await connectors.updateDocument(
+                target.driver, target.address, { provenanceUrl }, patch, { features },
+            );
+        } catch (error) {
+            // The source refused (revoked token, missing scope, deleted object).
+            // Retag it so the transport can pass the reason through instead of a
+            // generic 500 — "Failed to update documents" tells the user nothing
+            // about the one thing that actually went wrong.
+            const rejected = new Error(`${target.driver} rejected the change: ${error.message}`);
+            rejected.code = 'ECONNECTORWRITE';
+            rejected.cause = error;
+            throw rejected;
+        }
+        this.#logger.debug({ workspaceId: this.id, docId: id, provenanceUrl }, 'Document update written through to connector source');
+        return { id: result?.docId ?? id };
+    }
+
+    // ── Embedding (inferd service seam) ───────────────────────────────────────
+    // synapsd owns no embedding model; the inferd service computes vectors and
+    // pushes them back here. These two methods are the workspace-level adapter
+    // the inferd service registers with (storeVectors + resolveInput).
+
+    // Mid-ingest maintenance cadence: every N vector upserts, compact the Lance
+    // tables + refresh the ANN index. Each upsert is its own delete+add commit,
+    // so a bulk import otherwise accumulates thousands of tiny fragments that
+    // every query must brute-force scan — search latency grows with ingest
+    // progress until it times out. Runs inside the (sequential) inferd queue
+    // handler, so it never races other vector writes.
+    static #EMBED_OPTIMIZE_EVERY = Math.max(50, Number(process.env.CANVAS_INFERD_OPTIMIZE_EVERY) || 500);
+
+    /** Vector sink: persist inferd-computed chunk vectors into a synapsd space. */
+    async storeDocumentEmbeddings(docId, schema, updatedAt, chunks, opts = {}) {
+        const res = await this.#getActiveDb().storeDocumentEmbeddings(
+            parseDocumentId(docId, 'Document ID'), schema, updatedAt, chunks, opts,
+        );
+        if (++this.#embedStoreCount >= Workspace.#EMBED_OPTIMIZE_EVERY) {
+            this.#embedStoreCount = 0;
+            await this.#optimizeSearchIndexes('mid-ingest');
+        }
+        return res;
+    }
+
+    /**
+     * Compact Lance fragments, prune old versions and (re)build ANN indexes for
+     * all vector spaces + the FTS table. Best-effort: FTS compaction can lose a
+     * commit race against concurrent document puts (chokidar ingest) — that
+     * attempt aborts harmlessly and the next cadence retries.
+     */
+    async #optimizeSearchIndexes(reason) {
+        const db = this.#getActiveDb();
+        try {
+            await db.optimizeVectors();
+            await db.optimizeLance();
+            this.#logger.info({ workspaceId: this.id, reason }, 'Search indexes optimized');
+        } catch (error) {
+            this.#logger.warn({ workspaceId: this.id, reason, error: error.message }, 'Search index optimize failed');
+        }
+    }
+
+    /**
+     * Re-resolve this workspace's embedding backends and swap synapsd's vector
+     * spaces to match — applied live, no workspace restart.
+     *
+     * Writes are quiesced first: the workspace's embedding queue is paused and
+     * its in-flight batch allowed to finish, otherwise a batch straddling the
+     * swap would scatter half its chunks into the outgoing table.
+     */
+    async applyInferdSpaces() {
+        if (!this.#inferd || !this.isActive) { return { applied: false, reason: 'workspace not active' }; }
+        const spaces = await this.#inferd.spaceConfigsForWorkspace(this.id, {
+            userId: this.owner, config: this.#resolveCredentials(this.inferdConfig),
+        });
+        // Await: the drain below is only meaningful once the pause landed.
+        await this.#inferd.pause(this.id);
+        try {
+            await this.#inferd.drained(this.id);
+            const result = await this.#getActiveDb().setVectorSpaces(spaces);
+            this.#logger.info({ workspaceId: this.id, tables: result.tables }, 'Embedding vector spaces swapped');
+            return result;
+        } finally {
+            await this.#inferd.resume(this.id);
+        }
+    }
+
+    /** Document ids under a `ctx://` / `dir://` path — scopes a partial re-embed. */
+    async documentIdsUnderScope(scope) {
+        return await this.#getActiveDb().documentIdsUnderScope(scope);
+    }
+
+    /** Ledger read: docIds that match `schemas` but have no embedding for `space`. */
+    async getUnembeddedDocIds(space = 'text', schemas = null) {
+        return await this.#getActiveDb().getUnembeddedDocIds(space, schemas);
+    }
+
+    /** Wipe an embedding space (vectors + presence + seen) for a full re-embed. */
+    async clearSpace(space = 'text') {
+        return await this.#getActiveDb().clearSpace(space);
+    }
+
+    /**
+     * Dense-vector tables in this workspace, flagged with which are live. Tables
+     * a model swap left behind report `active:false` — they still hold their
+     * vectors so switching back is free, and this is how you find the ones worth
+     * reclaiming.
+     */
+    async listVectorTables() {
+        return await this.#getActiveDb().listVectorTables();
+    }
+
+    /** Drop a superseded model's vectors + ledger. Refuses live tables. */
+    async dropVectorTable(name) {
+        return await this.#getActiveDb().dropVectorTable(name);
+    }
+
+    // ── inferd registration + live enqueue ────────────────────────────────────
+
+    /** Register this workspace with the shared inferd service + subscribe events. */
+    #registerInferd() {
+        if (this.#withoutSecrets || !this.#inferd || this.#inferdRegistered) { return; }
+        this.#inferd.registerWorkspace(this.id, {
+            resolveInput: (docId) => this.resolveEmbeddingInput(docId),
+            storeVectors: (docId, schema, updatedAt, chunks, opts) =>
+                this.storeDocumentEmbeddings(docId, schema, updatedAt, chunks, opts),
+            getUnembedded: (space, schemas) => this.getUnembeddedDocIds(space, schemas),
+            documentIdsUnderScope: (scope) => this.documentIdsUnderScope(scope),
+            clearSpace: (space) => this.clearSpace(space),
+            imageDocumentIds: () => this.imageDocumentIds(),
+            setSummary: (docId, text) => this.setDocumentSummary(docId, text),
+            onQueueDrained: () => {
+                // The shared queue drains after every trickle (a single note
+                // save); a full compact + HNSW rebuild per save would dwarf the
+                // ingest itself. Only optimize once enough upserts accumulated —
+                // queries tolerate a few dozen fragments fine.
+                if (this.#embedStoreCount < 50) { return; }
+                this.#embedStoreCount = 0;
+                return this.#optimizeSearchIndexes('queue-drained');
+            },
+        }, { userId: this.owner, config: this.#resolveCredentials(this.inferdConfig) });
+        // Live enqueue: new + content-updated docs. Blob ingestion also lands as
+        // document.inserted (WorkspaceStoredIndex creates docs), so this covers
+        // stored files too — no separate object:add subscription needed.
+        //
+        // Batch ops (tab ingestion, 100+ uploads, fs/directory bulk ingest) are
+        // the common case — they emit `.batch` events with an id array. We
+        // subscribe to both the singular and `.batch` variants: some bulk
+        // emitters (putManyDirectoryPaths) fire only the singular event with
+        // `ids`, regular putMany fires both. The queue dedups by
+        // `${wsId}:${id}`, so the one overlap (putMany emitting both) is a
+        // harmless no-op — no path is missed or embedded twice.
+        //
+        // `document.updated` also fires for membership-only changes; the
+        // handler drops those on `reason` (see below) — a link changes no
+        // bytes, so there is nothing to re-embed.
+        this.on('document.inserted', this.#onDocEventForEmbed);
+        this.on('document.updated', this.#onDocEventForEmbed);
+        this.on('document.inserted.batch', this.#onDocEventForEmbed);
+        this.on('document.updated.batch', this.#onDocEventForEmbed);
+        this.#inferdRegistered = true;
+    }
+
+    #unregisterInferd() {
+        if (!this.#inferd || !this.#inferdRegistered) { return; }
+        this.off('document.inserted', this.#onDocEventForEmbed);
+        this.off('document.updated', this.#onDocEventForEmbed);
+        this.off('document.inserted.batch', this.#onDocEventForEmbed);
+        this.off('document.updated.batch', this.#onDocEventForEmbed);
+        this.#inferd.unregisterWorkspace(this.id);
+        this.#inferdRegistered = false;
+    }
+
+    // Handles both single (`{ id }`) and batch (`{ ids: [...] }`) payloads;
+    // enqueueMany routes through the same deduped queue as enqueue.
+    #onDocEventForEmbed = (payload) => {
+        if (!this.#inferd) { return; }
+        // A membership-only update (link/unlink) did not touch a single byte of
+        // the document — re-embedding it is pure waste, and on a bulk link of a
+        // photo folder it is a CLIP pass over the whole folder for nothing.
+        // This is what the `reason` discriminator is for.
+        if (payload?.reason === 'membership') { return; }
+        const ids = Array.isArray(payload?.ids)
+            ? payload.ids
+            : (payload?.id != null ? [payload.id] : []);
+        if (ids.length === 0) { return; }
+        this.#inferd.enqueueMany(this.id, ids);
+    };
+
+    /**
+     * Input source for embedding one document. Return shapes:
+     *   - null                          → doc gone (do NOT record as seen)
+     *   - { skip:true, schema, ... }    → exists but not inferdable (record as seen)
+     *   - { modality, schema, ... }     → inferdable (text|image + text|bytes)
+     *
+     * A `data/schema/file` is a byte blob: embed it from its *content*
+     * (text/* → utf8, image/* → bytes), never from generateEmbeddingsData (which
+     * for File yields the location URL string — garbage to embed). Only JSON
+     * abstractions (note, …) use generateEmbeddingsData.
+     */
+    async resolveEmbeddingInput(docId) {
+        const doc = await this.#getActiveDb().getDocument(parseDocumentId(docId, 'Document ID')).catch(() => null);
+        if (!doc) { return null; }
+
+        const schema = doc.schema;
+        const updatedAt = doc.updatedAt || new Date().toISOString();
+        const chunkOpts = doc.indexOptions?.embeddingOptions?.chunking || {};
+        const classification = classifyDocument(doc);
+        // Use the classifier's mime (filename-derived when the stored contentType
+        // is missing/generic) — the raw metadata.contentType can be the useless
+        // 'application/json' default for fs-indexed images, which the embed router
+        // (routes on image/*) would reject.
+        const contentType = classification.mime || doc.metadata?.contentType || null;
+        // User-authored comment rides along on every return shape (even skip/image),
+        // so the inferd worker can give any commented doc a dedicated text vector.
+        const comment = doc.hasComment ? doc.comment.trim() : '';
+        // Generated summary (metadata.summary, captioner output) rides the same
+        // rails into its own reserved text-space chunk.
+        const summary = doc.hasSummary ? doc.metadata.summary.trim() : '';
+
+        if (classification.isFile()) {
+            // Byte blob: only text/image content is inferdable; everything else
+            // (pdf, octet-stream, …) is a deliberate skip until a decoder/CLIP
+            // model exists. Bytes must be reachable from this instance: stored://,
+            // workspace files, or file://<deviceId> when the id is THIS device
+            // (foreign-device locations throw and fall through to skip).
+            if (!classification.isBlob() || !contentType) { return { skip: true, schema, updatedAt, contentType, comment, summary }; }
+            const modality = classification.embeddingModality();
+            if (!modality) { return { skip: true, schema, updatedAt, contentType, comment, summary }; }
+            let resolveError = null;
+            const resolved = await this.resolveDocument(doc).catch((e) => { resolveError = e; return null; });
+            if (!resolved?.buffer) {
+                // We classified this as an inferdable blob but its bytes are
+                // unreachable — usually stale/dead locations (e.g. a removed backend
+                // like the legacy fs:home). Surface it instead of silently skipping,
+                // so resync location cleanup can be triggered.
+                this.#logger.warn({
+                    workspaceId: this.id,
+                    docId: doc.id,
+                    modality,
+                    contentType,
+                    locations: (doc.locations || []).map((l) => l.url),
+                    error: resolveError?.message,
+                }, 'embed: could not resolve blob bytes (stale/unreachable locations)');
+                return { skip: true, schema, updatedAt, contentType, comment, summary };
+            }
+            if (modality === 'image') {
+                const enrichedAt = await this.#enrichImageDocMetadata(doc, resolved.buffer, contentType)
+                    .catch((e) => { this.#logger.warn({ workspaceId: this.id, docId: doc.id, error: e.message }, 'embed: image metadata enrichment failed'); return null; });
+                return { modality, schema, updatedAt: enrichedAt || updatedAt, bytes: resolved.buffer, contentType, comment, summary };
+            }
+            const textAt = await this.#enrichTextDocMetadata(doc, resolved.buffer, contentType)
+                .catch((e) => { this.#logger.warn({ workspaceId: this.id, docId: doc.id, error: e.message }, 'embed: text metadata enrichment failed'); return null; });
+            return { modality, schema, updatedAt: textAt || updatedAt, text: resolved.buffer.toString('utf8'), contentType, chunkOpts, comment, summary };
+        }
+
+        // JSON abstraction (note, etc.) → the text the doc exposes for embedding.
+        const data = typeof doc.generateEmbeddingsData === 'function' ? doc.generateEmbeddingsData() : null;
+        const text = Array.isArray(data) ? data.join('\n').trim() : (typeof data === 'string' ? data.trim() : '');
+        if (!text) { return { skip: true, schema, updatedAt, contentType, comment, summary }; }
+        return { modality: 'text', schema, updatedAt, text, contentType, chunkOpts, comment, summary };
+    }
+
+    /**
+     * EXIF/GPS/dimensions enrichment at embed time. Stored-backend ingest
+     * extracts this inline (WorkspaceStoredIndex); photos that never pass
+     * through it (file://-indexed via `ws add`, docs ingested before extraction
+     * existed) hit this seam instead — the embed pipeline is the one place every
+     * image's bytes already flow through. Extracted keys merge into
+     * doc.metadata and an EXIF capture date lands on the 'content' timeline
+     * (same convention as stored ingest), so photos are filterable by when they
+     * were taken rather than when they were indexed.
+     * Returns the post-update updatedAt, or null when nothing was written.
+     */
+    async #enrichImageDocMetadata(doc, buffer, contentType) {
+        const meta = doc.metadata || {};
+        // Bail only on keys that prove extraction already ran. A bare `geo` means
+        // device/manual geo arrived from a client without EXIF ever being read,
+        // so we still extract — the camera's fix outranks the uploader's location
+        // and pickGeo below decides, rather than this guard.
+        if (meta.exif || meta.dimensions) { return null; }
+        const extracted = await extractBlobMetadata({ data: buffer }, { mimeType: contentType, key: `doc:${doc.id}` });
+        const patch = {};
+        for (const k of ['exif', 'dimensions', 'media']) {
+            if (extracted[k] && typeof extracted[k] === 'object') { patch[k] = extracted[k]; }
+        }
+        // metadata patches shallow-merge top-level keys (Document.update), so
+        // `geo` is replaced wholesale — resolve the winner first, and only write
+        // when it actually changes to avoid a no-op update.
+        const geo = pickGeo(meta.geo, extracted.geo, { incomingSource: 'exif' });
+        if (geo && JSON.stringify(geo) !== JSON.stringify(meta.geo)) { patch.geo = geo; }
+        if (Object.keys(patch).length === 0) { return null; }
+
+        const update = { id: doc.id, metadata: patch, updatedAt: new Date().toISOString() };
+        const capturedAt = extracted.exif?.capturedAt;
+        const prior = Array.isArray(doc.timelines) ? doc.timelines : [];
+        if (capturedAt && !prior.some((t) => (t.timeline || t.name) === 'content')) {
+            update.timelines = [...prior, { timeline: 'content', start: capturedAt }];
+        }
+        // emitEvent:false — this runs inside the embed pipeline; a
+        // document.updated event here would re-enqueue the doc and CLIP-embed
+        // every photo a second time.
+        // Enrichment changes content indexes, never virtual-tree placement.
+        await this.#getActiveDb().put(update, { context: null, emitEvent: false });
+        return update.updatedAt;
+    }
+
+    /**
+     * The searchable head of a text blob, at embed time.
+     *
+     * Same seam as image EXIF, for the same reason: stored-backend ingest
+     * extracts this inline, and blobs that never passed through it (`ws add`
+     * via file://, anything ingested before extraction existed) hit this instead
+     * — the embed pipeline is the one place every file's bytes already flow.
+     *
+     * Without it a File is FTS-indexed by its name alone, so a markdown file, a
+     * config or a source file matched nothing you could remember about what it
+     * says. Vectors already covered this case; keyword search did not.
+     * Returns the post-update updatedAt, or null when nothing was written.
+     */
+    async #enrichTextDocMetadata(doc, buffer, contentType) {
+        if (doc.metadata?.text?.content) { return null; }
+        const extracted = await extractBlobMetadata({ data: buffer }, { mimeType: contentType, key: `doc:${doc.id}` });
+        if (!extracted.text?.content) { return null; }
+
+        // emitEvent:false — this runs inside the embed pipeline; a
+        // document.updated event here would re-enqueue the doc and embed it a
+        // second time.
+        const update = { id: doc.id, metadata: { text: extracted.text }, updatedAt: new Date().toISOString() };
+        // Enrichment changes content indexes, never virtual-tree placement.
+        await this.#getActiveDb().put(update, { context: null, emitEvent: false });
+        return update.updatedAt;
+    }
+
+    async linkMany(ids, { context = '/', directory = null, features = [], attributes, emitEvent = true, allowBackendsWrite = false } = {}) {
+        this.#assertBackendsWriteAllowed(directory, allowBackendsWrite);
+        const docIds = parseDocumentIdArray(ids, 'Document ID array');
+        const result = await this.#getActiveDb().linkMany(docIds, {
+            ...Workspace.#buildWriteSpec(context, directory),
+            features: this.#normalizeFeatureInput(features, attributes),
+            emitEvent,
+        });
+        await this.#cascadeThreadContext('link', docIds, context, emitEvent);
+        return result;
+    }
+
+    /** Bulk `unlink`; `options.trashIfOrphaned` applies the same rule per document. */
+    async unlinkMany(ids, { context = null, directory = null, features = [], attributes } = {}, options = {}) {
+        this.#assertBackendsWriteAllowed(directory, options.allowBackendsWrite === true);
+        const docIds = parseDocumentIdArray(ids, 'Document ID array');
+        const { trashIfOrphaned = false, ...dbOptions } = options;
+
+        const placementsBefore = new Map();
+        if (trashIfOrphaned) {
+            for (const docId of docIds) {
+                placementsBefore.set(docId, await this.listDocumentPlacements(docId).catch(() => []));
+            }
+        }
+
+        const result = await this.#getActiveDb().unlinkMany(docIds, {
+            ...Workspace.#buildWriteSpec(context, directory),
+            features: this.#normalizeFeatureInput(features, attributes),
+            ...dbOptions,
+        });
+
+        if (trashIfOrphaned) {
+            for (const entry of (result?.successful ?? [])) {
+                const docId = entry?.id ?? entry;
+                await this.#trashIfOrphaned(docId, placementsBefore.get(docId) || []).catch(() => {});
+            }
+        }
+        await this.#cascadeThreadContext('unlink', docIds, context);
+        return result;
+    }
+
+    async deleteMany(ids, options = {}) {
+        const docIds = parseDocumentIdArray(ids, 'Document ID array');
+        const { managedBlobs, checksums } = await this.#collectDeletionArtifacts(docIds);
+        const result = await this.#getActiveDb().deleteMany(docIds, options);
+        const deletedIds = new Set((result?.successful ?? []).map((entry) => entry?.id ?? entry));
+        await this.#cascadeManagedBlobDeletion(managedBlobs, deletedIds);
+        await this.#purgeDeletedDocThumbnails(checksums, deletedIds);
+        return result;
+    }
+
+    /**
+     * Pre-delete snapshot for a plain index-delete's side effects:
+     * - managedBlobs: documents whose EVERY location lives on a managed stored
+     *   backend (workspace:data — opaque, non-browseable by design) would
+     *   orphan their blobs; the URLs are collected so the bytes can be removed
+     *   after the delete succeeds. Documents with any user-owned location
+     *   (workspace:home file, imap message, device) are never touched.
+     * - checksums: primary checksum per doc, so cached thumbnails (derived
+     *   artifacts keyed thumb:<checksum>:<size>) can be dropped too.
+     */
+    async #collectDeletionArtifacts(ids) {
+        const managedBackends = new Set(Object.entries(this.dataBackends || {})
+            .filter(([, cfg]) => cfg?.managed === true && cfg?.readOnly !== true && cfg?.enabled !== false)
+            .map(([name]) => name));
+        const managedBlobs = new Map();
+        const checksums = new Map();
+        if (ids.length === 0) { return { managedBlobs, checksums }; }
+
+        const fetched = await this.getDocumentsByIdArray(ids, { parse: false }).catch(() => null);
+        const docs = Array.isArray(fetched) ? fetched : (fetched?.data ?? []);
+        for (const doc of docs.filter(Boolean)) {
+            if (Array.isArray(doc.checksumArray) && doc.checksumArray[0]) {
+                checksums.set(doc.id, doc.checksumArray[0]);
+            }
+            const urls = (doc.locations || []).map((l) => l?.url).filter(Boolean);
+            if (urls.length === 0 || managedBackends.size === 0) { continue; }
+            const allManaged = urls.every((url) => {
+                const parsed = parseLocationUrl(url);
+                return parsed?.scheme === 'stored' && managedBackends.has(parsed.backend);
+            });
+            if (allManaged) { managedBlobs.set(doc.id, urls); }
+        }
+        return { managedBlobs, checksums };
+    }
+
+    // Cache hygiene, not correctness (thumbnails are content-addressed): drop
+    // deleted docs' cached thumbnails so derived artifacts don't accumulate.
+    // Skipped when the stored index isn't running — not worth booting it for.
+    async #purgeDeletedDocThumbnails(checksums, deletedIds = null) {
+        if (!checksums || checksums.size === 0 || !this.#storedIndex?.isRunning) { return; }
+        const targets = [];
+        for (const [docId, checksum] of checksums) {
+            if (deletedIds && !deletedIds.has(docId)) { continue; }
+            targets.push(checksum);
+        }
+        if (targets.length > 0) {
+            await this.#storedIndex.purgeThumbnails(targets).catch(() => {});
+        }
+    }
+
+    /** Wipe every cached thumbnail (regenerated on demand). */
+    async clearThumbnailCache() {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return await this.#storedIndex.clearThumbnailCache();
+    }
+
+    async #cascadeManagedBlobDeletion(byId, deletedIds = null) {
+        if (!byId || byId.size === 0) { return; }
+        if (!this.#storedIndex?.isRunning) { await this.#startStoredIndex().catch(() => null); }
+        if (!this.#storedIndex?.isRunning) { return; }
+        for (const [docId, urls] of byId) {
+            if (deletedIds && !deletedIds.has(docId)) { continue; }
+            for (const url of urls) {
+                await this.#storedIndex.deleteStoredUrl(url).catch((err) =>
+                    this.#logger.warn({ workspaceId: this.id, docId, url, error: err.message }, 'Blob cascade: failed to delete managed blob'));
+            }
+        }
+    }
+
+    /**
+     * Resolve a document's content by streaming/reading the first reachable
+     * location (stored:// or file://{WORKSPACE_ROOT}/...).
+     * @param {object} doc document with `locations[]`
+     * @param {{stream?: boolean, url?: string}} [options]
+     * @returns {Promise<{buffer?: Buffer, stream?: ReadStream, url: string}|null>}
+     */
+    async resolveDocument(doc, options = {}) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        const locations = Array.isArray(doc?.locations) ? doc.locations : [];
+        const candidates = options.url ? [{ url: options.url }] : locations;
+        let lastError = null;
+        for (const loc of candidates) {
+            if (!loc?.url) continue;
+            try {
+                const res = await this.#storedIndex.resolve(loc.url, options);
+                const data = res?.data;
+                if (data != null) return { ...(options.stream ? { stream: data } : { buffer: data }), url: loc.url, ranged: !!res.ranged };
+            } catch (err) {
+                // A location on another device (no proxy yet) is an expected
+                // miss — fall through to the next location, and let an
+                // all-miss resolve return null (a clean 404) rather than 500.
+                if (err?.code === 'DEVICE_NOT_REACHABLE') {
+                    this.#logger.debug({ workspaceId: this.id, url: loc.url }, 'Location unreachable from this server (device not proxied)');
+                    continue;
+                }
+                lastError = err;
+            }
+        }
+        if (lastError) throw lastError;
+        return null;
+    }
+
+    /**
+     * Upload raw bytes into the workspace blob store (workspace:data). Returns a
+     * `stored://workspace:data/<key>` location (content-addressed, deduped) that a
+     * File document can then reference — making the bytes server-resident and
+     * inferdable. This is the byte half of `canvas ws insert`.
+     * @param {Buffer|import('stream').Readable} blob buffered or streamed (stored
+     *   hashes a stream on the fly to a temp file — large blobs never buffer in RAM)
+     * @returns {Promise<{url:string, key:string, checksum:string|null, size:number}>}
+     */
+    async persistBlob(blob) {
+        if (!this.#storedIndex?.isRunning) { await this.#startStoredIndex(); }
+        return await this.#storedIndex.persistBlob(blob);
+    }
+
+    async statBlobByChecksum(sha256) {
+        if (!this.#storedIndex?.isRunning) { await this.#startStoredIndex(); }
+        return await this.#storedIndex.statBlobByChecksum(sha256);
+    }
+
+    async getByChecksumString(checksumString, options = { parse: true }) {
+        return await this.#getActiveDb().getByChecksumString(checksumString, options);
+    }
+
+    async listDocumentTreeMemberships(id, treeNameOrId) {
+        return await this.#getActiveDb().listDocumentTreeMemberships(parseDocumentId(id, 'Document ID'), treeNameOrId);
+    }
+
+    /**
+     * Every place this document is filed: which paths of which trees hold it.
+     * The data behind the Synapses tab, and the basis of the orphan test and of
+     * trash restore provenance.
+     */
+    async listDocumentPlacements(id) {
+        const docId = parseDocumentId(id, 'Document ID');
+        const placements = [];
+        for (const tree of await this.listTrees()) {
+            if (!tree) { continue; }
+            const paths = await this.listDocumentTreeMemberships(docId, tree.id).catch(() => []);
+            placements.push({ tree: tree.name, treeId: tree.id, type: tree.type, paths });
+        }
+        return placements;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Relations — typed doc<->doc edges (synapsd edge plane)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Assert `from --predicate--> to` by writing it through the subject
+     * document's own `data.relations`; synapsd derives the edge from the row.
+     * The row is the source of truth — a rebuilt edge plane (`rebuildL3`)
+     * reconstructs every user-drawn relation, which a bare edge-plane write
+     * could not promise. (Relations are structural, not content: checksums,
+     * FTS and embeddings all strip them, so this causes no dedup churn or
+     * re-embed.) Idempotent: asserting a declared relation is a no-op.
+     */
+    async assertRelation(fromId, predicate, toId) {
+        return await this.#getActiveDb().assertRelation(
+            parseDocumentId(fromId, 'Relation source document ID'),
+            predicate,
+            parseDocumentId(toId, 'Relation target document ID'),
+        );
+    }
+
+    /**
+     * Retract an asserted relation: remove it from the subject row's
+     * `data.relations` and drop the derived edge. Derived (extractor/agent)
+     * edges between the same pair survive — they are not the row's to delete.
+     * Returns false when the row does not declare it (or no longer exists).
+     */
+    async retractRelation(fromId, predicate, toId) {
+        return await this.#getActiveDb().retractRelation(
+            parseDocumentId(fromId, 'Relation source document ID'),
+            predicate,
+            parseDocumentId(toId, 'Relation target document ID'),
+        );
+    }
+
+    /**
+     * Every edge touching this document, both directions, with provenance.
+     * `meta.src` is 'doc' for asserted edges (the synthesized default) and
+     * 'extractor:<name>' / 'agent:<hookId>' for derived ones — the UI only
+     * offers to delete the former.
+     */
+    async messageThread(id, { contextPath = null } = {}) {
+        const docId = parseDocumentId(id, 'Document ID');
+        const message = await this.get(docId);
+        if (!message) throw Object.assign(new Error('Message not found'), { statusCode: 404 });
+        if (!['data/schema/message', 'data/schema/message/email'].includes(message.schema)) {
+            throw Object.assign(new Error('This document is not a message'), { statusCode: 400 });
+        }
+        return readMessageThread(docId, {
+            edges: this.#getActiveDb().edges,
+            getMany: (ids) => this.getDocumentsByIdArray(ids),
+            allowedIds: contextPath ? (ids) => this.list({ context: contextPath, ids, idsOnly: true, limit: 200 }) : null,
+        });
+    }
+
+    listDocumentRelations(id) {
+        const docId = parseDocumentId(id, 'Document ID');
+        const edges = this.#getActiveDb().edges;
+        const { outgoing, incoming } = edges.edgesOf(docId);
+        return {
+            outgoing: outgoing.map(({ p, to }) => ({ p, to, meta: edges.edge(docId, p, to)?.meta ?? null })),
+            incoming: incoming.map(({ p, from }) => ({ p, from, meta: edges.edge(from, p, docId)?.meta ?? null })),
+        };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Trash — see docs/data-representation.md
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Is this document filed anywhere a user can navigate to?
+     *
+     * The root of a CONTEXT tree does not count. Every insert ticks it (tree
+     * setting `linkContextRoot`) and `unlink` refuses to remove it, so a `/`
+     * membership there means "exists in this workspace", not "filed somewhere" —
+     * counting it would make every document look filed forever and the orphan
+     * test a constant false. A directory tree's `/` DOES count: it is a real
+     * folder and nothing ticks it implicitly.
+     */
+    static #isFiled(placements) {
+        return placements.some(({ type, paths }) =>
+            paths.some((path) => !(type === Workspace.CONTEXT_TYPE && path === '/')));
+    }
+
+    getTrashSelector() {
+        return this.getDirectoryTreeSelector(Workspace.TRASH_PATH, Workspace.DIRECTORY_TREE_NAME);
+    }
+
+    #trashProvenanceKey(docId) { return `workspace/trash/${docId}`; }
+
+    // File an orphaned document into the trash path. `placementsBefore` is the
+    // snapshot taken before the unlink that orphaned it — restore puts it back
+    // exactly there.
+    async #trashIfOrphaned(id, placementsBefore = null) {
+        const docId = parseDocumentId(id, 'Document ID');
+
+        // Only an unlink that ORPHANS a document trashes it. A document that was
+        // already filed nowhere (never filed, or detached earlier by the plain
+        // API) is left alone: this unlink changed nothing, and sweeping such
+        // documents into the trash on an unrelated bulk remove would be a
+        // surprise — with no provenance to restore them by, at that.
+        if (placementsBefore && !Workspace.#isFiled(placementsBefore)) { return false; }
+
+        const placements = await this.listDocumentPlacements(docId);
+        if (Workspace.#isFiled(placements)) { return false; }
+
+        const db = this.#getActiveDb();
+        await db.link(docId, { context: null, directory: this.getTrashSelector() });
+        await db.internalStore.put(this.#trashProvenanceKey(docId), {
+            trashedAt: new Date().toISOString(),
+            placements: (placementsBefore || []).map(({ tree, treeId, type, paths }) => ({
+                tree, treeId, type,
+                // A context root is not a place to restore to (see #isFiled).
+                paths: paths.filter((path) => !(type === Workspace.CONTEXT_TYPE && path === '/')),
+            })).filter((placement) => placement.paths.length > 0),
+        });
+        this.#trashedIds?.add(docId);
+        return true;
+    }
+
+    // Ids currently in the trash, so the untrash-on-link check on the write path
+    // is a Set lookup rather than an index read. Seeded lazily; kept in sync by
+    // the trash operations themselves (all of which live in this class).
+    #trashedIds = null;
+
+    async #loadTrashedIds() {
+        if (this.#trashedIds) { return this.#trashedIds; }
+        const { ids } = await this.#getActiveDb()
+            .listTreeDocuments(Workspace.DIRECTORY_TREE_NAME, { path: Workspace.TRASH_PATH, idsOnly: true })
+            .catch(() => ({ ids: [] }));
+        this.#trashedIds = new Set(ids || []);
+        return this.#trashedIds;
+    }
+
+    /**
+     * Filing a document anywhere real takes it out of the trash. This is what
+     * makes a file manager's copy-then-delete move self-healing regardless of
+     * which half lands first — content addressing resolves the copy to the same
+     * document, and if the delete got there first, the copy un-trashes it.
+     */
+    async #untrashOnLink(idOrResult) {
+        // put() answers with an id (or a result carrying one); link() is called
+        // with the id directly.
+        const raw = (idOrResult && typeof idOrResult === 'object') ? idOrResult.id : idOrResult;
+        if (raw === undefined || raw === null) { return false; }
+        const docId = parseDocumentId(raw, 'Document ID');
+
+        const trashed = await this.#loadTrashedIds();
+        if (!trashed.has(docId)) { return false; }
+
+        const db = this.#getActiveDb();
+        await db.unlink(docId, { context: null, directory: this.getTrashSelector() });
+        await db.internalStore.remove(this.#trashProvenanceKey(docId));
+        trashed.delete(docId);
+        return true;
+    }
+
+    async listTrash({ limit = null, offset = 0, parse = true } = {}) {
+        const db = this.#getActiveDb();
+        const result = await db.listTreeDocuments(Workspace.DIRECTORY_TREE_NAME, {
+            path: Workspace.TRASH_PATH, limit, offset, parse,
+        });
+        const documents = (result.documents || []).map((document) => ({
+            ...document,
+            trashed: db.internalStore.get(this.#trashProvenanceKey(document.id)) || null,
+        }));
+        return { ...result, documents };
+    }
+
+    /**
+     * Put documents back where they were when they were trashed. Missing tree
+     * paths are recreated — a restore whose folder was deleted meanwhile should
+     * still land somewhere, not fail.
+     */
+    async restoreFromTrash(ids) {
+        const docIds = parseDocumentIdArray(ids, 'Document ID array');
+        const db = this.#getActiveDb();
+        const restored = [];
+        const failed = [];
+
+        for (const docId of docIds) {
+            try {
+                const provenance = db.internalStore.get(this.#trashProvenanceKey(docId));
+                let relinked = 0;
+                for (const placement of (provenance?.placements || [])) {
+                    for (const path of placement.paths) {
+                        const tree = this.getTree(placement.treeId) || this.getTree(placement.tree);
+                        if (!tree) { continue; }
+                        if (!tree.pathExists(path)) { await tree.insertPath(path); }
+                        const selector = placement.type === Workspace.DIRECTORY_TYPE
+                            ? { context: null, directory: this.getDirectoryTreeSelector(path, tree.name) }
+                            : { context: this.getContextTreeSelector(path, tree.name), directory: null };
+                        await db.link(docId, selector);
+                        relinked++;
+                    }
+                }
+
+                // Nothing was put back (no provenance recorded, or its trees are
+                // gone): leave the document IN the trash. Taking it out anyway
+                // would strand it — filed nowhere and no longer listed here.
+                if (relinked === 0) {
+                    failed.push({ id: docId, error: 'No restore target recorded' });
+                    continue;
+                }
+                await this.#untrashOnLink(docId);
+                restored.push(docId);
+            } catch (error) {
+                failed.push({ id: docId, error: error.message });
+            }
+        }
+        return { restored, failed, count: docIds.length };
+    }
+
+    /**
+     * Empty the trash: the ONE place a filesystem-side delete is allowed to
+     * destroy. Purges the index and cascades to canvas-owned (`stored://`)
+     * blobs; foreign locations (imap, a mounted NAS) are never touched — see
+     * "Storage policies" in TODO.md for the policy layer that will replace this
+     * blanket rule.
+     */
+    async emptyTrash({ documentIds = null } = {}) {
+        const db = this.#getActiveDb();
+        const ids = documentIds
+            ? parseDocumentIdArray(documentIds, 'Document ID array')
+            : (await db.listTreeDocuments(Workspace.DIRECTORY_TREE_NAME, {
+                path: Workspace.TRASH_PATH, idsOnly: true,
+            })).ids;
+        if (!ids.length) { return { destroyed: [], failed: [], count: 0 }; }
+
+        const result = await this.deleteMany(ids);
+        const destroyed = (result?.successful ?? []).map((entry) => entry?.id ?? entry);
+        for (const docId of destroyed) {
+            await db.internalStore.remove(this.#trashProvenanceKey(docId));
+            this.#trashedIds?.delete(docId);
+        }
+        return { destroyed, failed: result?.failed ?? [], count: ids.length };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Timeline API (delegated to db.timeline)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    async listTimelines() {
+        return await this.#getActiveDb().timeline.listTimelines();
+    }
+
+    async createTimeline(name) {
+        return await this.#getActiveDb().timeline.createTimeline(name);
+    }
+
+    hasTimeline(name) {
+        return this.#getActiveDb().timeline.hasTimeline(name);
+    }
+
+    async deleteTimeline(name) {
+        return await this.#getActiveDb().timeline.deleteTimeline(name);
+    }
+
+    async queryTimeline(timelineNames, interval, options = {}) {
+        return await this.#getActiveDb().timeline.queryInterval(timelineNames, interval, null, options);
+    }
+
+    // Per-bucket counts across timelines, intersected with the same candidate
+    // scope as list() (context/directory path, features, filters, canvas
+    // querySpec folding) — so rail densities always agree with the document list.
+    async timelineHistogram(names, buckets, spec = {}) {
+        const db = this.#getActiveDb();
+        const querySpec = this.#normalizeQuerySpec(this.#composeCanvasQuerySpec(spec));
+        const { bitmap } = await db.resolveCandidates(querySpec);
+        return await db.timeline.histogram(names, buckets, bitmap);
+    }
+
+    async insertTimelineEntry(timelineName, id, interval) {
+        return await this.#getActiveDb().timeline.insert(timelineName, parseDocumentId(id, 'Document ID'), interval);
+    }
+
+    // Additional (non-primary) positions for a document on one timeline — the
+    // multi-position membership plane. The primary interval stays insert()'s.
+    async insertTimelineEntries(timelineName, id, intervals) {
+        return await this.#getActiveDb().timeline.insertEntries(timelineName, parseDocumentId(id, 'Document ID'), intervals);
+    }
+
+    // Removes the document's PRIMARY interval (BSI planes). Membership cells
+    // from multi-position entries are derived from intervals, so clearing them
+    // needs the intervals they were inserted with — pass them via
+    // `options.intervals` (document-declared entries never need this: the row
+    // is re-derived on update/delete).
+    async removeTimelineEntry(timelineName, id, options = {}) {
+        const db = this.#getActiveDb();
+        const docId = parseDocumentId(id, 'Document ID');
+        if (Array.isArray(options.intervals) && options.intervals.length > 0) {
+            await db.timeline.removeEntries(timelineName, docId, options.intervals);
+        }
+        return await db.timeline.remove(timelineName, docId);
+    }
+
+    // Observed scale tiers for a timeline (both planes, coarse→fine).
+    // Informational — membership tiling is adaptive (per-entry notation-derived
+    // floor, synapsd 3.7.0); no per-timeline granularity config exists anymore.
+    async getTimelineScales(name) {
+        return await this.#getActiveDb().timeline.getScales(name);
+    }
+
+    // Covering decomposition of a range at the range's own notation-derived
+    // floor — what the membership plane would store/probe. Debug/UI surface.
+    decomposeTimelineRange(timelineName, interval) {
+        return this.#getActiveDb().timeline.decomposeRange(timelineName, interval);
+    }
+
+    async hasByChecksumString(checksumString, { context = null, directory = null, features = [], attributes } = {}) {
+        return await this.#getActiveDb().hasByChecksumString(checksumString, {
+            paths: Workspace.#buildPaths(context, directory),
+            features: this.#normalizeFeatureInput(features, attributes),
+        });
+    }
+
+    // Emit a tree-scoped document event for a known selection (e.g. after a
+    // scoped purge) so cross-client consumers (browser extension auto-close, web
+    // UI) refresh. Selectors are { tree, path } as returned by
+    // get{Context,Directory}TreeSelector; pass whichever applies.
+    emitTreeDocumentEvent(eventName, { context = null, directory = null, documentIds = [] } = {}) {
+        this.#getActiveDb().emitTreeDocumentEvent(eventName, { context, directory, documentIds });
+    }
+
+    async list(spec = {}) {
+        const querySpec = this.#normalizeQuerySpec(this.#composeCanvasQuerySpec(spec));
+        const searchQuery = querySpec.query ?? querySpec.search ?? querySpec.q;
+        if (typeof searchQuery === 'string' && searchQuery.trim()) {
+            return await this.#getActiveDb().search(querySpec);
+        }
+        return await this.#getActiveDb().list(querySpec);
+    }
+
+    async search(spec = {}) {
+        const querySpec = this.#normalizeQuerySpec(this.#composeCanvasQuerySpec(spec));
+        if (querySpec.maxDistance === undefined) { querySpec.maxDistance = Workspace.DEFAULT_MAX_COSINE_DISTANCE; }
+        return await this.#getActiveDb().search(querySpec);
+    }
+
+    // Stateless multi-query refinement: `spec` supplies the structured scope
+    // (path/features/filters/canvas), `queries` is the ordered stack of text
+    // queries that AND-narrow it (last ranks). Text is passed separately, so any
+    // single query carried on the spec is dropped from the base scope.
+    async searchRefined(queries = [], spec = {}, options = {}) {
+        const baseSpec = this.#normalizeQuerySpec(this.#composeCanvasQuerySpec(spec));
+        delete baseSpec.query; delete baseSpec.search; delete baseSpec.q;
+        const opts = { ...options };
+        if (opts.maxDistance === undefined) { opts.maxDistance = Workspace.DEFAULT_MAX_COSINE_DISTANCE; }
+        return await this.#getActiveDb().searchRefined(queries, baseSpec, opts);
+    }
+
+    // Compound query: OR/AND of independent refinement chains ("lines"). `spec`
+    // supplies the shared structured scope, each line its own query chain (+
+    // optional per-line filters). See SynapsD.searchCompound for semantics.
+    async searchCompound(lines = [], spec = {}, options = {}) {
+        const baseSpec = this.#normalizeQuerySpec(this.#composeCanvasQuerySpec(spec));
+        delete baseSpec.query; delete baseSpec.search; delete baseSpec.q;
+        const opts = { ...options, baseSpec };
+        if (opts.maxDistance === undefined) { opts.maxDistance = Workspace.DEFAULT_MAX_COSINE_DISTANCE; }
+        return await this.#getActiveDb().searchCompound(lines, opts);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Query sessions (live, delta-emitting views)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Normalize ONE session cue spec the same way list()/search() normalize a
+     * read: canvas querySpec folding + context/directory → the ctx:/dir: paths
+     * grammar.
+     *
+     * Cues are the CANDIDATE-SET stage: bitmap algebra (paths, features,
+     * filters incl. geo, literal id-sets) that can be cached, AND-ed and
+     * precisely invalidated. Text and image relevance are a SCORE, not a
+     * membership predicate — they have no bitmap key to invalidate and belong
+     * to the ranking stage (see buildMatch + QuerySession.materialize). Any
+     * text a canvas leaf folds in is therefore dropped here; the transport
+     * rejects caller-supplied text outright rather than silently ignoring it.
+     * `limit`/`offset` are paging concerns of the session as a whole (opts),
+     * not of a cue, and are dropped too.
+     */
+    normalizeSessionSpec(spec = {}) {
+        const cue = this.#normalizeQuerySpec(this.#composeCanvasQuerySpec(spec));
+        delete cue.query; delete cue.search; delete cue.q;
+        delete cue.limit; delete cue.offset; delete cue.page;
+        delete cue.sortBy; delete cue.order;
+        return cue;
+    }
+
+    /**
+     * Open a long-running, refinable query session over this workspace's db.
+     * Cue specs are workspace-normalized (see normalizeSessionSpec); everything
+     * else — modes, emit shapes, invalidation — is synapsd's QuerySession.
+     *
+     * Sessions hold a reference to the live db, so the workspace tracks them and
+     * closes them on stop(): a session surviving a shutdown would keep emitting
+     * against a torn-down db. The returned session's close() is idempotent and
+     * deregisters itself.
+     *
+     * @param {object|object[]} specs  one spec, an array of specs, or {spec,label}[]
+     * @param {object} opts            { mode, emit, combinator, debounceMs, limit, offset }
+     */
+    async openSession(specs = [], opts = {}) {
+        const db = this.#getActiveDb();
+        const list = (Array.isArray(specs) ? specs : (specs ? [specs] : []))
+            .filter(Boolean)
+            .map((entry) => (entry && typeof entry === 'object' && 'spec' in entry)
+                ? { label: entry.label, spec: this.normalizeSessionSpec(entry.spec) }
+                : this.normalizeSessionSpec(entry));
+
+        const session = await db.openSession(list, opts);
+        this.#sessions.add(session);
+        const close = session.close.bind(session);
+        session.close = () => { this.#sessions.delete(session); close(); };
+        return session;
+    }
+
+    /**
+     * Build a typed match descriptor for the RANKING stage — the second half of
+     * a session read, applied over the cue-narrowed candidate set.
+     *
+     * Text and image fuse: with both, the image rides as a vector leg on
+     * synapsd's typed match and RRF-merges with the full text pipeline (FTS +
+     * dense + text→image kNN), so "broken door" resurfaces the summarized NOTE
+     * about the entrance next to the photos the camera frame matched. Text
+     * alone stays a plain string (the classic fts/vector/hybrid path); an image
+     * alone is a single kNN leg and keeps its exact distance order.
+     *
+     * Returns null when there is nothing to rank by — the caller then gets the
+     * cheap listing path (bitmap slice, no Lance).
+     *
+     * @param {object} p
+     * @param {string|null}  p.text        free text ("broken door")
+     * @param {Buffer|null}  p.imageBytes  EPHEMERAL query image (camera frame) — embedded, never stored
+     * @param {string|null}  p.contentType mime for imageBytes
+     * @param {number|null}  p.similarTo   reuse an indexed document's stored image vector
+     */
+    async buildMatch({ text = null, imageBytes = null, contentType = null, similarTo = null, minDistance, maxDistance } = {}) {
+        const db = this.#getActiveDb();
+        const vectors = [];
+
+        if (imageBytes) {
+            if (!this.#inferd) { throw new Error('inferd service not available for image query embedding'); }
+            const vector = await this.#inferd.embedImageQuery(this.id, imageBytes, contentType);
+            if (!vector) { throw new Error('image query embedding failed (no image-capable provider for this workspace?)'); }
+            vectors.push({ space: 'image', vector, minDistance, maxDistance });
+        } else if (similarTo != null) {
+            const docId = parseDocumentId(similarTo, 'Document ID');
+            const vector = await db.getDocumentVector(docId, 'image');
+            if (!vector) { throw new Error(`document ${docId} has no image-space vector`); }
+            vectors.push({ space: 'image', vector, minDistance, maxDistance });
+        }
+
+        const query = typeof text === 'string' && text.trim().length > 0 ? text.trim() : null;
+        if (!query && vectors.length === 0) { return null; }
+        if (query && vectors.length === 0) { return query; }
+        return { text: query, vectors };
+    }
+
+    /** Close every session opened against this workspace (called from stop()). */
+    #closeSessions() {
+        for (const session of [...this.#sessions]) {
+            try { session.close(); } catch (err) { this.#logger.debug({ err: err.message }, 'Error closing query session'); }
+        }
+        this.#sessions.clear();
+    }
+
+    /**
+     * Search by image over the joint image space. Two query sources:
+     *  - imageBytes: an EPHEMERAL query image (camera frame, upload) — embedded
+     *    via the inferd service, never stored or indexed;
+     *  - similarTo: an already-indexed document id ("more like this") — its
+     *    stored vector is reused, no bytes cross any boundary.
+     * `spec` is the usual structured scope; results come back best-first in
+     * kNN order. No implicit distance floor: a frame query wants its top-K,
+     * pass maxDistance to cut noise (same semantics as the text path).
+     *
+     * Optional `text` switches to FUSED mode: the image becomes a vector leg in
+     * synapsd's typed match descriptor and RRF-fuses with the full text
+     * pipeline (FTS + dense + text→image kNN) — so the image query resurfaces
+     * NOTES ranked by the text, not just photos. Note: fused mode cannot
+     * exclude the similarTo self-match (RRF has no excludeIds); callers pair
+     * similarTo with text knowing the reference doc may rank first.
+     */
+    async searchByImage({ imageBytes = null, contentType = null, similarTo = null, text = null, spec = {}, limit, offset, minDistance, maxDistance, debug = false, idsOnly = false } = {}) {
+        const db = this.#getActiveDb();
+        let vector;
+        let excludeIds = [];
+        if (imageBytes) {
+            if (!this.#inferd) { throw new Error('inferd service not available for image query embedding'); }
+            // A text-only backend (e.g. ollama) throws from embedImage — fold it
+            // into the error envelope instead of 500ing the route.
+            try {
+                vector = await this.#inferd.embedImageQuery(this.id, imageBytes, contentType);
+            } catch (error) {
+                const empty = []; empty.count = 0; empty.totalCount = 0;
+                empty.error = `image query embedding failed: ${error.message}`;
+                return empty;
+            }
+            if (!vector) {
+                const empty = []; empty.count = 0; empty.totalCount = 0;
+                empty.error = 'image query embedding failed (no image-capable provider for this workspace?)';
+                return empty;
+            }
+        } else if (similarTo != null) {
+            const docId = parseDocumentId(similarTo, 'Document ID');
+            vector = await db.getDocumentVector(docId, 'image');
+            if (!vector) {
+                const empty = []; empty.count = 0; empty.totalCount = 0;
+                empty.error = `document ${docId} has no image-space vector`;
+                return empty;
+            }
+            excludeIds = [docId]; // a doc's nearest neighbour is always itself
+        } else {
+            throw new Error('searchByImage requires imageBytes or similarTo');
+        }
+        const querySpec = this.#normalizeQuerySpec(this.#composeCanvasQuerySpec(spec));
+
+        // Fused mode: image rides as a vector leg on the typed match descriptor,
+        // RRF-merged with the text legs by synapsd — notes and photos in one page.
+        if (typeof text === 'string' && text.trim().length > 0) {
+            delete querySpec.query; delete querySpec.search; delete querySpec.q;
+            return await db.search({
+                ...querySpec,
+                query: {
+                    text,
+                    vectors: [{ space: 'image', vector, minDistance, maxDistance }],
+                },
+                limit, offset, idsOnly, debug,
+                maxDistance: Workspace.DEFAULT_MAX_COSINE_DISTANCE, // text dense leg floor
+            });
+        }
+
+        return await db.searchByVector(vector, querySpec, {
+            space: 'image', limit, offset, minDistance, maxDistance,
+            withDistances: !!debug, idsOnly, excludeIds,
+        });
+    }
+
+    /**
+     * If the read targets a path whose leaf is a canvas layer, AND-compose the
+     * canvas's stored querySpec (features + filters) into the spec before
+     * delegating to the DB. Lets `GET /workspaces/:id/documents?context=/foo/bar/baz`
+     * apply baz's querySpec when baz is a canvas — no separate /canvases/:id/documents
+     * endpoint needed.
+     *
+     * Applies to BOTH scope keys: `spec.context` (context tree) and
+     * `spec.directory` (directory tree). Directory membership is node-exact, so
+     * a directory-tree canvas reads its PARENT folder's documents (the canvas
+     * node itself holds none) — with or without a stored querySpec.
+     */
+    #composeCanvasQuerySpec(spec) {
+        if (!spec || typeof spec !== 'object') { return spec; }
+        // Live canvas filter preview: when the client fully drives the filters
+        // (toolbox-on-canvas), it opts out of folding the canvas's STORED
+        // querySpec so its edits — including REMOVING a saved filter — take
+        // effect. Without this the stored spec is always AND-composed, so
+        // loosening a filter would never preview until Save.
+        if (spec.applyCanvasQuerySpec === false) { return spec; }
+        let out = this.#composeCanvasForScope(spec, 'context');
+        out = this.#composeCanvasForScope(out, 'directory');
+        return out;
+    }
+
+    #composeCanvasForScope(spec, scopeKey) {
+        const scope = spec?.[scopeKey];
+        if (!scope) { return spec; }
+
+        let treeRef = null;
+        let paths = [];
+        if (typeof scope === 'string') {
+            paths = [scope];
+        } else if (Array.isArray(scope)) {
+            paths = scope.filter((p) => typeof p === 'string');
+        } else if (typeof scope === 'object') {
+            treeRef = scope.tree ?? scope.treeId ?? null;
+            const p = scope.path ?? scope.context ?? scope.directory;
+            paths = Array.isArray(p) ? p.filter((s) => typeof s === 'string') : (typeof p === 'string' ? [p] : []);
+        }
+        if (paths.length === 0) { return spec; }
+
+        let tree;
+        try {
+            tree = treeRef
+                ? this.getTree(treeRef)
+                : (scopeKey === 'directory' ? this.getDefaultDirectoryTree() : this.getDefaultContextTree());
+        } catch (_) {
+            return spec;
+        }
+        if (!tree || typeof tree.getLayerForPath !== 'function') { return spec; }
+
+        let features = spec.features ?? spec.attributes ?? null;
+        let filters = Array.isArray(spec.filters) ? [...spec.filters] : (spec.filters ? [spec.filters] : []);
+        let query = spec.query ?? spec.search ?? spec.q ?? null;
+        let sort = null;
+        let nextScope = spec[scopeKey];
+        let touched = false;
+
+        for (const path of paths) {
+            let leaf = null;
+            try { leaf = tree.getLayerForPath(path); } catch (_) { /* ignore */ }
+            if (leaf?.type !== 'canvas') { continue; }
+            const qs = leaf.querySpec || {};
+            features = Workspace.#composeCanvasFeatures(features, qs.features);
+            filters = Workspace.#composeCanvasFilters(filters, qs.filters);
+            query = Workspace.#composeCanvasQuery(query, qs.query ?? qs.search ?? qs.q);
+            // A canvas's saved sort is the view's default order; last canvas on
+            // the path wins. The caller (request) overrides it when it sends its
+            // own sortBy — see the injection guard below.
+            if (qs.sort && qs.sort.sortBy) { sort = qs.sort; }
+            if (tree.type === Workspace.DIRECTORY_TYPE) {
+                nextScope = Workspace.#withCanvasParentPath(nextScope, path);
+            }
+            touched = true;
+        }
+
+        if (!touched) { return spec; }
+
+        const callerHasSort = spec.sortBy !== undefined && spec.sortBy !== null && spec.sortBy !== '';
+        return {
+            ...spec,
+            [scopeKey]: nextScope,
+            ...(features !== undefined ? { features } : {}),
+            filters,
+            ...(query ? { query } : {}),
+            ...(sort && !callerHasSort ? { sortBy: sort.sortBy, order: sort.order || spec.order || 'asc' } : {}),
+        };
+    }
+
+    static #composeCanvasFeatures(callerFeatures, canvasFeatures) {
+        if (canvasFeatures === null || canvasFeatures === undefined) { return callerFeatures; }
+        if (callerFeatures === null || callerFeatures === undefined) { return canvasFeatures; }
+        const toBuckets = (f) => {
+            if (Array.isArray(f)) { return { anyOf: [...f] }; }
+            if (f && typeof f === 'object') {
+                const out = {};
+                if (Array.isArray(f.allOf))  { out.allOf  = [...f.allOf]; }
+                if (Array.isArray(f.anyOf))  { out.anyOf  = [...f.anyOf]; }
+                if (Array.isArray(f.noneOf)) { out.noneOf = [...f.noneOf]; }
+                return out;
+            }
+            return {};
+        };
+        const a = toBuckets(callerFeatures);
+        const b = toBuckets(canvasFeatures);
+        const merged = {};
+        for (const key of ['allOf', 'anyOf', 'noneOf']) {
+            const left = a[key] || [];
+            const right = b[key] || [];
+            if (left.length || right.length) {
+                merged[key] = [...new Set([...left, ...right])];
+            }
+        }
+        return Object.keys(merged).length === 0 ? null : merged;
+    }
+
+    static #composeCanvasFilters(callerFilters, canvasFilters) {
+        const a = Array.isArray(callerFilters) ? callerFilters : [];
+        const b = Array.isArray(canvasFilters) ? canvasFilters : [];
+        if (!a.length && !b.length) { return callerFilters || []; }
+        return [...new Set([...a, ...b])];
+    }
+
+    static #composeCanvasQuery(callerQuery, canvasQuery) {
+        const a = typeof callerQuery === 'string' ? callerQuery.trim() : '';
+        const b = typeof canvasQuery === 'string' ? canvasQuery.trim() : '';
+        if (a && b && a !== b) return `${b} ${a}`;
+        return a || b || null;
+    }
+
+    static #withCanvasParentPath(context, canvasPath) {
+        const parentPath = Workspace.#parentPath(canvasPath);
+        if (typeof context === 'string') return parentPath;
+        if (Array.isArray(context)) {
+            return context.map((entry) => entry === canvasPath ? parentPath : entry);
+        }
+        if (context && typeof context === 'object') {
+            const pathValue = context.path ?? context.context;
+            if (Array.isArray(pathValue)) {
+                return { ...context, path: pathValue.map((entry) => entry === canvasPath ? parentPath : entry) };
+            }
+            return { ...context, path: parentPath };
+        }
+        return context;
+    }
+
+    static #parentPath(value) {
+        const normalized = String(value || '/').replace(/\/+/g, '/').replace(/\/$/, '') || '/';
+        if (normalized === '/') return '/';
+        const idx = normalized.lastIndexOf('/');
+        return idx <= 0 ? '/' : normalized.slice(0, idx);
+    }
+
+    getTree(nameOrId) {
+        const tree = nameOrId
+            ? this.#getActiveDb().getTree(nameOrId)
+            : this.#getPreferredContextTree();
+        if (!tree) throw new Error(`Tree not found: ${nameOrId}`);
+        return tree;
+    }
+
+    async listTrees(type = null) {
+        return await this.#getActiveDb().listTrees(type);
+    }
+
+    async createTree(name, type = Workspace.CONTEXT_TYPE, options = {}) {
+        return await this.#getActiveDb().createTree(name, type, options);
+    }
+
+    async renameTree(nameOrId, newName) {
+        this.#assertTreeNotReserved(nameOrId, 'rename');
+        return await this.#getActiveDb().renameTree(nameOrId, newName);
+    }
+
+    async destroyTree(nameOrId) {
+        this.#assertTreeNotReserved(nameOrId, 'delete');
+        return await this.#getActiveDb().deleteTree(nameOrId);
+    }
+
+    // The three pre-created trees (and any tree flagged settings.protected) are
+    // structural — services and clients address them by name.
+    #assertTreeNotReserved(nameOrId, action) {
+        const db = this.#getActiveDb();
+        const tree = db.getTree(nameOrId);
+        if (!tree) { return; }
+        if (tree.settings?.protected === true) {
+            throw new Error(`Cannot ${action} reserved tree "${tree.name}"`);
+        }
+        // Reserved = the canonical instance each structural name resolves to.
+        // A stray duplicate carrying a reserved name (leftover from a start
+        // race) stays deletable by id — only the tree that name-resolution
+        // actually lands on is load-bearing.
+        for (const name of [Workspace.CONTEXT_TREE_NAME, Workspace.DIRECTORY_TREE_NAME, Workspace.BACKENDS_TREE_NAME]) {
+            if (db.getTree(name)?.id === tree.id) {
+                throw new Error(`Cannot ${action} reserved tree "${tree.name}"`);
+            }
+        }
+    }
+
+    getContextTree(nameOrId = null) {
+        const tree = nameOrId ? this.getTree(nameOrId) : this.#getPreferredContextTree();
+        if (tree.type !== Workspace.CONTEXT_TYPE) throw new Error(`Tree is not a context tree: ${nameOrId}`);
+        return tree;
+    }
+
+    getDirectoryTree(nameOrId = null) {
+        const tree = nameOrId ? this.getTree(nameOrId) : this.#getPreferredDirectoryTree();
+        if (tree.type !== Workspace.DIRECTORY_TYPE) throw new Error(`Tree is not a directory tree: ${nameOrId}`);
+        return tree;
+    }
+
+    getDefaultContextTree() { return this.getContextTree(); }
+    getDefaultDirectoryTree() { return this.getDirectoryTree(); }
+
+    /**
+     * Remove a folder from the backends tree AND cascade-purge the documents
+     * that lived under it from the index. Backend-ingested docs are re-synced
+     * if the user re-enables the backend, so this lets a user discard the
+     * leftovers of a backend they removed without orphaning index entries.
+     * Bytes on the backend are NOT touched — see destroyBackendsTreePath for that.
+     *
+     * The backends tree root itself is protected. Doc ids are snapshotted
+     * BEFORE removePath — once the folder (and its membership bitmaps) are gone
+     * the subtree can no longer be resolved.
+     */
+    async removeBackendsTreePath(path, { recursive = false } = {}) {
+        const tree = this.getBackendsTree();
+        const normalizedPath = normalizeBackendsTreePath(path);
+        if (normalizedPath === '/') {
+            throw new Error('Cannot remove the backends root directory');
+        }
+
+        const bitmap = recursive
+            ? await tree.findRecursive(normalizedPath)
+            : await tree.find(normalizedPath);
+        const documentIds = bitmap ? bitmap.toArray() : [];
+
+        const result = await tree.removePath(normalizedPath, recursive);
+        if (result?.error) { return { ...result, purged: 0 }; }
+
+        let purgeResult = null;
+        if (documentIds.length > 0) {
+            purgeResult = await this.deleteMany(documentIds, { emitEvent: false });
+        }
+        return { ...result, purged: purgeResult?.successful?.length || 0, purgeResult };
+    }
+
+    /**
+     * Remove a backends-tree folder AND delete the mirrored resources on the
+     * backend itself (rw backends only; read-only/foreign locations degrade to
+     * reference-drop). The byte half of "remove from canvas AND the backend".
+     *
+     * Per document: locations that belong to the backend mirrored by `path` are
+     * destroyed via the stored index (stored:// delete, workspace file rm, imap
+     * EXPUNGE — readOnly config degrades each to a reference drop). Whatever the
+     * destroy pass didn't fully delete is then purged from the index (destroy
+     * implies purge). The folder is removed last so a mid-failure stays retryable.
+     */
+    async destroyBackendsTreePath(path, { recursive = false } = {}) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        const tree = this.getBackendsTree();
+        const normalizedPath = normalizeBackendsTreePath(path);
+        const segments = normalizedPath.split('/').filter(Boolean); // [driver, address, ...rest]
+        if (segments.length < 2) {
+            throw new Error('destroy requires a backend resource path (/<driver>/<resource-address>/...)');
+        }
+        const node = tree.getLayerForPath(normalizedPath);
+        if (!node) { return { data: null, count: 0, error: `Path not found: ${normalizedPath}` }; }
+        if (node.locked) {
+            throw new Error(`Path is locked: a backend mapped to ${normalizedPath} is enabled`);
+        }
+
+        const [driver, address, ...rest] = segments;
+        const scope = driver === 'imap'
+            ? { kind: 'imap', account: address.toLowerCase(), folder: rest.join('/').toLowerCase() || null }
+            : { kind: 'stored', backend: this.#storedIndex.resolveBackendForTreePath(normalizedPath) };
+
+        const bitmap = recursive ? await tree.findRecursive(normalizedPath) : await tree.find(normalizedPath);
+        const documentIds = bitmap ? bitmap.toArray() : [];
+
+        const destroyed = { docsDestroyed: 0, docsPurged: 0, deletedLocations: 0, droppedRefs: 0, failed: [] };
+        const leftovers = [];
+        for (const id of documentIds) {
+            try {
+                const doc = await this.get(id).catch(() => null);
+                if (!doc) { continue; }
+                const urls = (doc.locations || [])
+                    .map((l) => l?.url)
+                    .filter((url) => Workspace.#locationMatchesBackendScope(url, scope));
+                const res = urls.length > 0
+                    ? await this.destroyDocument(doc, { urls })
+                    : { deleted: [], droppedRefs: [], docDeleted: false };
+                destroyed.deletedLocations += res.deleted.length;
+                destroyed.droppedRefs += res.droppedRefs.length;
+                if (res.docDeleted) { destroyed.docsDestroyed += 1; } else { leftovers.push(id); }
+            } catch (err) {
+                destroyed.failed.push({ id, reason: err.message });
+                leftovers.push(id);
+            }
+        }
+        if (leftovers.length > 0) {
+            const purgeResult = await this.deleteMany(leftovers, { emitEvent: false }).catch(() => null);
+            destroyed.docsPurged = purgeResult?.successful?.length || 0;
+        }
+
+        const result = await tree.removePath(normalizedPath, true);
+        return { ...result, destroyed };
+    }
+
+    /**
+     * Does a location URL belong to the backend scope mirrored by a backends-tree
+     * path? Tree segments are normalized lowercase, so compares are
+     * case-insensitive (IMAP folder INBOX ↔ tree node inbox).
+     */
+    static #locationMatchesBackendScope(url, scope) {
+        if (typeof url !== 'string') { return false; }
+        const parsed = parseLocationUrl(url);
+        if (!parsed) { return false; }
+        if (scope.kind === 'imap') {
+            if (parsed.scheme !== 'imap' || parsed.backend.toLowerCase() !== scope.account) { return false; }
+            if (!scope.folder) { return true; }
+            const folder = parsed.key.split(';')[0].toLowerCase();
+            return folder === scope.folder || folder.startsWith(`${scope.folder}/`);
+        }
+        return parsed.scheme === 'stored' && !!scope.backend && parsed.backend === scope.backend;
+    }
+
+    /**
+     * Backend-node enable-lock: while a backend is enabled, its mirror node
+     * /<driver>/<resource-address> (backends tree) is structurally locked (no
+     * remove/rename/move). Holder-scoped: each backend adds its own
+     * system:backend:<holder> entry, so shared nodes (two mailboxes on one
+     * account) stay locked until the last holder releases.
+     */
+    async lockBackendTreeNode(backendPath, holder) {
+        const tree = this.getBackendsTree();
+        await tree.insertPath(backendPath, { ignoreLocks: true });
+        await tree.lockPath(backendPath, `${Workspace.BACKEND_NODE_LOCK_PREFIX}${holder}`);
+        this.emit('backend.tree.changed', { workspaceId: this.id, treeName: Workspace.BACKENDS_TREE_NAME, path: backendPath });
+    }
+
+    async unlockBackendTreeNode(backendPath, holder) {
+        const tree = this.getBackendsTree();
+        if (typeof tree.pathExists === 'function' && !tree.pathExists(backendPath)) { return; }
+        await tree.unlockPath(backendPath, `${Workspace.BACKEND_NODE_LOCK_PREFIX}${holder}`, { system: true })
+            .catch(() => {});
+        this.emit('backend.tree.changed', { workspaceId: this.id, treeName: Workspace.BACKENDS_TREE_NAME, path: backendPath });
+    }
+
+    getContextTreeSelector(path = '/', treeNameOrId = null) {
+        return this.#normalizeTreeSelector(Workspace.CONTEXT_TYPE, { tree: treeNameOrId, path }, '/');
+    }
+
+    getDirectoryTreeSelector(path = '/', treeNameOrId = null) {
+        return this.#normalizeTreeSelector(Workspace.DIRECTORY_TYPE, { tree: treeNameOrId, path }, '/');
+    }
+
+    getBackendsTreeSelector(path = '/') {
+        const normalizedPath = Array.isArray(path)
+            ? path.map((value) => normalizeBackendsTreePath(value))
+            : normalizeBackendsTreePath(path);
+        return this.getDirectoryTreeSelector(normalizedPath, Workspace.BACKENDS_TREE_NAME);
+    }
+
+    getBackendsTree() {
+        return this.getDirectoryTree(Workspace.BACKENDS_TREE_NAME);
+    }
+
+    /**
+     * A file left the backend: walk up from its folder and drop every node
+     * that is now empty (no documents anywhere below, no children) until the
+     * backend root (`/driver/address`, never removed) or a node that still
+     * holds something. Folders are not objects — a mirror deletes a tree file
+     * by file — so without this every emptied folder stayed on as a shell.
+     * `removePath` refuses non-empty and locked nodes, so a concurrent insert
+     * simply stops the walk.
+     */
+    async pruneEmptyBackendPaths(treePath) {
+        const tree = this.getBackendsTree();
+        if (!tree) return 0;
+        // Paths here are the tree's own (getPathByNodeId / listDocumentTreePaths):
+        // case-exact, so no normalizer — it would fold `Test` to `test` and miss.
+        const segments = String(treePath || '').split('/').filter(Boolean);
+        let removed = 0;
+        while (segments.length > 2) {
+            const current = `/${segments.join('/')}`;
+            if (tree.pathExists(current)) {
+                const docs = await tree.findRecursive(current);
+                if (docs && !docs.isEmpty) break;
+                let result;
+                try { result = await tree.removePath(current, false); } catch { break; }
+                if (result?.error) break;
+                removed += 1;
+            }
+            segments.pop();
+        }
+        return removed;
+    }
+
+    /**
+     * After a resync: remove every empty folder node under a backend root that
+     * is not on disk any more (`keepDirs` = the mount's current directory
+     * skeleton, relative to the root). Deepest first, so a chain of empty
+     * shells collapses in one pass. Locked nodes are left alone.
+     */
+    async sweepEmptyBackendPaths(rootPath, keepDirs = []) {
+        const tree = this.getBackendsTree();
+        if (!tree) return 0;
+        const root = `/${String(rootPath || '').split('/').filter(Boolean).join('/')}`;
+        if (root.split('/').filter(Boolean).length < 2 || !tree.pathExists(root)) return 0;
+        // On-disk dirs resolve through the tree (segment sanitizing and all) to
+        // node ids — comparing ids sidesteps every naming difference.
+        const keep = new Set();
+        for (const dir of keepDirs) for (const id of tree.getNodeIdsForPath(`${root}/${dir}`)) keep.add(id);
+        const rootIds = new Set(tree.getNodeIdsForPath(root));
+        const paths = [];
+        for (const nodeId of tree.getNodeIdsForPath(root, { recursive: true })) {
+            if (rootIds.has(nodeId) || keep.has(nodeId)) continue;
+            const nodePath = await tree.getPathByNodeId(nodeId);
+            if (nodePath && nodePath.startsWith(`${root}/`)) paths.push(nodePath);
+        }
+        paths.sort((a, b) => b.split('/').length - a.split('/').length || a.localeCompare(b));
+        let removed = 0;
+        for (const nodePath of paths) {
+            if (!tree.pathExists(nodePath)) continue;
+            const docs = await tree.findRecursive(nodePath);
+            if (docs && !docs.isEmpty) continue;
+            try { if (!(await tree.removePath(nodePath, false))?.error) removed += 1; } catch { /* locked */ }
+        }
+        return removed;
+    }
+
+    async getDocumentsByIdArray(ids, options = { parse: true }) {
+        return await this.#getActiveDb().getDocumentsByIdArray(parseDocumentIdArray(ids, 'Document ID array'), options);
+    }
+
+    /** Datasets: path-independent ingest provenance (data/dataset/<name>). */
+    async listDatasets() {
+        return await this.#getActiveDb().listDatasets();
+    }
+
+    /**
+     * Drop a dataset (its documents too unless dropDocuments:false). This is the
+     * ONLY sanctioned way to remove a data/dataset/* bitmap — deleteBitmap
+     * refuses the prefix.
+     */
+    async deleteDataset(name, { dropDocuments = true } = {}) {
+        return await this.#getActiveDb().deleteDataset(name, { dropDocuments });
+    }
+
+    async listBitmaps(prefix = '', { includeData = false, includeInternal = false } = {}) {
+        const keys = await this.#getActiveDb().bitmapIndex.listBitmaps(prefix, { includeInternal });
+        const bitmaps = await Promise.all(keys.map(async (key) => this.getBitmap(key, { includeData })));
+        return bitmaps.filter(Boolean);
+    }
+
+    async getBitmap(key, { includeData = false } = {}) {
+        if (!key || typeof key !== 'string') throw new Error('Bitmap key is required');
+
+        const bitmap = await this.#getActiveDb().bitmapIndex.getBitmap(key, false);
+        if (!bitmap) return null;
+
+        const out = {
+            key: bitmap.key,
+            size: bitmap.size,
+            isEmpty: bitmap.isEmpty,
+            min: bitmap.isEmpty ? null : bitmap.minimum(),
+            max: bitmap.isEmpty ? null : bitmap.maximum(),
+        };
+
+        if (includeData) out.ids = bitmap.toArray();
+        return out;
+    }
+
+    async deleteBitmap(key) {
+        if (!key || typeof key !== 'string') throw new Error('Bitmap key is required');
+        const normalized = key.replace(/^\/+|\/+$/g, '');
+        if (normalized.startsWith('data/') || normalized === 'data') {
+            throw new Error(`Refusing to delete bitmap "${key}": data/* bitmaps are protected (managed by document lifecycle).`);
+        }
+        // internal/* are engine-managed (gc, timeline, lance/fts, lance/vectors).
+        // Dropping them corrupts state or forces silent re-index — never via API.
+        if (normalized.startsWith('internal/') || normalized === 'internal') {
+            throw new Error(`Refusing to delete bitmap "${key}": internal/* bitmaps are protected (engine-managed).`);
+        }
+        // NOTE: the old rel/* guard is gone with the bitmaps it protected —
+        // typed doc<->doc edges live in the dupsort edge plane (synapsd
+        // indexes/edges/) since refactor-v3, and 'rel/' is no longer an allowed
+        // bitmap prefix, so such a key cannot exist to be deleted.
+        const db = this.#getActiveDb();
+        const existing = await db.bitmapIndex.getBitmap(normalized, false);
+        if (!existing) return false;
+        await db.bitmapIndex.deleteBitmap(normalized);
+        return true;
+    }
+
+    async getBitmapRawBuffer(key) {
+        if (!key || typeof key !== 'string') throw new Error('Bitmap key is required');
+
+        const bitmap = await this.#getActiveDb().bitmapIndex.getBitmap(key, false);
+        if (!bitmap) return null;
+
+        const serialized = bitmap.serialize(true);
+        return Buffer.isBuffer(serialized) ? serialized : Buffer.from(serialized);
+    }
+
+    #normalizeTreeSelector(type, selector, defaultPath = '/') {
+        if (selector == null) return null;
+
+        if (typeof selector === 'string' || Array.isArray(selector)) {
+            selector = { path: selector };
+        }
+
+        if (typeof selector !== 'object' || Array.isArray(selector)) {
+            throw new Error(`Invalid ${type} selector`);
+        }
+
+        const resolvedPath = selector.path ?? selector[type] ?? defaultPath;
+        const tree = selector.tree ?? selector.treeId ?? null;
+        const resolvedTree = tree
+            ? (type === Workspace.CONTEXT_TYPE ? this.getContextTree(tree) : this.getDirectoryTree(tree))
+            : (type === Workspace.CONTEXT_TYPE ? this.getDefaultContextTree() : this.getDefaultDirectoryTree());
+
+        return { ...selector, tree: resolvedTree.id, path: resolvedPath };
+    }
+
+    clearDatabaseSync() {
+        return this.#getActiveDb().clearSync();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Token Management (delegated to WorkspaceTokens)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    createToken(options = {}) { return this.#tokens.create(options); }
+    listTokens() { return this.#tokens.list(); }
+    deleteToken(hash) { return this.#tokens.delete(hash); }
+    verifyToken(tokenValue) { return this.#tokens.verify(tokenValue); }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Members — e-mail / group grants (delegated to WorkspaceMembers)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** The user's private home ("universe") workspace is never shareable. */
+    get isUniverse() { return this.type === 'universe'; }
+    listMembers() { return this.#members.list(); }
+    getMember(type, principal) { return this.#members.get(type, principal); }
+    grantMember(type, principal, options = {}) {
+        if (this.isUniverse) throw new Error('The universe workspace cannot be shared');
+        return this.#members.grant(type, principal, options);
+    }
+    revokeMember(type, principal) { return this.#members.revoke(type, principal); }
+
+    toJSON() {
+        return {
+            ...redactSecrets(this.config),
+            id: this.id,
+            icon: this.icon,
+            homeScreen: this.homeScreen,
+            status: this.status,
+            protection: this.protection,
+            lastStopReason: this.lastStopReason,
+            stoppedAt: this.stoppedAt,
+            isActive: this.isActive,
+            rootPath: this.rootPath
+        };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Stored home index (delegated to WorkspaceStoredIndex)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    async startHomeService() {
+        if (!this.isActive) return;
+        await this.setDataBackendConfig(WorkspaceStoredIndex.HOME_STORED_BACKEND, { enabled: true });
+        await this.#startStoredIndex();
+    }
+
+    async stopHomeService() {
+        await this.setDataBackendConfig(WorkspaceStoredIndex.HOME_STORED_BACKEND, { enabled: false });
+        await this.#stopStoredIndex();
+    }
+
+    // Per-backend config + runtime status map — feeds the backend descriptors
+    // (#listStorageBackends). Internal since the legacy /services/data-backends
+    // routes were retired; clients consume /:id/backends.
+    #getDataBackendStatus() {
+        const dataBackends = this.dataBackends;
+        return Object.fromEntries(Object.entries(dataBackends).map(([name, config]) => {
+            const runtime = this.#storedIndex?.getBackendStatus(name) || {};
+            return [name, {
+                ...config,
+                root: Workspace.#resolveWorkspaceRoot(config.root, this.#rootPath),
+                running: runtime.running || false,
+                watching: runtime.watching || false,
+                resyncing: runtime.resyncing === true,
+                resyncProgress: runtime.progress || null,
+                resyncStartedAt: runtime.resyncStartedAt || null,
+                lastScanAt: runtime.lastScanAt || null,
+                lastError: this.#withoutSecrets && containsSecrets(config) ? 'Credentials locked — start with PIN/password' : runtime.lastError || null,
+                cacheStats: runtime.cacheStats || null,
+                // Runtime truth (kernel mount table) beats the stored config —
+                // a folder can become a mountpoint, or stop being one, between
+                // restarts.
+                remote: runtime.remote === true || config.remote === true,
+                transport: runtime.transport || config.transport || null,
+                // Full exclusion set applied to watch + resync (defaults ∪ user
+                // `exclude`) so the settings UI can show both.
+                effectiveExclusions: this.#storedIndex?.isRunning
+                    ? this.#storedIndex.getEffectiveExclusions(name)
+                    : undefined,
+            }];
+        }));
+    }
+
+    async #resyncDataBackend(backendName, { background = true } = {}) {
+        const config = this.dataBackends[backendName];
+        if (!config) throw new Error(`Unknown data backend: ${backendName}`);
+        if (!config.supported) throw new Error(`Data backend "${backendName}" is not supported yet`);
+        if (!config.resync) throw new Error(`Data backend "${backendName}" does not support resync`);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        // A resync is a potentially slow full scan (large/remote backends); by
+        // default it runs in the background and progress is reported via the
+        // backend status. Pass { background: false } to await completion.
+        return background
+            ? this.#storedIndex.resyncInBackground(backendName)
+            : this.#storedIndex.resync(backendName);
+    }
+
+    /**
+     * Resync a backend addressed by its backends-tree mirror node path
+     * (/<driver>/<address>/… in the backends tree). Dispatches by driver because
+     * "backend" is overloaded: file/s3/etc. are stored data backends keyed by
+     * name, while imap accounts are mailbox connectors keyed by mailbox id.
+     * The context-menu resync in the tree routes through here. MVP resyncs the
+     * whole backend/account; the folder segment (if any) is ignored.
+     */
+    // ─────────────────────────────────────────────────────────────────────────
+    // Unified backend/connector facade — one surface over every "thing mounted
+    // under /<driver>/<address> in the backends tree": storage backends (file/cacache/s3,
+    // via WorkspaceStoredIndex) and message connectors (imap accounts, via
+    // WorkspaceMailIndex). The /:id/backends routes mirror the tree; driver
+    // dispatch + capabilities live here so the URL never carries an internal id.
+    // Descriptor: { driver, address, kind, enabled, status, lastSyncAt,
+    // lastError, capabilities, containers? }.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Capability map the UI reads to decide which actions to expose — replaces
+    // per-name special-casing. Future container mutation / object delete slot
+    // onto mutableContainers / deleteObject without new URL shapes.
+    #backendCapabilities(driver, config = {}) {
+        if (driver === 'imap') {
+            return { sync: true, test: true, containers: true, mutableContainers: false, deleteObject: true, paths: false };
+        }
+        const supported = config.supported !== false;
+        return {
+            sync: Boolean(config.resync) && supported,
+            test: driver === 'gdrive' && supported,
+            containers: false,
+            mutableContainers: (driver === 'file' || driver === 'gdrive') && config.readOnly !== true && supported,
+            // Direct, create-only uploads use the keyed-object API. Remote
+            // drivers can opt in once they implement the same write contract.
+            upload: driver === 'file' && config.enabled !== false && config.readOnly !== true && supported,
+            deleteObject: config.readOnly !== true && supported,
+            // Objects live under person-chosen paths (folder + filename on
+            // transfer) — false for the content-hash keyed blob store.
+            paths: driver !== 'cacache' && supported,
+        };
+    }
+
+    #storageBackendDescriptor(name, status = {}) {
+        const driver = status.driver || 'file';
+        const state = status.resyncing
+            ? 'syncing'
+            : (status.lastError ? 'error' : (status.running ? (status.watching ? 'running' : 'idle') : 'stopped'));
+        return {
+            driver,
+            address: name,
+            kind: 'storage',
+            enabled: status.enabled !== false,
+            status: state,
+            // Live resync state: clients render a spinner on the mirror node and
+            // a progress readout ({scanned, total}) without polling deep status.
+            resyncing: status.resyncing === true,
+            progress: status.resyncProgress || null,
+            resyncStartedAt: status.resyncStartedAt || null,
+            // Mirror node in the backends tree (/device/<device>/<mount> for
+            // device-scoped mounts) so clients never re-derive path grammar.
+            treePath: this.#storedIndex?.getBackendTreeRoot(name) || null,
+            lastSyncAt: status.lastScanAt || null,
+            lastError: status.lastError || null,
+            // Last on-demand disk usage ({bytes, files, computedAt}) if computed
+            // this runtime — see getBackendDiskUsage.
+            usage: status.diskUsage || null,
+            capabilities: this.#backendCapabilities(driver, status),
+            config: {
+                root: status.root || null,
+                // Display name of a user-added mount ("Financial Reports");
+                // address stays the slug.
+                label: status.label || null,
+                // Authoring device snapshot for device-scoped mounts.
+                device: status.device || null,
+                readOnly: status.readOnly === true,
+                managed: status.managed === true,
+                supported: status.supported !== false,
+                watch: status.watch === true,
+                scanOnStart: status.scanOnStart ?? (driver === 'file'),
+                // Network mount (cifs/nfs/sshfs/…). Detected from the kernel
+                // mount table by the file driver unless declared in config. The
+                // UI badges these and warns before a full resync; watching them
+                // needs explicit polling, since inotify never sees another
+                // client's writes.
+                remote: status.remote === true,
+                transport: status.transport || null,
+                resync: Boolean(status.resync),
+                // Remote (gdrive) extras. Secrets never leave the server:
+                // `credentialsConfigured` is the only trace of them.
+                ...(driver === 'gdrive' ? {
+                    account: status.account || null,
+                    folderId: status.folderId || 'root',
+                    clientId: status.clientId || null,
+                    credentialsConfigured: Boolean(status.clientId && status.clientSecret && status.refreshToken),
+                    pollInterval: status.pollInterval ?? 60000,
+                    permanentDelete: status.permanentDelete === true,
+                } : {}),
+                exclude: Array.isArray(status.exclude) ? status.exclude : [],
+                effectiveExclusions: Array.isArray(status.effectiveExclusions) ? status.effectiveExclusions : undefined,
+            },
+        };
+    }
+
+    #listStorageBackends() {
+        return Object.entries(this.#getDataBackendStatus())
+            .map(([name, status]) => this.#storageBackendDescriptor(name, status));
+    }
+
+    #imapBackendDescriptor(address, mailboxes = []) {
+        const errored = mailboxes.find((m) => m.lastError);
+        const anyRunning = mailboxes.some((m) => m.runtime?.active);
+        const lastSyncAt = mailboxes.map((m) => m.lastSyncAt).filter(Boolean).sort().at(-1) || null;
+        const primary = mailboxes[0] || {};
+        return {
+            driver: 'imap',
+            address,
+            kind: 'messages',
+            enabled: mailboxes.some((m) => m.enabled !== false),
+            status: errored ? 'error' : (anyRunning ? 'running' : 'idle'),
+            lastSyncAt,
+            lastError: errored?.lastError || null,
+            capabilities: this.#backendCapabilities('imap'),
+            // Connection config (from the account's primary mailbox) so the
+            // settings panel can render/edit the account without a second fetch.
+            config: {
+                host: primary.host || '',
+                port: primary.port ?? 993,
+                tls: primary.tls !== false,
+                allowSelfSigned: primary.allowSelfSigned !== false,
+                user: primary.user || '',
+                pollInterval: primary.pollInterval ?? 60000,
+                initialSyncDays: primary.initialSyncDays ?? 180,
+                passwordConfigured: mailboxes.some((m) => m.passwordConfigured),
+                smtp: (mailboxes.find((m) => m.enabled !== false && m.smtp?.enabled && !m.readOnly) || primary).smtp || {},
+                readOnly: mailboxes.every((m) => m.readOnly),
+            },
+            containers: mailboxes.map((m) => ({
+                name: m.folder || 'INBOX',
+                mailboxId: m.id,
+                enabled: m.enabled !== false,
+                status: m.runtime?.status || (m.enabled === false ? 'stopped' : 'idle'),
+                lastSyncAt: m.lastSyncAt || null,
+                lastError: m.lastError || null,
+            })),
+        };
+    }
+
+    // Group per-folder imap mailboxes by account into one instance each. The
+    // account segment matches the backends tree /imap/<account> node.
+    async #listImapBackends() {
+        const mailboxes = await this.listImapMailboxes();
+        const byAccount = new Map();
+        for (const mb of mailboxes) {
+            const address = normalizeSegment(mb.account || mb.user || '');
+            if (!address) continue;
+            if (!byAccount.has(address)) byAccount.set(address, []);
+            byAccount.get(address).push(mb);
+        }
+        return [...byAccount.entries()].map(([address, mbs]) => this.#imapBackendDescriptor(address, mbs));
+    }
+
+    async messagingAccounts() {
+        return (await this.listBackends()).filter((b) => ['imap', 'slack', 'whatsapp'].includes(b.driver)).map((b) => {
+            const c = b.driver === 'imap' ? b.config.smtp || {} : b.config;
+            return { driver: b.driver, address: b.address, enabled: b.enabled !== false,
+                canSend: b.enabled !== false && (b.driver === 'imap' ? c.enabled === true && !b.config.readOnly : c.sendEnabled === true && c.readOnly === false),
+                allowAgentSend: c.allowAgentSend === true, from: c.from || null };
+        });
+    }
+
+    async messageSendStatus(requestId, principal) {
+        return readSendReceipt(path.join(this.varPath, 'message-outbox'), requestId, principal);
+    }
+
+    async messageReplyTarget(id) {
+        const doc = await this.get(id);
+        if (!doc) throw Object.assign(new Error('Document not found'), { statusCode: 404 });
+        const source = sourceAccount(doc);
+        if (source?.driver === 'imap') {
+            const config = await this.#mailReadonly().senderConfig(source.address).catch(() => null);
+            if (config) return { ...source, recipients: emailRecipients(config.smtp.from, {}, doc),
+                allRecipients: emailRecipients(config.smtp.from, { replyAll: true }, doc) };
+        }
+        return source;
+    }
+
+    async sendMessage(input, principal = {}) {
+        return sendWorkspaceMessage(this, this.#mailReadonly(), await this.#connectors(), input, principal);
+    }
+
+    async messageConnection(driver, address, reset = false) {
+        return (await this.#connectors()).messageConnection(driver, address, reset);
+    }
+
+    async listBackends() {
+        return [
+            ...this.#listStorageBackends(),
+            ...(await this.#listImapBackends()),
+            ...(await this.#connectorsReadonly().listStoredBackends()),
+        ];
+    }
+
+    /**
+     * Documents mirrored under a backend address in the backends tree,
+     * optionally filtered by linkage: linked=false → present ONLY on the
+     * backend, never filed into any other tree (safe-to-purge candidates);
+     * linked=true → the inverse; linked=null → everything under the address.
+     */
+    async listBackendDocuments(driver, address, { linked = null, limit = null, offset = 0, parse = true } = {}) {
+        // Storage backends may mirror deeper than /<driver>/<address> (device
+        // segment on fs mounts) — ask the index for the canonical node first.
+        const path = this.#storedIndex?.getBackendTreeRoot(address)
+            || `/${normalizeSegment(driver)}/${normalizeSegment(address)}`;
+        return await this.#getActiveDb().listTreeDocuments(Workspace.BACKENDS_TREE_NAME, { path, linked, limit, offset, parse });
+    }
+
+    async listBackendsByDriver(driver) {
+        return (await this.listBackends()).filter((b) => b.driver === driver);
+    }
+
+    async getBackend(driver, address) {
+        const match = (await this.listBackends()).find((b) => b.driver === driver && b.address === address);
+        if (!match) throw new Error(`Backend not found: ${driver}/${address}`);
+        return match;
+    }
+
+    async addBackend(driver, config = {}) {
+        if (driver === 'imap') return this.saveImapMailbox(config);
+        if (isConnectorDriver(driver)) return (await this.#connectors()).saveBackend(driver, config);
+        if (driver === 'fs') driver = 'file'; // UX alias for the local-folder driver
+        if (driver === 'file') return this.#addFileBackend(config);
+        if (driver === 'gdrive') return this.#addGdriveBackend(config);
+        const name = config.name || config.address;
+        if (!name) throw new Error('Storage backend name is required');
+        await this.setDataBackendConfig(name, config);
+        return this.getBackend(driver, name);
+    }
+
+    // Case- and unicode-preserving slug for a user-added backend: "Fotky" must
+    // show as "Fotky" in the tree, not "fotky" (tree layer names keep case, like
+    // the home mirror's real folder names). Whitespace/separators collapse to
+    // '-'; the slug is the immutable backend address, the raw label stays the
+    // display name. Throws on an (case-insensitive) address collision.
+    #newBackendSlug(label) {
+        const name = String(label).normalize('NFC')
+            .replace(/[\s\\/]+/g, '-')
+            .replace(/[^\p{L}\p{N}._@-]+/gu, '-')
+            .replace(/-+/g, '-')
+            .replace(/^-+|-+$/g, '');
+        if (!name) throw new Error(`Backend name "${label}" has no usable characters`);
+        const collision = Object.keys(this.dataBackends).find((existing) => existing.toLowerCase() === name.toLowerCase());
+        if (collision) throw new Error(`Backend "${collision}" already exists`);
+        return name;
+    }
+
+    /**
+     * Mount an arbitrary local folder as a file data backend. The mount name
+     * ("Financial Reports") is the human handle: its case-preserving slug
+     * becomes the backend address (/device/<device>/Financial-Reports in the
+     * backends tree); documents carry file://<deviceId>/<abs-path> locations.
+     * The display label and the authoring device ({id, name}) are snapshotted
+     * on the config so mirror paths stay stable across device renames.
+     */
+    async #addFileBackend(config = {}) {
+        const label = String(config.label || config.name || config.address || '').trim();
+        if (!label) throw new Error('Backend name is required (e.g. "Financial Reports")');
+        const name = this.#newBackendSlug(label);
+
+        const rawRoot = String(config.root || config.path || '').trim();
+        if (!rawRoot) throw new Error('Backend root path is required');
+        if (!path.isAbsolute(rawRoot)) throw new Error(`Backend root must be an absolute path: ${rawRoot}`);
+        let root;
+        try {
+            root = await fsPromises.realpath(rawRoot);
+        } catch {
+            throw new Error(`Backend root does not exist or is not accessible: ${rawRoot}`);
+        }
+        const stat = await fsPromises.stat(root);
+        if (!stat.isDirectory()) throw new Error(`Backend root is not a directory: ${root}`);
+        await fsPromises.access(root, fsPromises.constants.R_OK).catch(() => {
+            throw new Error(`Backend root is not readable: ${root}`);
+        });
+        // The workspace root is already covered by the managed backends
+        // (workspace:home et al.) — a nested mount would double-index it.
+        const workspaceRoot = path.resolve(this.#rootPath);
+        if (root === workspaceRoot || root.startsWith(workspaceRoot + path.sep)) {
+            throw new Error(`Backend root is inside the workspace root (${workspaceRoot}) — already indexed`);
+        }
+        for (const [existingName, existing] of Object.entries(this.dataBackends)) {
+            if (existing?.driver !== 'file' || !existing.root || existing.root.includes('{WORKSPACE_ROOT}')) continue;
+            const existingRoot = path.resolve(existing.root);
+            if (root === existingRoot || root.startsWith(existingRoot + path.sep) || existingRoot.startsWith(root + path.sep)) {
+                throw new Error(`Backend root overlaps existing backend "${existingName}" (${existingRoot})`);
+            }
+        }
+
+        const device = getServerDevice();
+        const exclude = Array.isArray(config.exclude)
+            ? config.exclude.filter((p) => typeof p === 'string' && p.trim())
+            : [];
+        // Is this folder a network share (NFS/CIFS/sshfs/…)? Snapshotted at
+        // mount time so the UI can badge it before the stored index boots; the
+        // live backend re-detects on every registration, and runtime wins.
+        // An explicit flag in the request always overrides detection.
+        const mount = detectMountSync(root);
+        const remote = config.remote ?? mount.remote;
+        await this.setDataBackendConfig(name, {
+            enabled: true,
+            supported: true,
+            driver: 'file',
+            label,
+            root,
+            remote,
+            transport: config.transport ?? mount.transport,
+            // inotify does not carry another client's writes over the wire, so
+            // watching a share is opt-in polling or nothing. Never silently
+            // enable a watcher that would look live and miss everything.
+            watch: config.watch === true && (!remote || config.usePolling === true),
+            ...(remote && config.usePolling === true
+                ? { usePolling: true, pollInterval: Number(config.pollInterval) || 30000 }
+                : {}),
+            resync: true,
+            scanOnStart: config.scanOnStart ?? true,
+            exclude,
+            readOnly: config.readOnly === true,
+            // Authoring device snapshot: id is the file:// URL authority for
+            // this mount's locations, name the mirror-path device segment.
+            device: { id: device.deviceId, name: device.name },
+        });
+        return this.getBackend('file', name);
+    }
+
+    static #GDRIVE_SECRETS = ['clientSecret', 'refreshToken'];
+
+    // Normalize a gdrive config patch: required creds, folder id, poll interval.
+    // `previous` supplies stored secrets when the patch carries the redacted
+    // marker (`true`) or omits them — the same write-only contract connectors use.
+    #gdriveConfigPatch(input = {}, previous = {}) {
+        const patch = {};
+        for (const key of ['clientId', 'folderId', 'label', 'account']) {
+            if (key in input) patch[key] = String(input[key] ?? '').trim();
+        }
+        for (const key of Workspace.#GDRIVE_SECRETS) {
+            if (!(key in input) || input[key] === true || input[key] === '' || input[key] == null) continue;
+            patch[key] = String(input[key]).trim();
+        }
+        if ('scanOnStart' in input) {
+            if (typeof input.scanOnStart !== 'boolean') throw new Error('scanOnStart must be a boolean');
+            patch.scanOnStart = input.scanOnStart;
+        }
+        if ('watch' in input) patch.watch = input.watch === true;
+        if ('readOnly' in input) patch.readOnly = input.readOnly === true;
+        if ('permanentDelete' in input) patch.permanentDelete = input.permanentDelete === true;
+        if ('pollInterval' in input) {
+            const ms = Number(input.pollInterval);
+            if (!Number.isFinite(ms) || ms < 5000) throw new Error('pollInterval must be at least 5000 ms');
+            patch.pollInterval = ms;
+        }
+        const merged = { ...previous, ...patch };
+        if (!merged.clientId || !merged.clientSecret || !merged.refreshToken) {
+            throw new Error('Google Drive backend requires clientId, clientSecret and refreshToken');
+        }
+        if (!merged.folderId) patch.folderId = 'root';
+        return patch;
+    }
+
+    // Probe creds + root folder with a throwaway driver instance before anything
+    // is persisted — a backend that can't even list its root is a config error.
+    async #probeGdrive(config) {
+        const probe = new GdriveBackend('gdrive:probe', this.#resolveCredentials({ driver: 'gdrive', ...config }));
+        const live = await probe.verifyRoot();
+        if (!live.ok) throw new Error(`Google Drive check failed (${live.reason}): ${live.error || 'unknown error'}`);
+        return { ok: true, folderId: probe.rootFolderId };
+    }
+
+    /**
+     * Add a Google Drive folder as a remote storage backend. The label is the
+     * human handle (slug → backend address → /gdrive/<address> in the backends
+     * tree); `folderId` scopes the subtree (default `root` = whole My Drive).
+     * Credentials are validated against the API before the config is written.
+     */
+    async #addGdriveBackend(config = {}) {
+        const label = String(config.label || config.name || config.address || '').trim();
+        if (!label) throw new Error('Backend name is required (e.g. "Work Drive")');
+        const name = this.#newBackendSlug(label);
+        const patch = this.#gdriveConfigPatch(config, {});
+        await this.#probeGdrive(patch);
+        await this.setDataBackendConfig(name, {
+            enabled: true,
+            supported: true,
+            driver: 'gdrive',
+            label,
+            account: patch.account || label,
+            remote: true,
+            transport: 'gdrive',
+            resync: true,
+            watch: config.watch === true,
+            readOnly: config.readOnly === true,
+            ...patch,
+        });
+        // applyBackendConfig registers the live driver and kicks the initial
+        // scan in the background (resync:true) — nothing more to do here.
+        return this.getBackend('gdrive', name);
+    }
+
+    /**
+     * Copy or move an object from one storage backend to another.
+     *
+     * Content identity is preserved either way — the document keeps its id,
+     * checksums and every curated placement; only `locations[]` changes. A move
+     * releases the source solely after the destination write is durable, so a
+     * failed transfer degrades to a copy and never to data loss.
+     *
+     * @param {string} driver Source driver ('file', 'cacache', …)
+     * @param {string} address Source backend address
+     * @param {object} options
+     * @param {string} options.key Object key on the source backend
+     * @param {string} options.to Target backend address
+     * @param {string} [options.targetKey] Key on the target (defaults to `key`)
+     * @param {'copy'|'move'} [options.mode='copy']
+     */
+    async transferBackendObject(driver, address, { key, to, targetKey, mode = 'copy' } = {}) {
+        if (isConnectorDriver(driver) || driver === 'imap') {
+            throw new Error(`Backend "${driver}/${address}" does not store transferable objects`);
+        }
+        if (!key) throw new Error('Object key is required');
+        if (!to) throw new Error('A target backend is required');
+        if (mode !== 'copy' && mode !== 'move') throw new Error(`Unknown transfer mode: ${mode}`);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+
+        const url = `stored://${address}/${key}`;
+        const result = mode === 'move'
+            ? await this.#storedIndex.moveObject(url, { to, key: targetKey })
+            : await this.#storedIndex.copyObject(url, { to, key: targetKey });
+        // stored reports refusals as { ok:false, reason } — surface them as
+        // errors so the HTTP layer does not answer 200 for a transfer that
+        // never happened.
+        if (!result?.ok) {
+            const detail = result?.detail ? ` (${result.detail})` : '';
+            throw new Error(`${mode} failed: ${result?.reason || 'unknown error'}${detail}`);
+        }
+        return result;
+    }
+
+    // ── Keyed objects — the hub side of a device mirror ─────────────────────
+    // (backend, key) addressing with HTTP-style preconditions over a
+    // path-addressed local backend; see WorkspaceStoredIndex.writeObject.
+
+    #assertObjectsDriver(driver, address) {
+        if (isConnectorDriver(driver) || driver === 'imap') {
+            throw Object.assign(new Error(`Backend "${driver}/${address}" does not expose keyed objects`), { code: 'UNSUPPORTED_BACKEND', statusCode: 400 });
+        }
+    }
+
+    async writeBackendObject(driver, address, key, source, options = {}) {
+        this.#assertObjectsDriver(driver, address);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.writeObject(address, key, source, options);
+    }
+
+    async removeBackendObject(driver, address, key, options = {}) {
+        this.#assertObjectsDriver(driver, address);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.removeObject(address, key, options);
+    }
+
+    async renameBackendObject(driver, address, from, to, options = {}) {
+        this.#assertObjectsDriver(driver, address);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.renameObject(address, from, to, options);
+    }
+
+    async listBackendRetained(driver, address, options = {}) {
+        this.#assertObjectsDriver(driver, address);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return { retention: this.#storedIndex.retention, retained: this.#storedIndex.listRetained(address, options) };
+    }
+
+    async restoreBackendRetained(driver, address, sha256, options = {}) {
+        this.#assertObjectsDriver(driver, address);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.restoreRetained(address, sha256, options);
+    }
+
+    async statBackendObject(driver, address, key) {
+        this.#assertObjectsDriver(driver, address);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.statObject(address, key);
+    }
+
+    async listBackendObjects(driver, address, options = {}) {
+        this.#assertObjectsDriver(driver, address);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.listObjects(address, options);
+    }
+
+    async backendChanges(driver, address, options = {}) {
+        this.#assertObjectsDriver(driver, address);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.changes(address, options);
+    }
+
+    // ── Replicas (docs/durable-workspaces.md) ─────────────────────────────
+    //
+    // workspace.json `replicas: [{ device, role: full|cache, required }]` —
+    // which device mirrors count toward "protected". The per-document evidence
+    // (what each device reports it holds) lives in the stored index.
+
+    get replicas() {
+        const raw = this.#configStore.get('replicas', []);
+        return (Array.isArray(raw) ? raw : [])
+            .filter((r) => r && typeof r.device === 'string' && r.device.trim())
+            .map((r) => ({ device: r.device.trim(), role: r.role === 'cache' ? 'cache' : 'full', required: r.required === true }));
+    }
+
+    get requiredReplicas() { return this.replicas.filter((r) => r.required).map((r) => r.device); }
+
+    setReplica(deviceId, patch = {}) {
+        const device = String(deviceId || '').trim();
+        if (!device) throw Object.assign(new Error('deviceId is required'), { statusCode: 400, code: 'INVALID_DEVICE' });
+        const current = this.replicas;
+        const existing = current.find((r) => r.device === device) || { device, role: 'full', required: false };
+        const next = {
+            device,
+            role: patch.role === 'cache' || patch.role === 'full' ? patch.role : existing.role,
+            required: typeof patch.required === 'boolean' ? patch.required : existing.required,
+        };
+        if (next.role === 'cache') next.required = false;   // a cache never counts
+        const list = [...current.filter((r) => r.device !== device), next];
+        this.#configStore.set('replicas', list);
+        this.emit('replicas.changed', { id: this.id, replicas: list });
+        return next;
+    }
+
+    removeReplica(deviceId) {
+        const device = String(deviceId || '').trim();
+        const current = this.replicas;
+        const list = current.filter((r) => r.device !== device);
+        if (list.length === current.length) return false;
+        this.#configStore.set('replicas', list);
+        this.emit('replicas.changed', { id: this.id, replicas: list });
+        return true;
+    }
+
+    async recordReplicaApplied(deviceId, pairs, options = {}) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.recordReplicaApplied(deviceId, pairs, options);
+    }
+
+    async forgetReplica(deviceId) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.forgetReplica(deviceId);
+    }
+
+    async replicaProtection(address = 'workspace:home', options = {}) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.replicaProtection(address, { required: this.requiredReplicas, ...options });
+    }
+
+    async resolveBackendObject(driver, address, key, options = {}) {
+        this.#assertObjectsDriver(driver, address);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.resolveObject(address, key, options);
+    }
+
+    /** Bytes behind any of this workspace's location URLs (`{ data, ranged }`). */
+    async resolveStoredUrl(url, options = {}) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.resolve(url, options);
+    }
+
+    // ── Sync conflict inbox (see lib/SyncConflicts.js) ──────────────────────
+    #syncConflicts = null;
+
+    #getSyncConflicts() {
+        if (!this.#syncConflicts) {
+            this.#syncConflicts = new SyncConflicts({ workspace: this, getDb: () => this.#getActiveDb(), logger: this.#logger });
+        }
+        return this.#syncConflicts;
+    }
+
+    async createSyncConflict(input = {}) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#getSyncConflicts().create(input);
+    }
+
+    async listSyncConflicts() {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#getSyncConflicts().list();
+    }
+
+    async resolveSyncConflict(docId, options = {}) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#getSyncConflicts().resolve(docId, options);
+    }
+
+    /**
+     * Where this document's bytes live, as (backend, key) pairs — both address
+     * forms resolved (`stored://` and device-scoped `file://` mounts). Hook
+     * rules use it to pick a source backend and to derive a destination
+     * filename from the current one.
+     */
+    async documentByteEndpoints(doc) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.locationEndpoints(doc);
+    }
+
+    /**
+     * Copy or move ONE document's bytes to another backend, optionally renaming
+     * on arrival. The single-document counterpart of
+     * `transferDocumentsToBackends` — used by hook rules, which decide the
+     * destination key per document (photos filed as YYYY/MM/…jpg, say).
+     *
+     * @param {object} doc Parsed document
+     * @param {object} options
+     * @param {string} options.to Target backend address
+     * @param {'copy'|'move'} [options.mode='move']
+     * @param {string} [options.key] Destination key (defaults to the source key)
+     * @param {'error'|'rename'|'overwrite'} [options.onConflict='rename'] What to
+     *   do when other content already holds that key. Defaults to renaming here
+     *   (not erroring as in stored): templated names collide by construction —
+     *   two photos taken in the same second — and losing one is not an option.
+     * @param {{backend: string, key: string}} [options.from] Source location
+     */
+    async transferDocumentBytes(doc, { to, mode = 'move', key, onConflict = 'rename', from = null } = {}) {
+        if (!doc?.id) throw new Error('A document is required');
+        if (!to) throw new Error('A target backend is required');
+        if (!this.dataBackends[to]) throw new Error(`Unknown backend: ${to}`);
+        if (this.dataBackends[to].readOnly === true) throw new Error(`Backend "${to}" is read-only`);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+
+        const res = await this.#storedIndex.transferDocument(doc, { to, mode, key, onConflict, from });
+        if (!res?.ok) {
+            const detail = res?.detail ? ` (${res.detail})` : '';
+            throw new Error(`${mode} failed: ${res?.reason || 'unknown error'}${detail}`);
+        }
+        return res;
+    }
+
+    /**
+     * Whether objects on this storage backend are addressed by a path a person
+     * chose (directory share, drive) rather than a content hash (blob store).
+     * Decides if a transfer carries a folder + filename.
+     */
+    backendKeepsPaths(backendName) {
+        const config = this.dataBackends[backendName];
+        if (!config) return false;
+        const driver = config.driver || 'file';
+        return driver !== 'cacache' && driver !== 'imap' && !isConnectorDriver(driver);
+    }
+
+    /**
+     * Batch backend op over documents — the surface behind the UI's
+     * "Copy to / Move to / Delete from backend" actions.
+     *
+     * Addressed by document id rather than (backend, key) because that is what a
+     * selection in the UI holds; each document's own source location is resolved
+     * server-side, which also makes external mounts (file:// device locations)
+     * work without the client knowing the address grammar.
+     *
+     * Partial success is normal — one document already living on the target must
+     * not fail the other 49 — so every document reports its own outcome instead
+     * of the batch throwing.
+     *
+     * @param {Array<number|string>} documentIds
+     * @param {object} options
+     * @param {string[]} options.to Target backend addresses
+     * @param {'copy'|'move'|'delete'} [options.mode='copy']
+     * @param {boolean} [options.keepDocument=false] delete mode: keep the index
+     *   entry when its last location goes (otherwise the doc is cascaded)
+     * @param {string} [options.folder] copy/move: backend-relative folder the
+     *   bytes land in on path-keyed backends (ignored by the blob store)
+     * @param {string} [options.filename] copy/move, single document only: name
+     *   on arrival; defaults to the document's own filename (see transferFilename)
+     * @param {'error'|'rename'|'overwrite'} [options.onConflict='rename'] what
+     *   to do when other content already holds the destination key
+     * @returns {Promise<{successful: object[], failed: object[]}>}
+     */
+    async transferDocumentsToBackends(documentIds = [], { to = [], mode = 'copy', keepDocument = false, folder = '', filename = '', onConflict = 'rename' } = {}) {
+        if (!['copy', 'move', 'delete'].includes(mode)) throw new Error(`Unknown transfer mode: ${mode}`);
+        if (!['error', 'rename', 'overwrite'].includes(onConflict)) throw new Error(`Unknown conflict policy: ${onConflict}`);
+        // A destination folder is a backend-relative key prefix; `..` and
+        // leading slashes are dropped so it can never escape the backend root.
+        const destFolder = joinKey(folder);
+        const destName = filename ? joinKey(filename) : '';
+        if (destName && destName.includes('/')) throw new Error('filename must be a single path segment — use folder for the directory');
+        if (destName && documentIds.length > 1) throw new Error('filename applies to a single document — a batch keeps each document\'s own name');
+        const targets = [...new Set((Array.isArray(to) ? to : [to]).filter(Boolean).map(String))];
+        if (targets.length === 0) throw new Error('At least one target backend is required');
+        // A move has one destination by definition: with two, "which one may the
+        // source be dropped for?" has no answer. Copy fans out freely.
+        if (mode === 'move' && targets.length > 1) throw new Error('A move takes exactly one target backend');
+        if (mode !== 'delete') {
+            for (const target of targets) {
+                if (!this.dataBackends[target]) throw new Error(`Unknown backend: ${target}`);
+                if (this.dataBackends[target].readOnly === true) throw new Error(`Backend "${target}" is read-only`);
+            }
+        }
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+
+        const results = { successful: [], failed: [] };
+        for (const rawId of documentIds) {
+            const id = Number(rawId);
+            try {
+                const doc = await this.get(id);
+                if (!doc) { results.failed.push({ id, reason: 'not found' }); continue; }
+
+                if (mode === 'delete') {
+                    const urls = this.#storedIndex.locationUrlsOnBackends(doc, targets);
+                    if (urls.length === 0) { results.failed.push({ id, reason: 'no location on the selected backend(s)' }); continue; }
+                    const res = await this.#storedIndex.destroy(doc, { urls, keepDocument });
+                    results.successful.push({ id, mode, ...res });
+                    continue;
+                }
+
+                const transfers = [];
+                for (const target of targets) {
+                    // Path-keyed backends (a directory share, a drive) get a real
+                    // file name under the chosen folder; the blob store keeps its
+                    // content-hash key, where a name would only defeat dedup.
+                    let key;
+                    let from = null;
+                    if (this.backendKeepsPaths(target)) {
+                        const source = this.#storedIndex.locationEndpoints(doc).find((e) => e.backend !== target);
+                        if (!source) throw new Error(`Already on "${target}"`);
+                        from = source;
+                        key = joinKey(destFolder, destName || transferFilename(doc, { sourceKey: source.key, sourceUrl: source.url }));
+                    }
+                    const res = await this.#storedIndex.transferDocument(doc, { to: target, mode, key, onConflict, from });
+                    if (!res?.ok) {
+                        const detail = res?.detail ? ` (${res.detail})` : '';
+                        throw new Error(`${res?.reason || 'unknown error'}${detail}`);
+                    }
+                    // `unchanged` means the object was already there — a no-op,
+                    // not a transfer. Reporting it as "complete" would let a
+                    // stale index (or a repeat click) look like work happened.
+                    transfers.push({
+                        backend: target,
+                        state: res.unchanged ? 'unchanged' : (res.state || 'complete'),
+                        locations: res.locations,
+                    });
+                }
+                results.successful.push({ id, mode, transfers });
+            } catch (err) {
+                results.failed.push({ id, reason: err.message });
+            }
+        }
+        return results;
+    }
+
+    /** On-demand on-disk size of a local storage backend (slow walk — user-triggered). */
+    async getBackendDiskUsage(driver, address) {
+        if (driver === 'imap') throw new Error('IMAP backends have no local disk usage');
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return await this.#storedIndex.getBackendDiskUsage(address);
+    }
+
+    /**
+     * On-demand on-disk size of the WHOLE workspace root with a per-top-level
+     * directory breakdown (db, data, home, cache, …) — the number an export or
+     * sync needs to plan around. Total is measured on the root in one pass
+     * (hardlink/inode-aware via get-folder-size); the breakdown is per subtree,
+     * so cross-directory hardlinks can make its sum slightly exceed the total.
+     */
+    async getDiskUsage() {
+        const root = this.#rootPath;
+        const [bytes, entries] = await Promise.all([
+            getFolderSize.loose(root),
+            fsPromises.readdir(root, { withFileTypes: true }).catch(() => []),
+        ]);
+        const breakdown = {};
+        for (const entry of entries) {
+            const target = path.join(root, entry.name);
+            breakdown[entry.name] = entry.isDirectory()
+                ? await getFolderSize.loose(target)
+                : ((await fsPromises.stat(target).catch(() => null))?.size ?? 0);
+        }
+        return { workspaceId: this.id, bytes, breakdown, computedAt: new Date().toISOString() };
+    }
+
+    async updateBackend(driver, address, patch = {}) {
+        if (isConnectorDriver(driver)) return (await this.#connectors()).saveBackend(driver, { ...patch, address });
+        if (driver === 'imap') {
+            // Account-level settings/creds are shared across the account's folder
+            // mailboxes, so apply the patch to each.
+            const targets = (await this.listImapMailboxes())
+                .filter((m) => normalizeSegment(m.account || m.user || '') === normalizeSegment(address));
+            if (!targets.length) throw new Error(`No IMAP mailbox for account "${address}"`);
+            for (const m of targets) await this.saveImapMailbox({ ...patch, id: m.id });
+            return this.getBackend('imap', address);
+        }
+        if (driver === 'gdrive') {
+            const previous = this.dataBackends[address];
+            if (!previous || previous.driver !== 'gdrive') throw new Error(`Backend not found: gdrive/${address}`);
+            const credKeys = ['clientId', 'clientSecret', 'refreshToken', 'folderId'];
+            const touchesCreds = credKeys.some((k) => k in patch && patch[k] !== true && patch[k] !== '' && patch[k] != null);
+            const normalized = this.#gdriveConfigPatch(patch, previous);
+            if (touchesCreds) await this.#probeGdrive({ ...previous, ...normalized });
+            patch = { ...normalized, ...('enabled' in patch ? { enabled: patch.enabled === true } : {}) };
+        }
+        if ('exclude' in patch) {
+            if (!Array.isArray(patch.exclude) || patch.exclude.some((p) => typeof p !== 'string')) {
+                throw new Error('exclude must be an array of glob pattern strings');
+            }
+            patch = { ...patch, exclude: patch.exclude.map((p) => p.trim()).filter(Boolean).slice(0, 200) };
+        }
+        await this.setDataBackendConfig(address, patch);
+        // Toggling the home backend drives the stored-index lifecycle: enabling
+        // it must boot the index when it isn't running (setDataBackendConfig
+        // only applies config to an already-running index), disabling stops it.
+        if (address === WorkspaceStoredIndex.HOME_STORED_BACKEND && typeof patch.enabled === 'boolean') {
+            if (patch.enabled) await this.#startStoredIndex();
+            else await this.#stopStoredIndex();
+        }
+        return this.getBackend(driver, address);
+    }
+
+    async removeBackend(driver, address) {
+        if (isConnectorDriver(driver)) return (await this.#connectors()).removeBackend(driver, address);
+        if (driver === 'imap') {
+            const targets = (await this.listImapMailboxes())
+                .filter((m) => normalizeSegment(m.account || m.user || '') === normalizeSegment(address));
+            if (!targets.length) return false;
+            for (const m of targets) await this.removeImapMailbox(m.id);
+            return true;
+        }
+        // Managed storage defaults can't be deleted; disabling is the remove op.
+        // Disable first either way — it stops the watcher, unregisters the live
+        // backend and releases the mirror-node enable-lock.
+        const existing = this.dataBackends[address];
+        await this.setDataBackendConfig(address, { enabled: false });
+        if (existing && existing.managed !== true && !(address in WORKSPACE_STORAGE_BACKENDS)) {
+            // User-added mount: drop the config entirely. Mirrored docs keep
+            // their tree nodes until purged via tree-rm or swept as
+            // dead-backend locations on the next resync.
+            const dataBackends = this.dataBackends;
+            delete dataBackends[address];
+            this.#writeStoredBackends(dataBackends);
+            this.emit('dataBackends.changed', { backend: address, config: null });
+        }
+        return true;
+    }
+
+    /**
+     * Resync a backend. Storage resyncs run in the background by default (a full
+     * scan of a large mount is slow, and progress is reported via the backend
+     * status); pass `{ background: false }` to await the reconcile — what a
+     * caller that needs to act on the result wants.
+     */
+    async syncBackend(driver, address, { background = true } = {}) {
+        if (driver === 'imap') return (await this.#mail()).resyncAccount(address);
+        if (isConnectorDriver(driver)) return (await this.#connectors()).resync(driver, address);
+        // Storage: address is the backend name / config key verbatim
+        // (workspace:home, or a user mount's case-preserving slug).
+        return this.#resyncDataBackend(address, { background });
+    }
+
+    /**
+     * Directory skeleton of a storage backend: `{ ok, dirs, files }` where
+     * `dirs` are backend-relative folder keys ('Fotky/2019') honoring the
+     * backend's exclusions and `files` is the file count. readdir only — no
+     * stat, no hashing — so it is cheap even on a large mount. Backing for
+     * hooks that mirror a mount's folder structure into the workspace tree
+     * (ctx.backendShape). `{ ok:false, reason }` for unknown/unsupported.
+     */
+    async getBackendShape(backendName) {
+        if (!this.dataBackends[backendName]) throw new Error(`Unknown data backend: ${backendName}`);
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.stored.shape(backendName);
+    }
+
+    // Mirror root of a storage backend in the backends tree (/<driver>/<address>),
+    // null when the backend is not mirrored (managed blob store, unsupported).
+    getBackendTreeRoot(backendName) {
+        return this.#storedIndex?.isRunning ? this.#storedIndex.getBackendTreeRoot(backendName) : null;
+    }
+
+    // Cancel an in-flight storage resync. The walk stops at the next file;
+    // nothing is orphaned from the partial snapshot and a later sync resumes
+    // via the checksum cache (see WorkspaceStoredIndex.cancelResync).
+    async cancelSyncBackend(driver, address) {
+        if (driver === 'imap') throw new Error('IMAP sync does not support cancellation');
+        if (!this.#storedIndex?.isRunning) return { backend: address, resyncing: false, cancelled: false };
+        return this.#storedIndex.cancelResync(address);
+    }
+
+    async testBackend(driver, address) {
+        if (isConnectorDriver(driver)) return (await this.#connectors()).testBackend(driver, address);
+        if (driver === 'gdrive') {
+            const config = this.dataBackends[address];
+            if (!config || config.driver !== 'gdrive') throw new Error(`Backend not found: gdrive/${address}`);
+            return this.#probeGdrive(config);
+        }
+        if (driver !== 'imap') throw new Error(`Backend "${driver}/${address}" does not support test`);
+        const target = (await this.listImapMailboxes())
+            .find((m) => normalizeSegment(m.account || m.user || '') === normalizeSegment(address));
+        if (!target) throw new Error(`No IMAP mailbox for account "${address}"`);
+        return this.testImapMailbox(target.id);
+    }
+
+    // Mailboxes belonging to one imap account (the account's folder set).
+    async #imapAccountMailboxes(address) {
+        return (await this.listImapMailboxes())
+            .filter((m) => normalizeSegment(m.account || m.user || '') === normalizeSegment(address));
+    }
+
+    async listBackendContainers(driver, address, { available = false } = {}) {
+        if (isConnectorDriver(driver)) {
+            // `available` and subscribed coincide for connectors in v1: the
+            // driver lists what its config exposes (repos/channels/calendars).
+            return (await this.#connectors()).listContainers(driver, address);
+        }
+        if (driver !== 'imap') throw new Error(`Backend "${driver}/${address}" has no containers`);
+        if (available) {
+            // Folders available on the server (for subscribing more), from the
+            // account's primary mailbox creds.
+            const [primary] = await this.#imapAccountMailboxes(address);
+            if (!primary) throw new Error(`No IMAP mailbox for account "${address}"`);
+            return this.listImapMailboxFolders(primary.id);
+        }
+        return (await this.getBackend('imap', address)).containers || [];
+    }
+
+    // Write-back into a connector container (v1: caldav events on a backend
+    // configured readOnly:false). Remote-first, then mirrored locally.
+    async createBackendContainerDocument(driver, address, container, payload = {}) {
+        if (!isConnectorDriver(driver)) throw new Error(`Backend "${driver}/${address}" does not support document creation`);
+        return (await this.#connectors()).createDocument(driver, address, container, payload);
+    }
+
+    // Resolve a synced document's provenance URL for its connector driver.
+    async #connectorDocRef(driver, docId) {
+        const doc = await this.get(Number(docId));
+        if (!doc) throw new Error(`Document ${docId} not found`);
+        const scheme = CONNECTOR_SCHEMES[driver];
+        const provenanceUrl = (doc.locations || [])
+            .map((l) => l?.url)
+            .find((url) => typeof url === 'string' && url.startsWith(`${scheme}://`));
+        if (!provenanceUrl) throw new Error(`Document ${docId} has no ${driver} provenance location`);
+        return { provenanceUrl };
+    }
+
+    // Write-back: update the remote object behind a synced connector document
+    // (e.g. edit/close a GitHub issue). The driver's mirror re-ingests, so the
+    // local doc reflects the remote's post-update state.
+    async updateBackendDocument(driver, address, docId, patch = {}) {
+        if (!isConnectorDriver(driver)) throw new Error(`Backend "${driver}/${address}" does not support document updates`);
+        const ref = await this.#connectorDocRef(driver, docId);
+        return (await this.#connectors()).updateDocument(driver, address, ref, patch);
+    }
+
+    // Write-back: delete the remote object (or its terminal equivalent —
+    // GitHub closes as not_planned). When the remote is truly gone and no
+    // mirror remains (caldav), the local document is dropped too.
+    async deleteBackendDocument(driver, address, docId) {
+        if (!isConnectorDriver(driver)) throw new Error(`Backend "${driver}/${address}" does not support document deletion`);
+        const ref = await this.#connectorDocRef(driver, docId);
+        const result = await (await this.#connectors()).deleteDocument(driver, address, ref);
+        if (result.removedRemote && !result.hasMirror) {
+            await this.deleteMany([Number(docId)], { emitEvent: true }).catch((err) =>
+                this.#logger.warn({ workspaceId: this.id, docId, error: err.message }, 'Remote deleted but local mirror removal failed'));
+        }
+        return result;
+    }
+
+    async syncBackendContainer(driver, address, name) {
+        if (driver !== 'imap') throw new Error(`Backend "${driver}/${address}" has no containers`);
+        const container = (await this.listBackendContainers('imap', address)).find((c) => c.name === name);
+        if (!container) throw new Error(`Container "${name}" not found on imap/${address}`);
+        return (await this.#mail()).syncMailbox(container.mailboxId);
+    }
+
+    // Add containers: imap → subscribe folders (per-folder mailboxes); file →
+    // create real directories under the backend root (each folder is a relative
+    // path key like "docs" or "docs/2024").
+    async addBackendContainers(driver, address, folders = []) {
+        if (driver === 'imap') {
+            const [primary] = await this.#imapAccountMailboxes(address);
+            if (!primary) throw new Error(`No IMAP mailbox for account "${address}"`);
+            return this.subscribeImapFolders(primary.id, folders);
+        }
+        if (driver === 'file') {
+            const created = [];
+            for (const folder of folders) created.push(await this.createBackendFolder(driver, address, folder));
+            return created;
+        }
+        throw new Error(`Backend "${driver}/${address}" has no containers`);
+    }
+
+    async removeBackendContainer(driver, address, name) {
+        if (driver === 'imap') {
+            const target = (await this.#imapAccountMailboxes(address)).find((m) => (m.folder || 'INBOX') === name);
+            if (!target) throw new Error(`Container "${name}" not found on imap/${address}`);
+            return this.removeImapMailbox(target.id);
+        }
+        if (driver === 'file') return this.deleteBackendFolder(driver, address, name);
+        throw new Error(`Backend "${driver}/${address}" has no containers`);
+    }
+
+    // ── File-backend folder ops ───────────────────────────────────────────────
+    // Fs op runs on the (writable) file driver; the directory-tree mirror is
+    // updated here so empty folders are visible (docs alone would never surface
+    // an empty dir — the watcher only sees file events). Folder "name" is a
+    // relative path key under the backend root.
+    #backendFolderKey(name) {
+        const key = String(name || '').replace(/^\/+|\/+$/g, '').replace(/\/+/g, '/');
+        if (!key || key.split('/').some((seg) => seg === '..' || seg === '.')) {
+            throw new Error(`Invalid folder name: ${name}`);
+        }
+        return key;
+    }
+
+    async #directoryTreeForBackends() {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.getBackendsTree();
+    }
+
+    async createBackendFolder(driver, address, name) {
+        if (driver !== 'file') throw new Error(`Driver "${driver}" has no mutable folders`);
+        const key = this.#backendFolderKey(name);
+        const tree = await this.#directoryTreeForBackends();
+        await this.#storedIndex.createBackendContainer(address, key);
+        const root = this.#storedIndex.getBackendTreeRoot(address);
+        if (root) await tree.insertPath(`${root}/${key}`, { ignoreLocks: true });
+        return { driver, address, folder: key };
+    }
+
+    async deleteBackendFolder(driver, address, name) {
+        if (driver !== 'file') throw new Error(`Driver "${driver}" has no mutable folders`);
+        const key = this.#backendFolderKey(name);
+        const tree = await this.#directoryTreeForBackends();
+        // rm -rf on disk removes the files → the watcher drops their docs; the
+        // structural tree node is removed here (it survives empty otherwise).
+        await this.#storedIndex.deleteBackendContainer(address, key);
+        const root = this.#storedIndex.getBackendTreeRoot(address);
+        if (root) await tree.removePath(`${root}/${key}`, true).catch(() => {});
+        return { driver, address, folder: key, removed: true };
+    }
+
+    async renameBackendFolder(driver, address, fromName, toName) {
+        if (driver !== 'file') throw new Error(`Driver "${driver}" has no mutable folders`);
+        const fromKey = this.#backendFolderKey(fromName);
+        const toKey = this.#backendFolderKey(toName);
+        const tree = await this.#directoryTreeForBackends();
+        // fs move relocates the bytes; the watcher re-files contained docs under
+        // the new path (checksum-deduped). movePath keeps the structural node in
+        // sync immediately (and carries empty folders the watcher can't see).
+        await this.#storedIndex.renameBackendContainer(address, fromKey, toKey);
+        const root = this.#storedIndex.getBackendTreeRoot(address);
+        if (root) {
+            // movePath asserts mutability with no ignoreLocks escape under the
+            // locked backends-tree root, so mirror the move as remove-old +
+            // insert-new (same pattern as create/delete). The watcher re-files
+            // the contained docs under the new path.
+            await tree.removePath(`${root}/${fromKey}`, true).catch(() => {});
+            await tree.insertPath(`${root}/${toKey}`, { ignoreLocks: true });
+        }
+        return { driver, address, from: fromKey, to: toKey };
+    }
+
+    // Pre-create folder discovery — probe a connector with candidate creds
+    // before any instance exists (the "add account" flow).
+    async discoverBackendFolders(driver, config = {}) {
+        if (driver !== 'imap') throw new Error(`Driver "${driver}" does not support folder discovery`);
+        return this.discoverImapFolders(config);
+    }
+
+    /**
+     * Describe a document's locations for a Destroy picker (which can have bytes
+     * removed vs reference-dropped only).
+     */
+    async describeDocumentLocations(doc) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.describeLocations(doc);
+    }
+
+    /**
+     * Destroy a document's blobs (the "Destroy" op). `options.urls` targets
+     * specific locations; default targets all. Removes the doc from the index
+     * when no locations remain. See WorkspaceStoredIndex.destroy.
+     */
+    async destroyDocument(doc, options = {}) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.destroy(doc, options);
+    }
+
+    /**
+     * On-demand cached thumbnail for an image or PDF document (see
+     * WorkspaceStoredIndex.getThumbnail). Returns {buffer, mime} or null.
+     */
+    async getDocumentThumbnail(doc, size = 256) {
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.getThumbnail(doc, size);
+    }
+
+    #buildStoredIndex() {
+        return new WorkspaceStoredIndex({
+            rootPath: this.#rootPath,
+            cachePath: this.cachePath,
+            dataPath: this.dataPath,
+            homePath: this.homePath,
+            storedRootPath: this.storedRootPath,
+            dataBackends: this.#runtimeBackends(),
+            // Never index ourselves: any of the workspace's own runtime dirs
+            // that happens to live inside an indexed backend root is excluded
+            // structurally. Load-bearing for the `home` layout (home backend
+            // root == workspace root), harmless for `full`.
+            internalPaths: this.internalPaths,
+            workspaceId: this.id,
+            // This server's device identity — authority for the device-scoped
+            // file:// locations of external fs mounts.
+            device: getServerDevice(),
+            logger: this.#logger,
+            put: (record, options = {}) => this.put(record, { ...options, allowBackendsWrite: true }),
+            unlink: (id, options = {}, unlinkOptions = {}) => this.unlink(id, options, { ...unlinkOptions, allowBackendsWrite: true }),
+            getBackendsTreeSelector: this.getBackendsTreeSelector.bind(this),
+            getDb: () => this.#db,
+            // imap:// byte-ops are delegated to the mail service.
+            describeImapLocation: (url) => this.#mailIndex?.describeImapLocation(url) ?? null,
+            destroyImapLocation: (url) => this.#mailIndex?.destroyImapLocation(url) ?? null,
+            lockBackendNode: (path, holder) => this.lockBackendTreeNode(path, holder),
+            unlockBackendNode: (path, holder) => this.unlockBackendTreeNode(path, holder),
+            // Skeleton mirroring: bare directory nodes under the backend's
+            // mirror root (documents insert their own paths as they stream in).
+            insertBackendPath: (treePath) => this.getBackendsTree().insertPath(treePath, { ignoreLocks: true }),
+            pruneBackendPath: (treePath) => this.pruneEmptyBackendPaths(treePath),
+            sweepBackendPaths: (rootPath, keepDirs) => this.sweepEmptyBackendPaths(rootPath, keepDirs),
+            // Resync lifecycle/progress → ws clients (tree spinner, settings).
+            onResyncStateChange: (state) => this.emit('backend.resync.changed', { ...state, workspaceId: this.id }),
+            // Change-log advance (throttled per backend) → the nudge device
+            // mirrors subscribe to; `seq` is the log head to poll from.
+            onBackendChanged: ({ backend, seq }) => this.emit('backend.changed', { workspaceId: this.id, workspaceName: this.name, backend, seq }),
+            // Quiet config persist (mount fsid snapshot on first successful
+            // liveness check) — must NOT re-enter applyBackendConfig.
+            persistBackendConfig: (name, patch) => {
+                const dataBackends = this.dataBackends;
+                dataBackends[name] = { ...dataBackends[name], ...patch };
+                this.#writeStoredBackends(dataBackends);
+            },
+            // Orphan-GC retention (Settings > Database), -1 = keep forever.
+            getOrphanRetentionDays: () => Number(this.databaseSettings.orphanRetentionDays ?? -1),
+        });
+    }
+
+    async #startStoredIndex() {
+        this.assertActive();
+        if (this.#storedIndex?.isRunning) return;
+        this.#storedIndex = this.#buildStoredIndex();
+        await this.#storedIndex.start();
+        await this.#startMailIndex();
+        await this.#startConnectorIndex();
+    }
+
+    async #stopStoredIndex() {
+        await this.#stopConnectorIndex();
+        await this.#stopMailIndex();
+        if (!this.#storedIndex) return;
+        await this.#storedIndex.stop();
+        this.#storedIndex = null;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // IMAP mailboxes — delegated to the per-workspace mail service
+    // (WorkspaceMailIndex). Config in config/stored.json; the mail service
+    // shares the blob indexer's Stored instance to run imap backends.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #buildMailIndex() {
+        return new WorkspaceMailIndex({
+            resolveCredentials: (config) => this.#resolveCredentials(config),
+            secretsLocked: () => this.#withoutSecrets,
+            protectConfig: (config) => this.#crypto.protect(config, 'config/stored'),
+            rootPath: this.#rootPath,
+            configDir: this.configDir,
+            varPath: this.varPath,
+            homePath: this.homePath,
+            workspaceId: this.id,
+            logger: this.#logger,
+            put: (record, options = {}) => this.put(record, { ...options, allowBackendsWrite: true }),
+            putMany: (records, options = {}) => this.putMany(records, { ...options, allowBackendsWrite: true }),
+            // Attachment File docs: link an already-indexed blob into a mailbox
+            // folder, and draw the `includes` edge from its Email.
+            link: (id, options = {}) => this.link(id, { ...options, allowBackendsWrite: true }),
+            linkMany: (ids, options = {}) => this.linkMany(ids, { ...options, allowBackendsWrite: true }),
+            assertRelation: (fromId, predicate, toId) => this.assertRelation(fromId, predicate, toId),
+            getBackendsTreeSelector: this.getBackendsTreeSelector.bind(this),
+            insertBackendPath: (treePath) => this.getBackendsTree().insertPath(treePath, { ignoreLocks: true }),
+            getDb: () => this.#db,
+            // Persist email/attachment blobs into the local content-addressable
+            // data store (workspace:data) via the blob indexer.
+            persistBlob: (buffer) => this.#storedIndex.persistBlob(buffer),
+            lockBackendNode: (path, holder) => this.lockBackendTreeNode(path, holder),
+            unlockBackendNode: (path, holder) => this.unlockBackendTreeNode(path, holder),
+            // Threading: a reply lands where its parent is filed.
+            inheritThreadMemberships: (replyId, parentId) => this.inheritThreadMemberships(replyId, parentId),
+        });
+    }
+
+    // Started alongside the blob indexer (and stopped before it). The mail
+    // service is otherwise self-owned — it manages its own ImapBackend instances.
+    async #startMailIndex() {
+        if (this.#mailIndex?.isRunning) return;
+        this.#mailIndex = this.#buildMailIndex();
+        // Forward the mail service's object:* / source:state / error events with
+        // workspaceId + source stamped (same envelope as the db runtime events).
+        this.#mailRuntimeBinding = this.#createRuntimeListener(this.#mailIndex, 'imap');
+        await this.#mailIndex.start();
+    }
+
+    async #stopMailIndex() {
+        if (this.#mailRuntimeBinding) {
+            this.#mailRuntimeBinding.emitter.off('**', this.#mailRuntimeBinding.listener);
+            this.#mailRuntimeBinding = null;
+        }
+        if (!this.#mailIndex) return;
+        await this.#mailIndex.stop();
+        this.#mailIndex = null;
+    }
+
+    async #mail() {
+        if (!this.#mailIndex?.isRunning) await this.#startStoredIndex();
+        return this.#mailIndex;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Connectors (github / slack / gcal / teams) — delegated to the
+    // per-workspace connector service (WorkspaceConnectorIndex). Config in
+    // config/stored.json alongside the storage + imap backends; synced docs
+    // land only in the backends tree. See docs/connectors.md.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #buildConnectorIndex() {
+        return new WorkspaceConnectorIndex({
+            onContacts: async (account, contacts) => {
+                this.#startContactExtraction();
+                await this.#contacts.syncWhatsAppContacts(account, contacts);
+            },
+            sessionSecrets: {
+                seal: (json, accountHash) => this.#crypto.protect({ password: json }, `whatsapp/${accountHash}`).password,
+                open: (ref) => this.#crypto.resolve(ref),
+            },
+            resolveCredentials: (config) => this.#resolveCredentials(config),
+            secretsLocked: () => this.#withoutSecrets,
+            protectConfig: (config) => this.#crypto.protect(config, 'config/stored'),
+            rootPath: this.#rootPath,
+            configDir: this.configDir,
+            varPath: this.varPath,
+            homePath: this.homePath,
+            workspaceId: this.id,
+            logger: this.#logger,
+            put: (record, options = {}) => this.put(record, { ...options, allowBackendsWrite: true }),
+            getBackendsTreeSelector: this.getBackendsTreeSelector.bind(this),
+            insertBackendPath: async (treePath, { label } = {}) => {
+                const tree = this.getBackendsTree();
+                const result = await tree.insertPath(treePath, { ignoreLocks: true });
+                const layer = tree.getLayerForPath(treePath);
+                if (label && layer && layer.label !== label) await tree.updateLayer(layer.id, { label });
+                return result;
+            },
+            pruneBackendPath: (treePath) => this.pruneEmptyBackendPaths(treePath),
+            sweepBackendPaths: (rootPath, keepDirs) => this.sweepEmptyBackendPaths(rootPath, keepDirs),
+            lockBackendNode: (path, holder) => this.lockBackendTreeNode(path, holder),
+            unlockBackendNode: (path, holder) => this.unlockBackendTreeNode(path, holder),
+            // Deletion-sync (pruneRemoved): enumerate a connector's mirror docs
+            // and drop locations of source-deleted items with the stored
+            // index's orphan-not-delete semantics.
+            listDocumentIdsUnderBackendPath: (treePath) => this.documentIdsUnderScope(`${Workspace.BACKENDS_TREE_NAME}://${treePath}`),
+            getDocumentsByIdArray: (ids) => this.getDocumentsByIdArray(ids),
+            reconcileRemovedLocations: async (doc, urls) => {
+                if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+                return this.#storedIndex.reconcileRemovedLocations(doc, urls);
+            },
+            // Threading: parent lookup by identity checksum + reply-follows-root.
+            resolveDocumentIdByChecksum: async (checksum) => {
+                const doc = await this.#getActiveDb().getByChecksumString(checksum, { parse: false });
+                return doc?.id ?? null;
+            },
+            inheritThreadMemberships: (replyId, rootId) => this.inheritThreadMemberships(replyId, rootId),
+        });
+    }
+
+    async #startConnectorIndex() {
+        if (this.#connectorIndex?.isRunning) return;
+        this.#connectorIndex = this.#buildConnectorIndex();
+        this.#connectorRuntimeBinding = this.#createRuntimeListener(this.#connectorIndex, 'connectors');
+        await this.#connectorIndex.start();
+    }
+
+    async #stopConnectorIndex() {
+        if (this.#connectorRuntimeBinding) {
+            this.#connectorRuntimeBinding.emitter.off('**', this.#connectorRuntimeBinding.listener);
+            this.#connectorRuntimeBinding = null;
+        }
+        if (!this.#connectorIndex) return;
+        await this.#connectorIndex.stop();
+        this.#connectorIndex = null;
+    }
+
+    async #connectors() {
+        if (!this.#connectorIndex?.isRunning) await this.#startStoredIndex();
+        return this.#connectorIndex;
+    }
+
+    // Read-only view that does NOT boot sources (safe for status polls).
+    #connectorsReadonly() {
+        return this.#connectorIndex?.isRunning ? this.#connectorIndex : this.#buildConnectorIndex();
+    }
+
+    // Read-only view that does NOT boot sources (safe for status polls).
+    // ─────────────────────────────────────────────────────────────────────────
+    // Contact extraction from filed email (services/contacts) + one-time data
+    // migrations. See EmailContactExtractor for the why.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #contacts = null;
+
+    /** Filed where a user navigates: not the backends mirror, not the trash, not a context root. */
+    async #isUserFiled(id) {
+        const placements = await this.listDocumentPlacements(id);
+        return placements.some(({ tree, type, paths }) => tree !== Workspace.BACKENDS_TREE_NAME && paths.some((path) =>
+            !(type === Workspace.CONTEXT_TYPE && path === '/')
+            && !(type === Workspace.DIRECTORY_TYPE && (path === Workspace.TRASH_PATH || path.startsWith(`${Workspace.TRASH_PATH}/`)))));
+    }
+
+    #startContactExtraction() {
+        if (this.#contacts) return;
+        const db = this.#getActiveDb();
+        this.#contacts = new ContactExtractor({
+            get: (id) => this.get(id),
+            getMany: async (ids) => {
+                const result = await this.getDocumentsByIdArray(ids, { parse: false });
+                if (result.error) throw new Error(result.error);
+                return result.data;
+            },
+            listIds: async () => {
+                const ids = await db.list({ context: null, directory: null,
+                    attributes: { anyOf: ['data/schema/message', 'data/schema/identity'] }, idsOnly: true, limit: 0 });
+                if (ids.error) throw new Error(ids.error);
+                return ids;
+            },
+            isUserFiled: (id) => this.#isUserFiled(id),
+            listRelations: (id) => this.listDocumentRelations(id),
+            putMany: (records) => this.putMany(records, { context: null }),
+            reconcileRelations: (entries, options) => db.reconcileDerivedRelations(entries, options),
+            ownAddresses: () => this.#mailReadonly().ownAddresses().catch(() => []),
+            logger: this.#logger,
+        });
+        for (const event of ['document.linked', 'document.inserted', 'document.updated', 'document.deleted']) {
+            this.on(event, this.#onDocumentFiled);
+            this.on(`${event}.batch`, this.#onDocumentFiled);
+        }
+        // Build a compact participant lookup and repair known-contact edges in
+        // the background. No Lance queries and no contact creation from mirrors.
+        this.#contacts.extract([]).catch(() => {});
+    }
+
+    async #stopContactExtraction() {
+        if (!this.#contacts) return;
+        for (const event of ['document.linked', 'document.inserted', 'document.updated', 'document.deleted']) {
+            this.off(event, this.#onDocumentFiled);
+            this.off(`${event}.batch`, this.#onDocumentFiled);
+        }
+        await this.#contacts.stop();
+        this.#contacts = null;
+    }
+
+    // Backend-only messages still relate to KNOWN identities. The service
+    // checks filing separately before it may create a new identity.
+    #onDocumentFiled = (payload) => {
+        if (!this.#contacts) return;
+        const ids = Array.isArray(payload?.ids) ? payload.ids : (payload?.id != null ? [payload.id] : []);
+        this.#contacts.enqueue(ids);
+    };
+
+    /** The identity carrying this email address (alias-key lookup), or null. */
+    async findIdentityByEmail(address) {
+        const key = Identity.emailAliasKey(address);
+        if (!key) return null;
+        const doc = await this.#getActiveDb().getByChecksumString(key).catch(() => null);
+        return doc?.id ?? null;
+    }
+
+    /** Settle queued extraction (tests / maintenance callers). */
+    async drainContactExtraction() { await this.#contacts?.drain(); }
+
+    // A contact may have just been saved while the debounced worker is pending.
+    // Reconcile before serving its Relations tab so the first read is current.
+    async refreshContactRelations(document) {
+        if (document?.schema === 'data/schema/identity' || document?.schema?.startsWith('data/schema/identity/')) {
+            await this.#contacts?.refresh([document.id]);
+        }
+    }
+
+    /**
+     * Extract contacts for every email already filed in user trees (backfill
+     * for mail filed before extraction existed; also a manual re-run).
+     */
+    async extractEmailContacts() {
+        if (!this.#contacts) throw new Error('Workspace is not active');
+        const ids = await this.list({ features: ['data/schema/message/email'], context: null, directory: null, idsOnly: true, limit: 0 });
+        return this.#contacts.extract(Array.isArray(ids) ? ids : []);
+    }
+
+    async extractMessageContacts() {
+        if (!this.#contacts) throw new Error('Workspace is not active');
+        const ids = await this.list({ features: ['data/schema/message'], context: null, directory: null, idsOnly: true, limit: 0 });
+        return this.#contacts.extract(Array.isArray(ids) ? ids : []);
+    }
+
+    // One-time data migrations, flagged in workspace.json `dataMigrations`.
+    // Each step records its own completion, so a failure retries only itself.
+    async #runDataMigrations() {
+        const done = { ...(this.#configStore.get('dataMigrations') || {}) };
+        const mark = (name, result) => {
+            done[name] = new Date().toISOString();
+            this.#configStore.set('dataMigrations', { ...done });
+            this.#logger.info({ workspaceId: this.id, migration: name, result }, 'Data migration done');
+        };
+        const db = this.#getActiveDb();
+
+        // Mail/chat stored before synapsd derived the 'content' timeline.
+        if (!done.contentTimelines) {
+            mark('contentTimelines', await db.rederiveSchemaTimelines({ schemas: ['data/schema/message'] }));
+        }
+        // Identities stored before they carried identity-email/* alias keys:
+        // re-derive checksums so extraction finds hand-made contacts.
+        if (!done.identityEmailAliases) {
+            const ids = await this.list({ features: ['data/schema/identity'], context: null, directory: null, idsOnly: true, limit: 0 });
+            let updated = 0;
+            for (const id of Array.isArray(ids) ? ids : []) {
+                const doc = await this.get(id).catch(() => null);
+                if (!doc?.generateChecksumStrings) continue;
+                const wanted = doc.generateChecksumStrings();
+                if (wanted.every((key) => doc.checksumArray?.includes(key))) continue;
+                const checksumArray = [...new Set([...(doc.checksumArray || []), ...wanted])];
+                await db.put({ id: doc.id, checksumArray }, { context: null, emitEvent: false });
+                updated++;
+            }
+            mark('identityEmailAliases', { identities: ids?.length || 0, updated });
+        }
+        if (!done.emailContacts || !done.filedMessageContacts) {
+            const result = await this.extractMessageContacts();
+            mark('emailContacts', result);
+            mark('filedMessageContacts', result);
+        }
+    }
+
+    #mailReadonly() {
+        return this.#mailIndex?.isRunning ? this.#mailIndex : this.#buildMailIndex();
+    }
+
+    // IMAP wrappers backing the unified backend facade (listBackends / addBackend
+    // / syncBackend / containers). getImapStatus feeds the services status view.
+    async listImapMailboxes() { return this.#mailReadonly().listMailboxes(); }
+    async getImapStatus() { return this.#mailReadonly().getImapStatus(); }
+    async saveImapMailbox(input) { return (await this.#mail()).saveMailbox(input); }
+    async removeImapMailbox(id) { return (await this.#mail()).removeMailbox(id); }
+    async testImapMailbox(id) { return (await this.#mail()).testMailbox(id); }
+    async listImapMailboxFolders(id) { return (await this.#mail()).listMailboxFolders(id); }
+    async discoverImapFolders(input) { return (await this.#mail()).discoverFolders(input); }
+    async subscribeImapFolders(id, folders) { return (await this.#mail()).subscribeFolders(id, folders); }
+
+    // Ingest one raw RFC822 message as an Email document (+ its attachments as
+    // File docs with `includes` edges). The mail service's own backends push
+    // whole fetch batches internally; this is the entry point for everything
+    // else that holds a raw message — a future SMTP send filing its own copy
+    // into Sent, an import, a test.
+    async ingestEmailMessage(payload) { return (await this.#mail()).ingestMessage(payload); }
+    async ingestEmailBatch(payloads) { return (await this.#mail()).ingestBatch(payloads); }
+
+    // Service-level enable/disable for 'imap'.
+    async enableImap() { await this.#startStoredIndex(); return this.getImapStatus(); }
+    async disableImap() { if (this.#mailIndex?.isRunning) await this.#mailIndex.disableImap(); return true; }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Tree setup
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #getPreferredContextTree() {
+        const db = this.#getActiveDb();
+        return db.getTree(Workspace.CONTEXT_TREE_NAME) || db.getDefaultContextTree();
+    }
+
+    #getPreferredDirectoryTree() {
+        const db = this.#getActiveDb();
+        return db.getTree(Workspace.DIRECTORY_TREE_NAME) || db.getDefaultDirectoryTree();
+    }
+
+    async #ensureContextTree() {
+        if (this.#db.getTree(Workspace.CONTEXT_TREE_NAME)) {
+            return this.#db.getTree(Workspace.CONTEXT_TREE_NAME);
+        }
+
+        // Migration: rename legacy names ('default', 'ContextTree') -> 'context'
+        const defaultContextTree = this.#db.getDefaultContextTree();
+        if (defaultContextTree?.type === Workspace.CONTEXT_TYPE && ['default', 'ContextTree'].includes(defaultContextTree.name)) {
+            await this.#db.renameTree(defaultContextTree.id, Workspace.CONTEXT_TREE_NAME);
+            return this.#db.getTree(Workspace.CONTEXT_TREE_NAME);
+        }
+
+        await this.#db.createTree(Workspace.CONTEXT_TREE_NAME, Workspace.CONTEXT_TYPE);
+        return this.#db.getTree(Workspace.CONTEXT_TREE_NAME);
+    }
+
+    async #ensureDirectoryTree() {
+        if (this.#db.getTree(Workspace.DIRECTORY_TREE_NAME)) {
+            return this.#db.getTree(Workspace.DIRECTORY_TREE_NAME);
+        }
+
+        await this.#db.createTree(Workspace.DIRECTORY_TREE_NAME, Workspace.DIRECTORY_TYPE);
+        return this.#db.getTree(Workspace.DIRECTORY_TREE_NAME);
+    }
+
+    async #ensureBackendsTree() {
+        const existing = this.#db.getTree(Workspace.BACKENDS_TREE_NAME);
+        if (existing) {
+            if (existing.type !== Workspace.DIRECTORY_TYPE) {
+                throw new Error(`Tree "${Workspace.BACKENDS_TREE_NAME}" exists but is not a directory tree — rename it to free the reserved name`);
+            }
+            return existing;
+        }
+
+        // linkContextRoot:false keeps backend mirrors out of the user's context
+        // root until explicitly filed; protected guards rename/destroy.
+        await this.#db.createTree(Workspace.BACKENDS_TREE_NAME, Workspace.DIRECTORY_TYPE, {
+            isDefault: false,
+            settings: { linkContextRoot: false, protected: true },
+        });
+        return this.#db.getTree(Workspace.BACKENDS_TREE_NAME);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Runtime event forwarding
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #setStatus(status) {
+        if (this.#status !== status) {
+            this.#status = status;
+            this.emit('status.changed', { id: this.id, status });
+        }
+    }
+
+    #bindRuntimeEvents() {
+        this.#unbindRuntimeEvents();
+        if (!this.#db) return;
+        this.#runtimeListeners = [this.#createRuntimeListener(this.#db, 'db')].filter(Boolean);
+    }
+
+    #unbindRuntimeEvents() {
+        for (const binding of this.#runtimeListeners) {
+            binding.emitter.off('**', binding.listener);
+        }
+        this.#runtimeListeners = [];
+    }
+
+    static #mergeConfigMap(defaults, overrides) {
+        const out = {};
+        for (const [key, value] of Object.entries(defaults || {})) {
+            out[key] = { ...(value || {}) };
+        }
+        for (const [key, value] of Object.entries(overrides || {})) {
+            out[key] = { ...(out[key] || {}), ...(value || {}) };
+        }
+        return out;
+    }
+
+    static #resolveWorkspaceRoot(value, rootPath) {
+        if (typeof value !== 'string') return value;
+        return value.replaceAll('{WORKSPACE_ROOT}', rootPath);
+    }
+
+    #createRuntimeListener(emitter, source) {
+        if (!emitter?.on) return null;
+
+        const workspace = this;
+        const listener = function (payload = {}) {
+            const eventName = this.event;
+            if (!eventName) return;
+
+            const eventPayload = payload && typeof payload === 'object'
+                ? { ...payload }
+                : { value: payload };
+
+            if (!eventPayload.workspaceId) eventPayload.workspaceId = workspace.id;
+            if (!eventPayload.source) eventPayload.source = source;
+
+            workspace.emit(eventName, eventPayload);
+        };
+
+        emitter.on('**', listener);
+        return { emitter, listener };
+    }
+}
+
+export default Workspace;

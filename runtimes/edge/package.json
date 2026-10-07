@@ -1,40 +1,40 @@
 {
-    "name": "@augmentd-labs/canvas-edge",
-    "version": "0.5.0",
-    "description": "Canvas device runtime: folder mirrors (canvas-stored Mirror engine) + edge tunnel client",
-    "license": "AGPL-3.0-or-later",
-    "type": "module",
-    "bin": {
-        "canvas-edge": "bin/canvas-edge"
-    },
-    "exports": {
-        ".": "./src/index.js",
-        "./client": "./src/EdgeClient.js"
-    },
-    "files": [
-        "bin",
-        "src",
-        "NOTICE"
-    ],
-    "scripts": {
-        "start": "node bin/canvas-edge --foreground",
-        "test": "node --test \"tests/**/*.test.js\"",
-        "lint": "eslint src tests bin --no-error-on-unmatched-pattern"
-    },
-    "engines": {
-        "node": ">=20.18.0"
-    },
-    "dependencies": {
-        "@augmentd-labs/canvas-protocol": "workspace:*",
-        "canvas-stored": "github:canvas-ui/canvas-stored#main",
-        "fastify": "^4.29.1",
-        "pino": "^10.3.1",
-        "socket.io-client": "^4.8.3",
-        "@augmentd-labs/canvas-api-client": "workspace:*"
-    },
-    "repository": {
-        "type": "git",
-        "url": "git+https://github.com/canvas-ui/canvas-common.git",
-        "directory": "runtimes/edge"
-    }
+  "name": "@augmentd-labs/canvas-edge",
+  "version": "0.6.0",
+  "description": "Canvas device runtime: folder mirrors (canvas-stored Mirror engine) + edge tunnel client",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "bin": {
+    "canvas-edge": "bin/canvas-edge"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/EdgeClient.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "NOTICE"
+  ],
+  "scripts": {
+    "start": "node bin/canvas-edge --foreground",
+    "test": "node --test \"tests/**/*.test.js\"",
+    "lint": "eslint src tests bin --no-error-on-unmatched-pattern"
+  },
+  "engines": {
+    "node": ">=20.18.0"
+  },
+  "dependencies": {
+    "@augmentd-labs/canvas-protocol": "workspace:*",
+    "canvas-stored": "github:canvas-ui/canvas-stored#main",
+    "fastify": "^4.29.1",
+    "pino": "^10.3.1",
+    "socket.io-client": "^4.8.3",
+    "@augmentd-labs/canvas-api-client": "workspace:*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/canvas-ui/canvas-common.git",
+    "directory": "runtimes/edge"
+  }
 }

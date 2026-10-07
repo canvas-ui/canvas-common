@@ -1,0 +1,12 @@
+{
+  "name": "@canvas/agent-core",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.74.2",
+    "@earendil-works/pi-ai": "0.74.2"
+  },
+  "license": "AGPL-3.0-or-later",
+  "author": "me@idnc.sk"
+}

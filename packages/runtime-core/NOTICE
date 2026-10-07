@@ -1,0 +1,105 @@
+Canvas (open layer: clients, integrations and shared packages)
+Copyright (C) 2023-2026 Jozef Melich
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Contact:
+    lic@augmentd.eu       licensing
+    contrib@augmentd.eu   contributions
+    security@augmentd.eu  security
+
+
+PART OF CANVAS
+--------------
+
+This repository holds the shared packages of the Canvas open layer and the
+canvas-edge device runtime. The client applications live in their own
+repositories (canvas-web, canvas-cli, canvas-desktop,
+canvas-browser-extension; until 2026-10 they were `apps/*` here).
+
+    packages/protocol           wire contract (envelope, codes, routes, events)
+    packages/schemas            document schema ids, versions, builders
+    packages/api-client         REST client over the protocol package
+
+This repository is one component of the Canvas project:
+
+    this repository  https://github.com/canvas-ui/canvas-common
+    the project      https://github.com/canvas-ui/canvas-server
+
+Canvas components are not all licensed the same way. The server runtime and
+the services behind it (canvas-server, canvas-synapsd, canvas-stored,
+canvas-inferd, canvas-agentd) are dual-licensed: AGPL-3.0-or-later or a
+commercial licence. The shared libraries in this repository (`packages/*`)
+are dual-licensed the same way. The client applications (formerly `apps/*`
+here, now their own repositories), and the canvas-fuse client, are AGPL-only. The COMPONENTS section
+of the project NOTICE lists which is which.
+
+
+DISTRIBUTION
+------------
+
+The components in this repository are clients that run on the user's own
+machine or in their browser, so the network clause in section 13 of the AGPL
+is rarely the one that applies to them. Sections 4 to 6 are. If you convey
+these programs, modified or not, through an app store, an extension gallery, a
+package registry, a distribution image or an appliance, recipients must
+receive this licence and an offer of the corresponding source.
+
+If you build against a modified Canvas server, section 13 reaches that server
+too. See the project NOTICE.
+
+
+COPYRIGHT AND LICENSING
+-----------------------
+
+Copyright in this codebase is held by Jozef Melich. Augmentd s.r.o. holds an
+exclusive licence to it, including the right to grant sublicences, and is the
+entity authorised to issue commercial licences for Canvas.
+
+The client applications (formerly `apps/*` here, now the canvas-web,
+canvas-cli, canvas-desktop and canvas-browser-extension repositories) are
+available under the AGPL-3.0-or-later
+and under no other terms. No commercial licence is offered for them to
+anyone, and none is planned. The Canvas clients stay free software in all
+cases, including for anyone who holds a commercial licence to the Canvas
+server runtime and its services.
+
+The shared libraries (`packages/*`) are also available under the
+AGPL-3.0-or-later, and additionally under the Canvas commercial licence, as
+part of the dual-licensed Canvas engine. Contributions to `packages/*` are
+therefore asked for under the Canvas CLA; contributions to the client
+applications need only a DCO sign-off. See CONTRIBUTING.md.
+
+A commercial licence to a dual-licensed Canvas component does not extend to
+the client applications. If you modify one of these clients and convey it, or
+serve a modified web UI, the AGPL applies to you in full, whatever other
+Canvas licences you hold.
+
+Commercial licensing of the dual-licensed components is described at
+https://github.com/canvas-ui/canvas-server/blob/main/COMMERCIAL.md
+Enquiries: lic@augmentd.eu
+
+    Augmentd s.r.o.
+    DUETT Business Center
+    Námestie Osloboditeľov 3/A
+    040 01 Košice, Slovakia
+    Company ID: 45331936
+    VAT ID: SK2022968717
+    https://augmentd.eu
+
+
+THIRD-PARTY CODE
+----------------
+
+Third-party dependencies keep their own licences. See the dependency manifests
+and lockfiles for their terms. This notice covers Canvas code only.

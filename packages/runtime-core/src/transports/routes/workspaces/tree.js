@@ -1,0 +1,879 @@
+'use strict';
+
+import ResponseObject from '../../ResponseObject.js';
+
+// The dedicated backends tree mirrors backend storage 1:1 — generic tree-path
+// writes don't belong there (backend container ops go through /:id/backends).
+function isBackendsTree(workspace, tree) {
+  if (!tree || tree.type !== 'directory') { return false; }
+  try { return workspace.getBackendsTree()?.id === tree.id; }
+  catch { return false; }
+}
+
+export default async function workspaceTreeRoutes(fastify) {
+  async function getWorkspaceInstance(request, reply) {
+    const identifier = request.params.id;
+    const userId = request.user.id;
+    const isWorkspaceId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identifier);
+    const workspaceId = isWorkspaceId ? identifier : await fastify.workspaceManager.resolveWorkspaceId(userId, identifier);
+    if (!workspaceId) {
+      const responseObject = new ResponseObject().notFound(`Workspace with ID ${identifier} not found`);
+      reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      return null;
+    }
+    const workspace = await fastify.workspaceManager.getWorkspace(workspaceId, userId);
+    if (!workspace) {
+      const responseObject = new ResponseObject().notFound(`Workspace with ID ${identifier} not found`);
+      reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      return null;
+    }
+    return workspace;
+  }
+
+  async function getTreeInstance(request, reply, expectedType = null) {
+    const workspace = await getWorkspaceInstance(request, reply);
+    if (!workspace) { return null; }
+
+    try {
+      const tree = workspace.getTree(request.params.treeNameOrTreeId);
+      if (expectedType && tree.type !== expectedType) {
+        const responseObject = new ResponseObject().badRequest(`Tree "${tree.name}" is not a ${expectedType} tree`);
+        reply.code(responseObject.statusCode).send(responseObject.getResponse());
+        return null;
+      }
+      return { workspace, tree };
+    } catch (error) {
+      // getTree() reaches into the workspace DB, so on a stopped workspace it
+      // throws before it can tell whether the tree exists — that is not a
+      // missing tree.
+      const responseObject = ResponseObject.isWorkspaceNotActiveError(error)
+        ? new ResponseObject().workspaceNotActive()
+        : new ResponseObject().notFound(error.message || 'Tree not found');
+      reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      return null;
+    }
+  }
+
+  function pathFromSplat(request) {
+    const splat = request.params['*'] || '';
+    return `/${splat}`.replace(/\/+/g, '/');
+  }
+
+  function normalizeTreePath(path) {
+    return `/${String(path || '').replace(/^\/+/, '')}`.replace(/\/+/g, '/').replace(/\/$/, '') || '/';
+  }
+
+  function parentPathOf(path) {
+    const normalized = normalizeTreePath(path);
+    if (normalized === '/') { return null; }
+    return normalized.split('/').slice(0, -1).join('/') || '/';
+  }
+
+  function leafNameOf(path) {
+    return normalizeTreePath(path).split('/').filter(Boolean).pop() || null;
+  }
+
+  function pathNodeView(tree, path) {
+    const layer = typeof tree.getLayerForPath === 'function'
+      ? tree.getLayerForPath(path)
+      : null;
+    if (layer) {
+      return {
+        ...(typeof layer.toJSON === 'function' ? layer.toJSON() : layer),
+        treeId: tree.id,
+        treeName: tree.name,
+        path,
+      };
+    }
+    if (typeof tree.getNodeIdsForPath === 'function') {
+      const nodeIds = tree.getNodeIdsForPath(path);
+      if (nodeIds.length > 0) {
+        return {
+          id: nodeIds[nodeIds.length - 1],
+          type: tree.type,
+          treeId: tree.id,
+          treeName: tree.name,
+          path,
+        };
+      }
+    }
+    return null;
+  }
+
+  async function insertTreePath(tree, path, body = {}) {
+    if (tree.type === 'context') {
+      return await tree.insertPath(path, {
+        leafType: body.type || 'context',
+        querySpec: body.querySpec,
+        metadata: body.metadata,
+      }, body.autoCreateLayers ?? true);
+    }
+    return await tree.insertPath(path, {
+      leafType: body.type || 'directory',
+      querySpec: body.querySpec,
+      metadata: body.metadata,
+    });
+  }
+
+  // DirectoryTree.movePath/copyPath expect targetPath = FULL destination path
+  // (parent + final name). UI drag-drop sends targetPath = drop-target node
+  // (the destination parent). If targetPath resolves to an existing directory
+  // distinct from source, compose finalPath = `${target}/${sourceName}`.
+  function resolveDirectoryTargetPath(tree, fromPath, targetPath) {
+    const source = pathNodeView(tree, fromPath);
+    if (!source?.id) { return { error: `Path not found: ${fromPath}` }; }
+    const existingTarget = pathNodeView(tree, targetPath);
+    if (existingTarget && existingTarget.id !== source.id) {
+      const sourceName = leafNameOf(fromPath);
+      const normalizedParent = normalizeTreePath(targetPath);
+      const finalPath = normalizedParent === '/'
+        ? `/${sourceName}`
+        : `${normalizedParent}/${sourceName}`;
+      return { finalPath };
+    }
+    return { finalPath: targetPath };
+  }
+
+  async function moveTreePath(tree, fromPath, targetPath, recursive = false, options = {}) {
+    if (tree.type !== 'context') {
+      const resolved = resolveDirectoryTargetPath(tree, fromPath, targetPath);
+      if (resolved.error) { return { data: null, count: 0, error: resolved.error }; }
+      return await tree.movePath(fromPath, resolved.finalPath, recursive);
+    }
+
+    const source = pathNodeView(tree, fromPath);
+    if (!source?.id) {
+      return { data: null, count: 0, error: `Path not found: ${fromPath}` };
+    }
+
+    const existingTarget = pathNodeView(tree, targetPath);
+    if (existingTarget && existingTarget.id !== source.id) {
+      // Existing target means "move under this parent" for drag/drop callers.
+      return await tree.movePath(fromPath, targetPath, recursive, options);
+    }
+
+    const targetName = leafNameOf(targetPath);
+    const targetParentPath = parentPathOf(targetPath);
+    if (!targetName || !targetParentPath) {
+      return { data: null, count: 0, error: `Invalid target path: ${targetPath}` };
+    }
+
+    const sourceParentPath = parentPathOf(fromPath);
+    if (targetParentPath !== sourceParentPath) {
+      const moved = await tree.movePath(fromPath, targetParentPath, recursive, options);
+      if (moved?.error) { return moved; }
+    }
+
+    if (targetName !== source.name) {
+      const renamed = await tree.renameLayer(source.id, targetName);
+      return {
+        data: { pathFrom: fromPath, pathTo: targetPath, layerId: renamed.id, layerName: renamed.name },
+        count: 1,
+        error: null,
+      };
+    }
+
+    return {
+      data: { pathFrom: fromPath, pathTo: targetPath, layerId: source.id, layerName: source.name },
+      count: 1,
+      error: null,
+    };
+  }
+
+  function resolveTargetTree(workspace, currentTree, nameOrId) {
+    if (!nameOrId || nameOrId === currentTree.id || nameOrId === currentTree.name) {
+      return currentTree;
+    }
+    const tree = workspace.getTree(nameOrId);
+    if (!tree) { throw new Error(`Target tree not found: ${nameOrId}`); }
+    return tree;
+  }
+
+  function treeSelectorFor(tree, path) {
+    return tree.type === 'directory'
+      ? { context: null, directory: { tree: tree.id, path } }
+      : { context: { tree: tree.id, path }, directory: null };
+  }
+
+  function joinTreePath(parent, name) {
+    return parent === '/' ? `/${name}` : `${parent}/${name}`;
+  }
+
+  // Walk a buildJsonTree() result down to the node at `path` (segments are
+  // node names). Needed for subtree copies — pathNodeView only returns the
+  // single layer, not its children.
+  function findJsonTreeNode(root, path) {
+    const segments = normalizeTreePath(path).split('/').filter(Boolean);
+    let node = root;
+    for (const segment of segments) {
+      node = (node?.children || []).find((child) => child?.name === segment);
+      if (!node) { return null; }
+    }
+    return node;
+  }
+
+  // Cross-tree "paste a folder" (e.g. backends → context tree). Not an
+  // on-disk copy: creates the tree path(s) in the target tree and links the
+  // source documents (id arrays) to them. With `recursive` the whole source
+  // subtree structure is mirrored.
+  async function copyAcrossTrees(workspace, sourceTree, targetTree, fromPath, targetPath, recursive = false, move = false) {
+    const normalizedTargetPath = normalizeTreePath(targetPath);
+    const normalizedFromPath = normalizeTreePath(fromPath);
+    if (isBackendsTree(workspace, targetTree)) {
+      return { data: null, count: 0, error: 'Backends tree is read-only' };
+    }
+    if (move && isBackendsTree(workspace, sourceTree)) {
+      return { data: null, count: 0, error: 'Backends tree is read-only (copy documents out instead of moving)' };
+    }
+    const sourceNode = pathNodeView(sourceTree, normalizedFromPath);
+    if (!sourceNode?.id) {
+      return { data: null, count: 0, error: `Path not found: ${normalizedFromPath}` };
+    }
+
+    // Pasting onto an existing target node copies the source folder UNDER it
+    // (`<target>/<sourceName>`); a non-existing target is taken as the full
+    // destination path. Missing paths are created below.
+    let finalPath = normalizedTargetPath;
+    const sourceLeafName = leafNameOf(normalizedFromPath);
+    if (pathNodeView(targetTree, normalizedTargetPath) && sourceLeafName) {
+      finalPath = joinTreePath(normalizedTargetPath, sourceLeafName);
+    }
+
+    // Source→target path pairs; recursive mirrors the whole subtree so the
+    // folder structure survives the copy.
+    const jobs = [{ src: normalizedFromPath, dst: finalPath }];
+    if (recursive) {
+      const subtree = findJsonTreeNode(sourceTree.buildJsonTree(), normalizedFromPath);
+      const walk = (node, srcBase, dstBase) => {
+        for (const child of node?.children || []) {
+          if (!child?.name) { continue; }
+          const src = joinTreePath(srcBase, child.name);
+          const dst = joinTreePath(dstBase, child.name);
+          jobs.push({ src, dst });
+          walk(child, src, dst);
+        }
+      };
+      if (subtree) { walk(subtree, normalizedFromPath, finalPath); }
+    }
+
+    // Per path: ensure it exists in the target tree, then link the source
+    // documents. Listing at a path includes descendants, so a doc under a
+    // subfolder is linked at each ancestor too — the deepest link wins the
+    // final placement and the extra links are idempotent subsets.
+    const allIds = new Set();
+    const failures = [];
+    for (const job of jobs) {
+      await insertTreePath(targetTree, job.dst, {});
+      const docs = await workspace.list({
+        ...treeSelectorFor(sourceTree, job.src),
+        limit: 0,
+        parse: false,
+      });
+      if (docs.error) {
+        failures.push(`${job.src}: ${docs.error}`);
+        continue;
+      }
+      const documentIds = docs.map((doc) => doc?.id).filter((id) => typeof id === 'number');
+      if (documentIds.length === 0) { continue; }
+      const linked = await workspace.linkMany(documentIds, treeSelectorFor(targetTree, job.dst));
+      if (linked.failed?.length) {
+        failures.push(`${job.dst}: ${linked.failed.length} document(s) could not be linked`);
+      }
+      documentIds.forEach((id) => allIds.add(id));
+    }
+
+    if (move && allIds.size > 0) {
+      const unlinked = await workspace.unlinkMany([...allIds], treeSelectorFor(sourceTree, normalizedFromPath), [], { recursive });
+      if (unlinked.failed?.length) {
+        failures.push(`source unlink: ${unlinked.failed.length} failure(s)`);
+      }
+    }
+
+    return {
+      data: {
+        pathFrom: normalizedFromPath,
+        pathTo: finalPath,
+        sourceTree: sourceTree.name,
+        targetTree: targetTree.name,
+        pathsCreated: jobs.length,
+        documentIds: [...allIds],
+      },
+      count: allIds.size,
+      error: failures.length ? failures.join('; ') : null,
+    };
+  }
+
+  fastify.get('/', {
+    onRequest: [fastify.authenticate],
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply);
+      if (!resolved) return;
+      const responseObject = new ResponseObject().found(resolved.tree.buildJsonTree(), 'Workspace tree retrieved successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Get workspace tree error for ID ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError('Failed to get workspace tree');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  fastify.get('/paths', {
+    onRequest: [fastify.authenticate],
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply);
+      if (!resolved) return;
+      const paths = resolved.tree.paths;
+      const responseObject = new ResponseObject().found(paths, 'Tree paths retrieved successfully', 200, paths.length);
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Get workspace tree paths error for ID ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to get tree paths');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  fastify.get('/path/*', {
+    onRequest: [fastify.authenticate],
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply);
+      if (!resolved) return;
+      const path = pathFromSplat(request);
+      const node = pathNodeView(resolved.tree, path);
+      if (!node) {
+        const responseObject = new ResponseObject().notFound(`Path not found: ${path}`);
+        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+      const responseObject = new ResponseObject().found(node, 'Tree path retrieved successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Get workspace path error for ID ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to get path');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  fastify.put('/path/*', {
+    onRequest: [fastify.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          type: { type: 'string' },
+          autoCreateLayers: { type: 'boolean' },
+          querySpec: { type: 'object' },
+          metadata: { type: 'object' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply);
+      if (!resolved) return;
+      const path = pathFromSplat(request);
+      // The backends tree mirrors backend storage 1:1 — user-created canvases
+      // (or folders) don't belong there; folder ops go through /:id/backends.
+      if (isBackendsTree(resolved.workspace, resolved.tree)) {
+        const responseObject = new ResponseObject().badRequest('Backends tree is read-only');
+        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+      const result = await insertTreePath(resolved.tree, path, request.body || {});
+      if (result?.error) {
+        const responseObject = new ResponseObject().badRequest(result.error);
+        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+      const responseObject = new ResponseObject().created(pathNodeView(resolved.tree, path) || result, 'Tree path saved successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Save workspace path error for ID ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to save path');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  // Shared by '/path/*' and the bare '/path' root alias: the wildcard route
+  // does not match an empty splat, but the root layer's presentation
+  // (metadata.views, color, …) must be editable too — the web's content-view
+  // tabs save against whatever path is open, '/' included.
+  const updateTreePathOpts = {
+    onRequest: [fastify.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          to: { type: 'string' },
+          targetTreeNameOrTreeId: { type: 'string' },
+          name: { type: 'string' },
+          recursive: { type: 'boolean', default: false },
+          // Context trees only: OR the moved layer into its new ancestors so
+          // the destination path reads its documents (ContextTree.mergeDown).
+          mergeDown: { type: 'boolean', default: false },
+          label: { type: 'string' },
+          description: { type: 'string' },
+          color: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+          querySpec: { type: 'object' },
+          metadata: { type: 'object' },
+        },
+      },
+    },
+  };
+  const updateTreePathHandler = async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply);
+      if (!resolved) return;
+      const path = pathFromSplat(request);
+      const body = request.body || {};
+
+      if (body.to || body.name) {
+        const targetPath = body.to || `${path.split('/').slice(0, -1).join('/') || '/'}/${body.name}`;
+        const targetTree = resolveTargetTree(resolved.workspace, resolved.tree, body.targetTreeNameOrTreeId);
+        const result = targetTree.id === resolved.tree.id
+          ? await moveTreePath(resolved.tree, path, targetPath, body.recursive, { mergeDown: body.mergeDown })
+          : await copyAcrossTrees(resolved.workspace, resolved.tree, targetTree, path, targetPath, body.recursive, true);
+        const responseObject = result?.error
+          ? new ResponseObject().badRequest(result.error)
+          : new ResponseObject().success(result, 'Tree path moved successfully');
+        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+
+      const node = pathNodeView(resolved.tree, path);
+      if (!node?.id || typeof resolved.tree.updateLayer !== 'function') {
+        const responseObject = new ResponseObject().badRequest(`Path cannot be updated: ${path}`);
+        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+      // Strip move/control fields (including schema-injected defaults)
+      // so only real layer fields reach updateLayer — otherwise locked layers
+      // reject presentation-only edits.
+      const { to, name, targetTreeNameOrTreeId, recursive, mergeDown, ...layerUpdates } = body;
+      void to; void name; void targetTreeNameOrTreeId; void recursive; void mergeDown;
+      const updated = await resolved.tree.updateLayer(node.id, layerUpdates);
+      const responseObject = new ResponseObject().success({
+        ...(typeof updated.toJSON === 'function' ? updated.toJSON() : updated),
+        treeId: resolved.tree.id,
+        treeName: resolved.tree.name,
+        path,
+      }, 'Tree path updated successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Update workspace path error for ID ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to update path');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  };
+  fastify.patch('/path/*', updateTreePathOpts, updateTreePathHandler);
+  fastify.patch('/path', updateTreePathOpts, updateTreePathHandler);
+
+  fastify.post('/path/*', {
+    onRequest: [fastify.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['to'],
+        properties: {
+          to: { type: 'string' },
+          targetTreeNameOrTreeId: { type: 'string' },
+          recursive: { type: 'boolean', default: false },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply);
+      if (!resolved) return;
+      const fromPath = pathFromSplat(request);
+      let toPath = request.body.to;
+      const targetTree = resolveTargetTree(resolved.workspace, resolved.tree, request.body.targetTreeNameOrTreeId);
+      if (targetTree.id !== resolved.tree.id) {
+        const result = await copyAcrossTrees(resolved.workspace, resolved.tree, targetTree, fromPath, toPath, request.body.recursive, false);
+        const responseObject = result?.error
+          ? new ResponseObject().badRequest(result.error)
+          : new ResponseObject().success(result, 'Tree path copied successfully');
+        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+      if (resolved.tree.type !== 'context') {
+        const r = resolveDirectoryTargetPath(resolved.tree, fromPath, toPath);
+        if (r.error) {
+          const errResp = new ResponseObject().badRequest(r.error);
+          return reply.code(errResp.statusCode).send(errResp.getResponse());
+        }
+        toPath = r.finalPath;
+      }
+      const result = await resolved.tree.copyPath(fromPath, toPath, request.body.recursive);
+      const responseObject = new ResponseObject().success(result, 'Tree path copied successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Copy workspace path error for ID ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to copy path');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  fastify.delete('/path/*', {
+    onRequest: [fastify.authenticate],
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          recursive: { type: 'boolean', default: false },
+          // Opt-in cascade-purge. Only honored inside the backends tree: drops
+          // the folder AND deletes the documents under it from the index
+          // ("Remove and purge"). Default (false) is plain "Remove" —
+          // folder/membership dropped, documents kept (an agent/user may have
+          // already filed the keepers elsewhere; backends re-sync the rest if
+          // re-enabled). Ignored elsewhere.
+          purge: { type: 'boolean', default: false },
+          // Opt-in backend deletion ("Remove, purge and destroy"). Only honored
+          // inside the backends tree: additionally deletes the mirrored
+          // resources ON the backend (rw backends only; read-only/foreign
+          // locations degrade to a reference drop). Implies purge.
+          destroy: { type: 'boolean', default: false },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply);
+      if (!resolved) return;
+      const path = pathFromSplat(request);
+      const isBackendsPath = isBackendsTree(resolved.workspace, resolved.tree);
+      const destroy = request.query.destroy === true && isBackendsPath;
+      const purge = (request.query.purge === true || destroy) && isBackendsPath;
+      const result = destroy
+        ? await resolved.workspace.destroyBackendsTreePath(path, { recursive: request.query.recursive })
+        : purge
+          ? await resolved.workspace.removeBackendsTreePath(path, { recursive: request.query.recursive })
+          : await resolved.tree.removePath(path, request.query.recursive);
+      const message = result?.error
+        ? null
+        : destroy
+          ? `Tree path removed; ${(result.destroyed?.docsDestroyed || 0) + (result.destroyed?.docsPurged || 0)} document(s) purged, ${result.destroyed?.deletedLocations || 0} location(s) destroyed on backend`
+          : purge
+            ? `Tree path removed and ${result.purged || 0} document(s) purged`
+            : 'Tree path removed successfully';
+      const responseObject = result?.error
+        ? new ResponseObject().badRequest(result.error)
+        : new ResponseObject().success(result, message);
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      // A locked node means a backend mapped to this folder is still enabled —
+      // a state conflict, not a server fault.
+      if (/locked/i.test(error.message || '')) {
+        const conflict = new ResponseObject().conflict('Path is locked — a backend mapped to this folder is enabled; disable it first');
+        return reply.code(conflict.statusCode).send(conflict.getResponse());
+      }
+      fastify.log.error(`Remove workspace path error for ID ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to remove path');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  fastify.get('/layers', {
+    onRequest: [fastify.authenticate],
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply, 'context');
+      if (!resolved) return;
+      const layers = await resolved.tree.listLayers();
+      const responseObject = new ResponseObject().found(layers, 'Layers retrieved successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`List layers error for workspace ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to list layers');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  fastify.get('/layers/:layerId', {
+    onRequest: [fastify.authenticate],
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply, 'context');
+      if (!resolved) return;
+      const layer = resolved.tree.getLayerById(request.params.layerId) || resolved.tree.getLayer(request.params.layerId);
+      if (!layer) {
+        const responseObject = new ResponseObject().notFound(`Layer not found: ${request.params.layerId}`);
+        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+      const responseObject = new ResponseObject().found(layer, 'Layer retrieved successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Get layer error for workspace ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to get layer');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  // A single layer's OWN bitmap (no path AND). Same paging / text search /
+  // feature+filter / sort surface as GET /documents so the layer view in the
+  // web can page, search and sort like the path view does.
+  const layerDocsArrayOfStrings = {
+    anyOf: [{ type: 'array', items: { type: 'string' } }, { type: 'string' }],
+  };
+  fastify.get('/layers/:layerId/documents', {
+    onRequest: [fastify.authenticate],
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'integer', default: 200 },
+          offset: { type: 'integer' },
+          page: { type: 'integer' },
+          q: layerDocsArrayOfStrings,
+          allOf: layerDocsArrayOfStrings,
+          anyOf: layerDocsArrayOfStrings,
+          noneOf: layerDocsArrayOfStrings,
+          filters: layerDocsArrayOfStrings,
+          ids: { anyOf: [{ type: 'array', items: { type: 'integer' } }, { type: 'integer' }] },
+          order: { type: 'string', enum: ['asc', 'desc'], default: 'desc' },
+          sortBy: { type: 'string' },
+          mode: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply, 'context');
+      if (!resolved) return;
+      const { workspace, tree } = resolved;
+      const layer = tree.getLayerById(request.params.layerId) || tree.getLayer(request.params.layerId);
+      if (!layer) {
+        const responseObject = new ResponseObject().notFound(`Layer not found: ${request.params.layerId}`);
+        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+      const asList = (v) => (Array.isArray(v) ? v : (v == null ? [] : [v])).filter((x) => x !== '' && x != null);
+      const bitmapKey = `context/${tree.id}/${layer.id}`;
+      const attributes = { allOf: [bitmapKey, ...asList(request.query.allOf)] };
+      const anyOf = asList(request.query.anyOf);
+      const noneOf = asList(request.query.noneOf);
+      if (anyOf.length) attributes.anyOf = anyOf;
+      if (noneOf.length) attributes.noneOf = noneOf;
+      const ids = asList(request.query.ids);
+      const queries = asList(request.query.q).filter((x) => typeof x === 'string' && x.trim());
+      const spec = {
+        // Explicitly NOT scoped to a path: the layer bitmap is the whole scope.
+        context: null,
+        directory: null,
+        attributes,
+        filters: asList(request.query.filters),
+        ...(ids.length ? { ids } : {}),
+        limit: request.query.limit,
+        offset: request.query.offset,
+        page: request.query.page,
+        order: request.query.order,
+        sortBy: request.query.sortBy,
+        applyCanvasQuerySpec: false,
+      };
+      let documents;
+      if (queries.length > 1) {
+        documents = await workspace.searchRefined(queries, spec, { limit: request.query.limit, offset: request.query.offset, mode: request.query.mode });
+      } else if (queries.length === 1) {
+        documents = await workspace.search({ query: queries[0], mode: request.query.mode, ...spec });
+      } else {
+        documents = await workspace.list(spec);
+      }
+      if (documents.error) {
+        const responseObject = new ResponseObject().serverError('Failed to list layer documents');
+        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+      const responseObject = new ResponseObject().found(documents, 'Layer documents retrieved successfully', 200, documents.count, documents.totalCount);
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Get layer documents error for workspace ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to get layer documents');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  fastify.patch('/layers/:layerId', {
+    onRequest: [fastify.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply, 'context');
+      if (!resolved) return;
+      const layer = request.body.name
+        ? await resolved.tree.renameLayer(request.params.layerId, request.body.name)
+        : await resolved.tree.updateLayer(request.params.layerId, request.body);
+      const responseObject = new ResponseObject().success(layer, 'Layer updated successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Update layer error for workspace ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to update layer');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  fastify.post('/layers/:layerId/lock', {
+    onRequest: [fastify.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['lockBy'],
+        properties: {
+          lockBy: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply, 'context');
+      if (!resolved) return;
+      const result = await resolved.tree.lockLayer(request.params.layerId, request.body.lockBy);
+      const responseObject = new ResponseObject().success(result, 'Layer locked successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Lock layer error for workspace ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to lock layer');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  fastify.post('/layers/:layerId/unlock', {
+    onRequest: [fastify.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['lockBy'],
+        properties: {
+          lockBy: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply, 'context');
+      if (!resolved) return;
+      const result = await resolved.tree.unlockLayer(request.params.layerId, request.body.lockBy);
+      if (result.isStillLocked) {
+        const ids = result.lockedBy.join(', ');
+        const responseObject = new ResponseObject().conflict(
+          `Your lock was removed, but layer is still locked by: ${ids}`,
+          { lockedBy: result.lockedBy },
+        );
+        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+      const responseObject = new ResponseObject().success(result, 'Layer unlocked successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Unlock layer error for workspace ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to unlock layer');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  fastify.delete('/layers/:layerId', {
+    onRequest: [fastify.authenticate],
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply, 'context');
+      if (!resolved) return;
+      await resolved.tree.deleteLayer(request.params.layerId);
+      const responseObject = new ResponseObject().deleted(true, 'Layer deleted successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Delete layer error for workspace ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to delete layer');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  // Path-scoped bitmap ops. Source = leaf layer of `path`, targets = its
+  // ancestors on that path — derived server-side so a caller cannot swap them
+  // (the classic accident: OR-ing /Home into every descendant).
+  const pathBitmapOp = (method, verb) => async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply, 'context');
+      if (!resolved) return;
+      if (typeof resolved.tree[method] !== 'function') {
+        const responseObject = new ResponseObject().badRequest(`${verb} is only available on context trees`);
+        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+      const result = await resolved.tree[method](request.body.path);
+      const responseObject = result.error
+        ? new ResponseObject().badRequest(result.error)
+        : new ResponseObject().success(result, `${verb} completed`);
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`${verb} error for workspace ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || `Failed to ${verb.toLowerCase()}`);
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  };
+  const pathBitmapOpOpts = {
+    onRequest: [fastify.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['path'],
+        properties: { path: { type: 'string' } },
+      },
+    },
+  };
+  fastify.post('/paths/merge-down', pathBitmapOpOpts, pathBitmapOp('mergeDown', 'Merge down'));
+  fastify.post('/paths/subtract-down', pathBitmapOpOpts, pathBitmapOp('subtractDown', 'Subtract down'));
+
+  fastify.post('/layers/merge', {
+    onRequest: [fastify.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['layerId', 'targetLayers'],
+        properties: {
+          layerId: { type: 'string' },
+          targetLayers: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply, 'context');
+      if (!resolved) return;
+      const result = await resolved.tree.mergeLayer(request.body.layerId, request.body.targetLayers);
+      const responseObject = result.error
+        ? new ResponseObject().badRequest(result.error)
+        : new ResponseObject().success(result, 'Layer merged successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Merge layer error for workspace ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to merge layer');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+
+  fastify.post('/layers/subtract', {
+    onRequest: [fastify.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['layerId', 'targetLayers'],
+        properties: {
+          layerId: { type: 'string' },
+          targetLayers: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const resolved = await getTreeInstance(request, reply, 'context');
+      if (!resolved) return;
+      const result = await resolved.tree.subtractLayer(request.body.layerId, request.body.targetLayers);
+      const responseObject = result.error
+        ? new ResponseObject().badRequest(result.error)
+        : new ResponseObject().success(result, 'Layer subtracted successfully');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    } catch (error) {
+      fastify.log.error(`Subtract layer error for workspace ${request.params.id}: ${error.message}`);
+      const responseObject = new ResponseObject().serverError(error.message || 'Failed to subtract layer');
+      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+    }
+  });
+}

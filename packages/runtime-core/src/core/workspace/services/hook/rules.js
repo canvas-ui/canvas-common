@@ -1,0 +1,900 @@
+'use strict';
+
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { spawn } from 'child_process';
+import { isDisabledFile } from './naming.js';
+import { WORKSPACE_DIRECTORIES } from '../../lib/constants.js';
+import { sanitizeSegment, joinKey, MIME_EXTENSIONS } from './key-utils.js';
+import { download } from './download.js';
+import { classifyDocument } from '../../lib/classifier.js';
+
+/**
+ * Declarative hook rules (canvas.hook-rules/v1).
+ *
+ * Rules live next to JS hooks in `{WORKSPACE_ROOT}/git/hooks` as `rules.json`
+ * plus `rules/*.json` (merged in filename sort order). An `example-`,
+ * `disabled-` or `_` prefix deactivates a file (same convention as JS hooks);
+ * a rule with `enabled: false` is skipped individually.
+ *
+ * Rule shape:
+ *   { id, enabled?, description?, cascade?, approval?, editable?, ttl?,
+ *     when: { event, reason?, schema?, path?, url?, from?, to?, subject?,
+ *     mime?, attachment? }, then: [ { action, ..., approval? } ] }
+ *
+ * `approval: true` (rule-level: hold the whole `then` block; action-level:
+ * hold that action only) diverts execution into the pending-actions review
+ * queue — see pending-actions.js. `editable` lists JSON paths the reviewer
+ * may amend; `ttl` expires undecided proposals.
+ *
+ * `when.path` includes descendants; `when.pathExact` matches direct folder
+ * membership only. Existing prefix rules retain their recursive scope.
+ *
+ * `when` keys AND together; a key's value may be an array (any-of / OR).
+ * Every matching rule fires — there is no first-match-wins, which keeps the
+ * format trivially composable for a UI rule builder.
+ *
+ * Actions: link, unlink, tag, store, unstore, download, delete, destroy, agent,
+ * notify, script, emit. `link`/`unlink` take `recursive: true` to append the
+ * document's sub-path below the matched `when.path` prefix to every target
+ * (mirror a folder subtree: `backends:/workspace/home/foo` → `dir:/bar`);
+ * templates see the same via {{match.rel}}. `store`/`unstore` are the storage-layer pair — they move/copy a
+ * document's BYTES between backends (with template renaming) and delete them
+ * from named backends; everything else operates on the index. `store` takes
+ * `folder` (destination directory on the target backend), `recursive: true`
+ * (append the sub-path below the matched `when.path`, like link) and `key`
+ * (file-name template) — composed as folder/{{match.rel}}/key.
+ */
+
+// Trace-worthy line (agent exchange, delivery outcome). Loggers handed in by
+// tests or JS hooks may lack info(); fall back to debug rather than fail the
+// action over a log line.
+function traceInfo(logger, message) {
+    if (typeof logger?.info === 'function') { logger.info(message); }
+    else { logger?.debug?.(message); }
+}
+
+// ── Loading ──────────────────────────────────────────────────────────────────
+
+export function resolveRuleFiles(hooksRoot) {
+    const files = [];
+
+    const singleFile = path.join(hooksRoot, 'rules.json');
+    try {
+        if (fs.statSync(singleFile).isFile()) { files.push(singleFile); }
+    } catch { /* absent */ }
+
+    const rulesDir = path.join(hooksRoot, 'rules');
+    try {
+        const entries = fs.readdirSync(rulesDir, { withFileTypes: true })
+            .filter((e) => e.isFile() && e.name.endsWith('.json') && !isDisabledFile(e.name))
+            .map((e) => path.join(rulesDir, e.name))
+            .sort();
+        files.push(...entries);
+    } catch { /* no rules directory */ }
+
+    return files;
+}
+
+// Mtime-keyed cache (same pattern as HookService#loadHookRun): an edited file
+// is re-parsed, an unchanged one is parsed once. Malformed JSON yields [].
+export function loadRuleFile(filePath, cache, logger = null) {
+    let stat;
+    try {
+        stat = fs.statSync(filePath);
+        if (!stat.isFile()) { return []; }
+    } catch {
+        return [];
+    }
+
+    const cached = cache?.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs) { return cached.rules; }
+
+    let rules = [];
+    try {
+        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        const list = Array.isArray(parsed) ? parsed : parsed?.rules;
+        if (Array.isArray(list)) {
+            rules = list.filter((r) => r && typeof r === 'object' && r.when && Array.isArray(r.then));
+        } else {
+            logger?.debug(`Rule file ${filePath} has no rules array, ignoring`);
+        }
+    } catch (err) {
+        logger?.debug(`Error parsing rule file ${filePath}: ${err.message}`);
+    }
+
+    cache?.set(filePath, { mtimeMs: stat.mtimeMs, rules });
+    return rules;
+}
+
+// ── Matching ─────────────────────────────────────────────────────────────────
+
+function asArray(value) {
+    return Array.isArray(value) ? value : [value];
+}
+
+// String matcher: plain string = case-insensitive substring (the semantics the
+// email-linker seed established); object = { equals, contains, startsWith, regex }.
+function matchText(actual, matcher) {
+    if (actual == null) { return false; }
+    const value = String(actual).toLowerCase();
+    if (typeof matcher === 'string') { return value.includes(matcher.toLowerCase()); }
+    if (!matcher || typeof matcher !== 'object') { return false; }
+    if (matcher.equals !== undefined && value !== String(matcher.equals).toLowerCase()) { return false; }
+    if (matcher.contains !== undefined && !value.includes(String(matcher.contains).toLowerCase())) { return false; }
+    if (matcher.startsWith !== undefined && !value.startsWith(String(matcher.startsWith).toLowerCase())) { return false; }
+    if (matcher.regex !== undefined && !safeRegex(matcher.regex)?.test(String(actual))) { return false; }
+    return true;
+}
+
+function matchUrl(classification, matcher) {
+    if (typeof matcher === 'string') { return classification.urlMatches(matcher); }
+    if (!matcher || typeof matcher !== 'object') { return false; }
+    if (matcher.host !== undefined && !asArray(matcher.host).some((h) => classification.hostMatches(h))) { return false; }
+    if (matcher.prefix !== undefined && !(classification.url || '').toLowerCase().startsWith(String(matcher.prefix).toLowerCase())) { return false; }
+    if (matcher.contains !== undefined && !asArray(matcher.contains).some((c) => classification.urlMatches(c))) { return false; }
+    if (matcher.regex !== undefined && !asArray(matcher.regex).some(pattern => classification.urlMatches(safeRegex(pattern)))) { return false; }
+    return true;
+}
+
+function safeRegex(pattern) {
+    try {
+        return new RegExp(pattern, 'i');
+    } catch {
+        return null;
+    }
+}
+
+// One check per `when` key. Shared by matchRule (dispatch) and explainRule
+// (the explain endpoint's matcher-by-matcher breakdown).
+const WHEN_CHECKS = {
+    event: (c, matcher, eventName) => Boolean(matcher) && asArray(matcher).includes(eventName),
+    // Which KIND of change fired the event: 'content' (the document changed)
+    // vs 'membership' (only its tree placement did). Lets a rule say "only when
+    // the file itself changed" instead of re-running on every re-filing.
+    reason: (c, matcher) => Boolean(matcher) && asArray(matcher).includes(c.reason),
+    schema: (c, matcher) => asArray(matcher).some((s) => c.isSchema(s)),
+    path: (c, matcher) => asArray(matcher).some((p) => c.inPath(p)),
+    pathExact: (c, matcher) => asArray(matcher).some((p) => c.pathMatches(p).some((match) => match.rel === '')),
+    url: (c, matcher) => asArray(matcher).some((u) => matchUrl(c, u)),
+    from: (c, matcher) => asArray(matcher).some((f) => matchText(c.from, f)),
+    // Any To/Cc recipient matches (substring or {equals|contains|startsWith|regex}).
+    to: (c, matcher) => asArray(matcher).some((m) => c.to.some((addr) => matchText(addr, m))),
+    subject: (c, matcher) => asArray(matcher).some((s) => matchText(c.subject, s)),
+    mime: (c, matcher) => asArray(matcher).some((m) => c.mimeMatches(m)),
+    // `attachment: true` = has any attachment; string/array = attachment mime
+    // pattern(s) (`application/pdf`, `image/*`, `*`); object = { mime?, filename? }.
+    attachment: (c, matcher) => {
+        if (matcher === true) { return c.hasAttachment(); }
+        if (typeof matcher === 'string' || Array.isArray(matcher)) {
+            return asArray(matcher).some((m) => c.hasAttachment(m));
+        }
+        if (!matcher || typeof matcher !== 'object') { return false; }
+        const mimeOk = matcher.mime === undefined || asArray(matcher.mime).some((m) => c.hasAttachment(m));
+        const nameOk = matcher.filename === undefined
+            || c.attachments.some((att) => asArray(matcher.filename).some((f) => matchText(att?.filename, f)));
+        return mimeOk && nameOk;
+    },
+};
+
+/**
+ * Matcher-by-matcher evaluation of one rule — "why (didn't) my rule fire".
+ * Unlike matchRule it does not short-circuit, so every check is reported.
+ * @param {Object} rule
+ * @param {string} eventName
+ * @param {Classification} c - classification of the document
+ * @returns {{ matched: boolean, enabled: boolean, checks: Array<{key, expected, matched}> }}
+ */
+export function explainRule(rule, eventName, c) {
+    const enabled = rule.enabled !== false;
+    const when = rule.when && typeof rule.when === 'object' ? rule.when : {};
+    const checks = [];
+
+    for (const [key, check] of Object.entries(WHEN_CHECKS)) {
+        if (key !== 'event' && when[key] === undefined) { continue; }
+        checks.push({ key, expected: when[key] ?? null, matched: check(c, when[key], eventName) });
+    }
+    // Unknown when-keys can never be satisfied — surface them instead of
+    // silently ignoring what the engine would reject.
+    for (const key of Object.keys(when)) {
+        if (!(key in WHEN_CHECKS)) { checks.push({ key, expected: when[key], matched: false, unknown: true }); }
+    }
+
+    return { matched: enabled && checks.length > 0 && checks.every((chk) => chk.matched), enabled, checks };
+}
+
+/**
+ * @param {Object} rule
+ * @param {string} eventName
+ * @param {Classification} c - classification of the event's document
+ * @returns {boolean}
+ */
+export function matchRule(rule, eventName, c) {
+    if (rule.enabled === false) { return false; }
+    const when = rule.when;
+    if (!when || typeof when !== 'object') { return false; }
+
+    if (!WHEN_CHECKS.event(c, when.event, eventName)) { return false; }
+    for (const key of ['reason', 'schema', 'path', 'pathExact', 'url', 'from', 'to', 'subject', 'mime', 'attachment']) {
+        if (when[key] !== undefined && !WHEN_CHECKS[key](c, when[key])) { return false; }
+    }
+
+    return true;
+}
+
+// ── Actions ──────────────────────────────────────────────────────────────────
+
+// Minimal `{{path.to.value}}` interpolation over the action scope. Missing
+// paths resolve to an empty string; objects/arrays (e.g. {{doc.locations}})
+// are JSON-serialized so they survive into agent prompts intact. Kept
+// deliberately dumb so a UI rule builder can round-trip the JSON.
+export function interpolate(template, scope) {
+    if (typeof template !== 'string') { return template; }
+    return template.replace(/\{\{\s*([\w.[\]]+)\s*\}\}/g, (_, keyPath) => {
+        const value = keyPath.split('.').reduce((acc, key) => (acc == null ? undefined : acc[key]), scope);
+        if (value == null) { return ''; }
+        if (typeof value === 'object') {
+            try { return JSON.stringify(value); } catch { return String(value); }
+        }
+        return String(value);
+    });
+}
+
+// A link target is a context-tree path by default; a 'tree:' qualifier picks
+// another tree by its actual name: 'ctx:'/'context:' (explicit context),
+// 'dir:'/'directory:' (the directory tree), or any directory-type tree such
+// as 'backends:/github/x'. Note the backends mirror itself is read-only for
+// rules — 'backends:' works in path CONDITIONS, but as a link/unlink target
+// the workspace guard refuses it (the run log shows the error).
+function parseLinkTarget(raw) {
+    const value = String(raw || '');
+    const qualifier = value.match(/^([A-Za-z][\w-]*):(?=\/|$)/);
+    if (!qualifier) { return { tree: 'context', path: value }; }
+    const tree = ({ ctx: 'context', dir: 'directory' })[qualifier[1]] || qualifier[1];
+    return { tree, path: value.slice(qualifier[0].length) || '/' };
+}
+
+// Directory selector for a parsed non-context target. The default
+// 'directory' tree keeps the legacy bare-path form; named trees go
+// tree-qualified so 'backends:'/custom trees resolve to the right tree.
+function directorySelector(target) {
+    return target.tree === 'directory' ? target.path : { tree: target.tree, path: target.path };
+}
+
+// Shared output pipeline for actions that produce text (agent reply, script
+// stdout). `output` supports, in any combination:
+//   note:   { path, title? }  -> insert the text as a note document at path
+//   file:   { path, backend?: 'home'|'data', append?, insert? }
+//           backend 'home' (default) writes {WORKSPACE_ROOT}/home/<path>
+//           (append: true appends); backend 'data' persists to the
+//           workspace:data blob store. `insert: '/a/b'` additionally indexes
+//           the result as a File document at that tree path.
+//   notify: true | { channel } -> send the text to the workspace owner
+// Paths accept 'dir:' / 'ctx:' prefixes and {{...}} templates.
+async function handleActionOutput(text, output, { context, scope, workspace, logger, label }) {
+    if (!text || !output || typeof output !== 'object') { return; }
+
+    if (output.note && typeof output.note === 'object' && output.note.path) {
+        const target = parseLinkTarget(interpolate(String(output.note.path), scope));
+        const title = interpolate(String(output.note.title || scope.rule?.description || `Automation output (${label})`), scope);
+        const note = await context.insert(
+            { schema: 'data/schema/note', data: { title, content: String(text) } },
+            target.tree !== 'context' ? { context: null, directory: directorySelector(target) } : { context: target.path },
+        );
+        logger.debug(`rule ${label}: output saved as note ${note?.id ?? note} at ${target.tree}:${target.path}`);
+    }
+
+    if (output.file && typeof output.file === 'object' && output.file.path) {
+        await writeOutputFile(String(text), output.file, { context, scope, workspace, logger, label });
+    }
+
+    if (output.notify) {
+        await context.notify(String(text), typeof output.notify === 'object' && output.notify.channel ? { channel: output.notify.channel } : {});
+    }
+}
+
+async function writeOutputFile(text, fileSpec, { context, scope, workspace, logger, label }) {
+    const backend = fileSpec.backend === 'data' ? 'data' : 'home';
+    const relPath = interpolate(String(fileSpec.path), scope).replace(/^\/+/, '');
+    if (!relPath) { return; }
+
+    let location; // { url, checksum, size }
+    if (backend === 'data') {
+        const buffer = Buffer.from(fileSpec.append ? `${text}\n` : text, 'utf8');
+        const persisted = await workspace.persistBlob(buffer);
+        location = { url: persisted.url, checksum: persisted.checksum, size: persisted.size };
+        logger.debug(`rule ${label}: output persisted to ${persisted.url}`);
+    } else {
+        const homeRoot = path.resolve(workspace.homePath);
+        const filePath = path.resolve(homeRoot, relPath);
+        if (filePath !== homeRoot && !filePath.startsWith(`${homeRoot}${path.sep}`)) {
+            logger.debug(`rule ${label}: refusing output file outside home/: ${fileSpec.path}`);
+            return;
+        }
+        await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+        if (fileSpec.append) { await fs.promises.appendFile(filePath, `${text}\n`, 'utf8'); }
+        else { await fs.promises.writeFile(filePath, text, 'utf8'); }
+        const bytes = await fs.promises.readFile(filePath);
+        location = {
+            url: `file://{WORKSPACE_ROOT}/home/${relPath.split(path.sep).join('/')}`,
+            checksum: crypto.createHash('sha256').update(bytes).digest('hex'),
+            size: bytes.length,
+        };
+        logger.debug(`rule ${label}: output written to home/${relPath}`);
+    }
+
+    if (fileSpec.insert) {
+        const target = parseLinkTarget(interpolate(String(fileSpec.insert), scope));
+        const doc = {
+            schema: 'data/schema/file',
+            checksumArray: location.checksum ? [`sha256/${location.checksum}`] : [],
+            locations: [{ url: location.url }],
+            metadata: { contentType: 'text/plain', size: location.size, filename: path.posix.basename(relPath.split(path.sep).join('/')) },
+            data: {},
+        };
+        const inserted = await context.insert(
+            doc,
+            target.tree !== 'context' ? { context: null, directory: directorySelector(target) } : { context: target.path },
+        );
+        logger.debug(`rule ${label}: output file indexed as ${inserted?.id ?? inserted} at ${target.tree}:${target.path}`);
+    }
+}
+
+// ── Storage-key templating ───────────────────────────────────────────────────
+
+export { joinKey } from './key-utils.js';
+
+/**
+ * The moment a document's content is *about*, best-effort, for date-templated
+ * storage keys. EXIF capture time first — a photo imported years later belongs
+ * under the year it was taken, not the year it was uploaded.
+ *
+ * EXIF timestamps carry no timezone: exifr parses them as server-local wall
+ * clock, and the formatter below reads them back with local getters, so the
+ * filename shows the time the camera showed. Falls back through the content
+ * timeline, document created/updated stamps, then now.
+ */
+function documentDate(doc) {
+    const candidates = [
+        doc?.metadata?.exif?.capturedAt,
+        (doc?.timelines || []).find((t) => (t?.timeline || t?.name) === 'content')?.start,
+        doc?.createdAt,
+        doc?.created,
+        doc?.metadata?.mtime,
+    ];
+    for (const candidate of candidates) {
+        if (!candidate) { continue; }
+        const date = candidate instanceof Date ? candidate : new Date(candidate);
+        if (!Number.isNaN(date.getTime())) { return date; }
+    }
+    return new Date();
+}
+
+function titleOf(doc) {
+    const raw = doc?.data?.title ?? doc?.metadata?.title ?? doc?.data?.name ?? doc?.data?.subject ?? '';
+    return String(raw).trim();
+}
+
+function filenameOf(doc, sourceKey) {
+    const own = String(doc?.metadata?.filename || doc?.data?.filename || '').trim();
+    if (own) { return own; }
+    return path.posix.basename(String(sourceKey || '').split(path.sep).join('/'));
+}
+
+/**
+ * Expand `{{YYYY}}`-style tokens in a storage key template.
+ *
+ * Date: YYYY, YY, MM, DD, HH, mm, ss. File: ext (with the dot, lowercased),
+ * basename (filename without extension), filename, title (document title made
+ * filesystem-safe, falls back to basename), id. Everything else is left for
+ * the generic {{doc.*}} interpolation, which runs after this.
+ */
+export function expandKeyTemplate(template, { doc, sourceKey } = {}) {
+    const date = documentDate(doc);
+    const pad = (n, width = 2) => String(n).padStart(width, '0');
+    const filename = filenameOf(doc, sourceKey);
+    const ext = (path.posix.extname(filename)
+        || MIME_EXTENSIONS[String(doc?.metadata?.contentType || '').toLowerCase()]
+        || '').toLowerCase();
+
+    const tokens = {
+        YYYY: String(date.getFullYear()),
+        YY: pad(date.getFullYear() % 100),
+        MM: pad(date.getMonth() + 1),
+        DD: pad(date.getDate()),
+        HH: pad(date.getHours()),
+        mm: pad(date.getMinutes()),
+        ss: pad(date.getSeconds()),
+        ext,
+        basename: ext && filename.toLowerCase().endsWith(ext) ? filename.slice(0, -ext.length) : filename,
+        filename,
+        id: doc?.id != null ? String(doc.id) : '',
+    };
+    tokens.title = sanitizeSegment(titleOf(doc), tokens.basename);
+
+    return String(template).replace(/\{\{\s*([A-Za-z]+)\s*\}\}/g, (match, token) => (
+        Object.prototype.hasOwnProperty.call(tokens, token) ? tokens[token] : match
+    ));
+}
+
+// Target paths for link/unlink. With `recursive: true` the remainder of the
+// document's placement below the rule's matched `when.path` prefix is
+// appended to every target, so a rule on `backends:/workspace/home/foo` with
+// target `dir:/bar` files `.../foo/a/b` into `dir:/bar/a/b` — one placement
+// per matched path. Without a matched prefix (no `path` condition, or the
+// document sits exactly at the prefix) the targets are used as written.
+function resolveTargetPaths(action, scope) {
+    const raw = asArray(action.paths || action.path || []).filter(Boolean).map((p) => interpolate(String(p), scope));
+    if (action.recursive !== true) { return raw; }
+    const rels = [...new Set((scope.match?.all || []).map((m) => m.rel).filter((rel) => typeof rel === 'string'))];
+    if (!rels.length) { return raw; }
+    const out = [];
+    for (const base of raw) {
+        const trimmed = String(base).replace(/\/+$/, '');
+        for (const rel of rels) { out.push(rel ? `${trimmed}/${rel}` : base); }
+    }
+    return [...new Set(out)];
+}
+
+const ACTIONS = {
+    // Link the document to tree paths, optionally with feature tags. Paths
+    // default to the context tree; 'dir:/path' targets the directory tree.
+    // emitEvent:false so the resulting membership change can't re-trigger rules.
+    async link(action, { workspace, doc, scope, logger, provenance }) {
+        if (!doc?.id) { return; }
+        for (const rawPath of resolveTargetPaths(action, scope)) {
+            const target = parseLinkTarget(rawPath);
+            const selector = target.tree !== 'context'
+                ? { directory: directorySelector(target) }
+                : { context: workspace.getContextTreeSelector(target.path) };
+            await workspace.link(doc.id, {
+                ...selector,
+                features: action.tags || [],
+                emitEvent: false,
+                provenance,
+            });
+            logger.debug(`rule link: ${doc.id} -> ${target.tree}:${target.path}`);
+        }
+    },
+
+    /**
+     * Move (or copy) the document's BYTES to a storage backend, optionally
+     * renaming them by template. The index entry, its id and every tree
+     * placement stay exactly as they are — only `locations[]` changes.
+     *
+     * The canonical use: uploads land in the managed blob store
+     * (`workspace:data`, content-hash keys, opaque by design); a rule watching
+     * a curated path files them onto a real filesystem under a real name.
+     *
+     *   { "action": "store", "to": "workspace:home", "from": "workspace:data",
+     *     "key": "Fotky/{{YYYY}}/{{MM}}/{{YYYY}}{{MM}}{{DD}}_{{HH}}{{mm}}{{ss}}{{ext}}" }
+     *
+     * The friendlier spelling splits WHERE from WHAT: `folder` is the
+     * directory on the target backend, `recursive: true` keeps the sub-folder
+     * structure below the matched `when.path` (exactly like link's), and `key`
+     * is just the file name template (default `{{basename}}{{ext}}` — the
+     * original name, with an extension derived from the mime type when the
+     * blob-store key has none):
+     *
+     *   { "action": "store", "to": "workspace:home", "folder": "Projects/Canvas/UI",
+     *     "recursive": true }
+     *
+     * filed under /projects/canvas/UI/mobile → home:Projects/Canvas/UI/mobile/<name>.
+     * The three parts are joined with `..`/leading-slash segments dropped.
+     *
+     * `from` (backend name or array) is the guard that makes this idempotent:
+     * once the bytes have moved, no source matches and re-runs are no-ops, so
+     * the rule can safely fire on both document.inserted and document.linked.
+     */
+    async store(action, { workspace, doc, scope, logger, placement = false, sourceOverride = null }) {
+        if (!doc?.id) return { status: 'skipped', error: 'No document' };
+        if (action.autoLink === true && !placement) {
+            if (!scope.match) return { status: 'skipped', error: 'No explicit virtual placement' };
+            if (!workspace.backendKeepsPaths(action.to)) throw new Error('Auto-Link requires a backend that preserves folder paths');
+            const initial = await workspace.get(doc.id);
+            const endpoints = await workspace.documentByteEndpoints(initial);
+            const original = endpoints.find(endpoint => endpoint.backend !== action.to) || endpoints[0];
+            if (!original) return { status: 'skipped', error: 'No transferable file content' };
+            for (const [index, match] of scope.match.all.entries()) {
+                // Re-read locations between placements and queued events.
+                const current = await workspace.get(doc.id);
+                // Copy every placement before releasing the original on the last.
+                const mode = index === scope.match.all.length - 1 ? action.mode : 'copy';
+                await ACTIONS.store({ ...action, mode }, { workspace, doc: current, scope: { ...scope, match }, logger, placement: true, sourceOverride: original });
+            }
+            return;
+        }
+        const to = String(action.to || '').trim();
+        if (!to) { logger.warn('rule store: "to" (target backend) is required'); return; }
+        const mode = action.mode === 'copy' || (action.autoLink === true && action.mode !== 'move') ? 'copy' : 'move';
+
+        const endpoints = await workspace.documentByteEndpoints(doc);
+        if (!endpoints.length) {
+            logger.debug(`rule store: ${doc.id} has no transferable byte location, skipping`);
+            return;
+        }
+
+        const sources = asArray(action.from || []).filter(Boolean).map(String);
+        const source = sourceOverride || (sources.length
+            ? endpoints.find((e) => sources.includes(e.backend))
+            : endpoints.find((e) => e.backend !== to) || (action.autoLink === true ? endpoints[0] : null));
+        if (!source) {
+            // Already where the rule wants it (or never on the source backend).
+            logger.debug(`rule store: ${doc.id} has nothing on ${sources.join(', ') || `a backend other than ${to}`}, skipping`);
+            return;
+        }
+
+        // Key tokens expand BEFORE the generic {{doc.*}} interpolation: both use
+        // {{…}}, and interpolate() resolves any unknown word to an empty string
+        // — running it first would silently eat {{YYYY}} and file everything
+        // under `Fotky///`.
+        const render = (template) => interpolate(expandKeyTemplate(String(template), { doc, sourceKey: source.key }), scope);
+        const folder = action.autoLink === true ? String(action.folder || '') : action.folder != null && String(action.folder).trim() !== '' ? render(action.folder) : '';
+        const recursive = action.recursive === true;
+        let key;
+        if (action.key || folder || recursive || action.autoLink === true) {
+            const name = action.autoLink === true
+                ? path.posix.basename(filenameOf(doc, source.key).replaceAll('\\', '/')) || String(doc.id)
+                : action.key ? render(action.key) : render('{{basename}}{{ext}}');
+            const rel = recursive ? String(scope.match?.rel || '') : '';
+            key = joinKey(folder, rel, name);
+            if (!key) {
+                logger.warn(`rule store: ${doc.id} destination key rendered empty (folder="${action.folder ?? ''}", key="${action.key ?? ''}"), skipping`);
+                return;
+            }
+        }
+
+        if (action.autoLink === true && endpoints.some(endpoint => endpoint.backend === to && endpoint.key === key)) return;
+
+        const res = await workspace.transferDocumentBytes(doc, {
+            to,
+            mode,
+            key,
+            onConflict: action.onConflict || 'rename',
+            from: source,
+        });
+        const landed = res?.to?.url || res?.added?.[0] || `stored://${to}/${key ?? source.key}`;
+        logger.debug(`rule store: ${doc.id} ${mode}d ${source.backend}:${source.key} -> ${landed}${res?.state === 'pending' ? ' (pending sync)' : ''}`);
+    },
+
+    /**
+     * Delete the document's bytes from specific backends — the dedupe action.
+     * Copies on every other backend, and the index entry itself, stay.
+     *
+     *   { "action": "unstore", "from": "workspace:data", "ifOn": "workspace:home" }
+     *
+     * Two guards, because a rule fires unattended on every matching event:
+     *   - `keepLast` (default true) refuses to remove the object's LAST
+     *     location. Deleting the only copy is `destroy`'s job, and it should
+     *     take saying so.
+     *   - `ifOn` requires the content to also live on those backends first —
+     *     "drop the staging copy once it is safely on the NAS", stated in the
+     *     order it actually has to happen.
+     */
+    /**
+     * Download what a link points at (image, video via yt-dlp, arXiv PDF, a
+     * page or a whole website via wget) into a backend folder and index the
+     * result as a file document next to the link. See download.js.
+     */
+    async download(action, args) {
+        return download(action, { ...args, helpers: { interpolate, expandKeyTemplate, parseLinkTarget, directorySelector } });
+    },
+
+    async unstore(action, { workspace, doc, logger }) {
+        if (!doc?.id) { logger.debug('rule unstore: event carries no document, skipping'); return; }
+        const from = asArray(action.from || action.backends || []).filter(Boolean).map(String);
+        if (!from.length) { logger.warn('rule unstore: "from" (backend to delete from) is required'); return; }
+
+        const endpoints = await workspace.documentByteEndpoints(doc);
+        const targeted = endpoints.filter((e) => from.includes(e.backend));
+        if (!targeted.length) {
+            logger.debug(`rule unstore: ${doc.id} has nothing on ${from.join(', ')}, skipping`);
+            return;
+        }
+
+        const required = asArray(action.ifOn || []).filter(Boolean).map(String);
+        if (required.length && !required.every((backend) => endpoints.some((e) => e.backend === backend && !from.includes(e.backend)))) {
+            logger.debug(`rule unstore: ${doc.id} is not on ${required.join(', ')} yet, keeping the copy on ${from.join(', ')}`);
+            return;
+        }
+
+        // Count survivors across ALL locations, not just the transferable ones:
+        // an imap:// or https:// location is still somewhere the bytes are.
+        const removedUrls = new Set(targeted.map((e) => e.url));
+        const survivors = (doc.locations || []).filter((l) => !removedUrls.has(l?.url));
+        if (action.keepLast !== false && survivors.length === 0) {
+            logger.warn(`rule unstore: refusing to delete the last location of ${doc.id} (set keepLast:false or use destroy)`);
+            return;
+        }
+
+        const results = await workspace.transferDocumentsToBackends([doc.id], {
+            to: from,
+            mode: 'delete',
+            keepDocument: action.keepDocument === true,
+        });
+        const failure = results.failed[0];
+        if (failure) { throw new Error(failure.reason); }
+        const outcome = results.successful[0] || {};
+        logger.debug(`rule unstore: ${doc.id} deleted from ${from.join(', ')} (${outcome.deleted?.length || 0} location(s), ${survivors.length} kept)`);
+    },
+
+    // Tag the document in place (on the paths it already landed in).
+    async tag(action, { workspace, doc, payload, logger, provenance }) {
+        if (!doc?.id) { return; }
+        const tags = asArray(action.tags || []).filter(Boolean);
+        if (!tags.length) { return; }
+        // Re-link on the context path(s) the document already landed in.
+        const paths = payload?.context?.paths ?? payload?.context?.path ?? '/';
+        await workspace.link(doc.id, { context: paths, features: tags, emitEvent: false, provenance });
+        logger.debug(`rule tag: ${doc.id} += ${tags.join(',')}`);
+    },
+
+    // Remove the document from tree path(s) — the inverse of `link`. The doc
+    // stays in the index and on its other paths.
+    async unlink(action, { workspace, doc, scope, logger, provenance }) {
+        if (!doc?.id) { return; }
+        for (const rawPath of resolveTargetPaths(action, scope)) {
+            const target = parseLinkTarget(rawPath);
+            const selector = target.tree !== 'context'
+                ? { directory: directorySelector(target) }
+                : { context: workspace.getContextTreeSelector(target.path) };
+            // The resulting document.removed / document.unlinked events carry
+            // origin:'rule' + depth, so cascade defaults keep them from
+            // re-triggering non-opted-in automation.
+            await workspace.unlink(doc.id, selector, { provenance });
+            logger.debug(`rule unlink: ${doc.id} -x- ${target.tree}:${target.path}`);
+        }
+    },
+
+    // Purge the document from the index (all paths, all bitmaps). Bytes on
+    // storage backends (blobs, files, mail on the server) are NOT touched.
+    async delete(action, { workspace, doc, logger, provenance }) {
+        if (!doc?.id) { return; }
+        await workspace.delete(doc.id, { provenance });
+        logger.debug(`rule delete: ${doc.id} purged from index`);
+    },
+
+    // Destroy the document everywhere: delete its bytes on every location the
+    // backend can delete (stored:// blob, workspace file rm, imap EXPUNGE —
+    // read-only locations degrade to a reference drop), then purge it from the
+    // index. Irreversible.
+    async destroy(action, { workspace, doc, logger, provenance }) {
+        if (!doc?.id) { return; }
+        const res = await workspace.destroyDocument(doc);
+        if (!res?.docDeleted) { await workspace.delete(doc.id, { provenance }).catch(() => {}); }
+        logger.debug(`rule destroy: ${doc.id} (${res?.deleted?.length || 0} locations deleted, ${res?.droppedRefs?.length || 0} refs dropped)`);
+    },
+
+    // Prompt an agent; optionally consume its reply via action.output
+    // (see handleActionOutput: note / file / notify).
+    // The inserted note/file emits document.inserted with origin:'rule', so it
+    // only reaches rules/hooks that opted in with cascade:true (and never past
+    // the maxDepth ceiling) — a rule matching its own output no longer loops.
+    async agent(action, { context, scope, workspace, logger }) {
+        if (!action.slug || !action.prompt) { return; }
+        // The membership-only document.updated form carries no document:
+        // prompting an agent about nothing is never what the rule meant.
+        if (!scope.doc) { return { status: 'skipped', error: 'event carries no document (membership-only update)' }; }
+        const prompt = interpolate(action.prompt, scope);
+        traceInfo(logger, `agent(${action.slug}) prompt: ${prompt}`);
+        const reply = await context.agent(action.slug, prompt, { ...(action.options || {}), throwOnError: true });
+        traceInfo(logger, `agent(${action.slug}) reply: ${reply ? String(reply) : '(empty)'}`);
+        if (!reply) { return { status: 'skipped', error: `agent "${action.slug}" returned an empty reply` }; }
+        await handleActionOutput(String(reply), action.output, { context, scope, workspace, logger, label: `agent(${action.slug})` });
+    },
+
+    async notify(action, { context, scope, logger }) {
+        if (!action.message) { return; }
+        const options = action.channel ? { channel: action.channel } : {};
+        const message = interpolate(action.message, scope);
+        const res = await context.notify(message, { ...options, throwOnError: true });
+        traceInfo(logger, `notify via ${res?.channel || action.channel || 'default channel'}: ${message}`);
+    },
+
+    // Script under the workspace git/ tree (same pattern as the youtube seed
+    // hook). Paths resolving outside git/ are rejected.
+    //
+    // Hardened execution contract:
+    //   env    — sanitized to PATH/HOME/LANG + CANVAS_EVENT, CANVAS_EVENT_ID,
+    //            CANVAS_WORKSPACE, CANVAS_WORK_DIR. Server secrets/config never
+    //            leak into workspace-synced scripts.
+    //   stdin  — the full JSON event envelope ({ event, eventId, payload,
+    //            workspace, rule }); argv (action.args) stays available for
+    //            scripts that predate the envelope.
+    //   cwd    — {WORKSPACE_ROOT}/var/tmp/<ruleId>/<eventId> (CANVAS_WORK_DIR),
+    //            created per run; removed after a clean captured run.
+    //   output — without `output` the script is fire-and-forget (detached);
+    //            with `output` stdout is captured (default 60s timeout,
+    //            `timeout` ms overrides up to 600s; 256 KiB cap) and fed
+    //            through the same pipeline as agent replies (note/file/notify).
+    async script(action, { context, workspace, scope, logger }) {
+        if (!action.path) { return; }
+        const gitRoot = path.resolve(workspace.rootPath, 'git');
+        const scriptPath = path.resolve(gitRoot, String(action.path));
+        if (scriptPath !== gitRoot && !scriptPath.startsWith(`${gitRoot}${path.sep}`)) {
+            logger.debug(`rule script: refusing path outside git/: ${action.path}`);
+            return;
+        }
+        if (!fs.existsSync(scriptPath)) {
+            logger.debug(`rule script: ${action.path} missing, skipping`);
+            return;
+        }
+        const args = asArray(action.args || []).map((a) => interpolate(String(a), scope));
+
+        const eventId = scope.payload?.eventId || crypto.randomUUID();
+        const handlerId = String(scope.rule?.id || 'rule').replace(/[^a-zA-Z0-9._-]+/g, '-');
+        const workDir = path.join(workspace.rootPath, WORKSPACE_DIRECTORIES.varTmp, handlerId, eventId);
+        try { fs.mkdirSync(workDir, { recursive: true }); }
+        catch (err) { logger.warn(`rule script: work dir creation failed: ${err.message}`); return; }
+
+        const env = {
+            PATH: process.env.PATH,
+            HOME: process.env.HOME,
+            ...(process.env.LANG ? { LANG: process.env.LANG } : {}),
+            CANVAS_EVENT: String(scope.event || ''),
+            CANVAS_EVENT_ID: eventId,
+            CANVAS_WORKSPACE: String(workspace.id || ''),
+            CANVAS_WORK_DIR: workDir,
+        };
+        const envelope = JSON.stringify({
+            event: scope.event,
+            eventId,
+            payload: scope.payload ?? null,
+            workspace: { id: workspace.id, name: workspace.name },
+            rule: scope.rule ?? null,
+        });
+        const writeStdin = (child) => {
+            // The try/catch only covers a SYNC throw — a script that exits
+            // without reading stdin surfaces EPIPE asynchronously on the stream,
+            // which without a listener becomes an uncaughtException.
+            child.stdin.on('error', (err) => logger.debug(`rule script: stdin write failed: ${err.message}`));
+            try { child.stdin.write(envelope); child.stdin.end(); }
+            catch (err) { logger.debug(`rule script: stdin write failed: ${err.message}`); }
+        };
+
+        if (!action.output || typeof action.output !== 'object') {
+            const child = spawn('bash', [scriptPath, ...args], {
+                stdio: ['pipe', 'ignore', 'ignore'], detached: true, cwd: workDir, env,
+            });
+            child.on('error', (err) => logger.debug(`rule script: spawn failed: ${err.message}`));
+            writeStdin(child);
+            child.unref();
+            logger.debug(`rule script: spawned ${action.path} (workdir ${workDir})`);
+            return;
+        }
+
+        const timeoutMs = Math.min(Math.max(1000, Number(action.timeout) || 60_000), 600_000);
+        const stdout = await new Promise((resolve) => {
+            // detached → own process group, so the timeout can kill the whole
+            // tree: killing only bash leaves its children holding the stdout
+            // pipe open and 'close' never fires until they exit.
+            const child = spawn('bash', [scriptPath, ...args], {
+                stdio: ['pipe', 'pipe', 'ignore'], cwd: workDir, env, detached: true,
+            });
+            const chunks = [];
+            let size = 0;
+            const timer = setTimeout(() => {
+                logger.warn(`rule script: ${action.path} timed out after ${timeoutMs}ms, killing`);
+                try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+            }, timeoutMs);
+            writeStdin(child);
+            child.stdout.on('data', (chunk) => {
+                if (size >= 256 * 1024) { return; }
+                size += chunk.length;
+                chunks.push(chunk);
+            });
+            child.on('error', (err) => {
+                clearTimeout(timer);
+                logger.debug(`rule script: spawn failed: ${err.message}`);
+                resolve(null);
+            });
+            child.on('close', (code) => {
+                clearTimeout(timer);
+                if (code !== 0) { logger.warn(`rule script: ${action.path} exited ${code}`); }
+                else { fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {}); }
+                resolve(Buffer.concat(chunks).toString('utf8').trim());
+            });
+        });
+        if (!stdout) { return; }
+        await handleActionOutput(stdout, action.output, { context, scope, workspace, logger, label: `script(${action.path})` });
+    },
+
+    // Re-emit a workspace event (context.emit stamps source:'hook').
+    async emit(action, { context, scope }) {
+        if (!action.event) { return; }
+        await context.emit(action.event, {
+            ...(action.payload && typeof action.payload === 'object' ? action.payload : {}),
+            documentId: scope.doc?.id ?? null,
+        });
+    },
+};
+
+// Where the document matched the rule's `path` condition: `{ prefix, tree,
+// path, rel, all }` for the first prefix with a placement under it (`all`
+// lists every placement, `rel` is the first one's remainder), or null when
+// the rule has no `path` condition. Exposed to templates as
+// {{match.rel}} / {{match.path}} / {{match.prefix}} and consumed by
+// `recursive: true` on link/unlink.
+function matchedPath(rule, context) {
+    const prefixes = asArray(rule?.when?.pathExact || rule?.when?.path || []).filter(Boolean);
+    if (!prefixes.length || typeof context?.classify !== 'function') { return null; }
+    let c;
+    try { c = context.classify(); } catch { return null; }
+    if (!c || typeof c.pathMatches !== 'function') { return null; }
+    const autoLink = rule.then?.some(action => action.autoLink === true);
+    if (autoLink && context.eventName === 'document.linked' && !context.payload?.backfill) {
+        // A backend event must not reactivate unrelated existing virtual links.
+        c = classifyDocument(context.payload?.document, { changed: context.payload?.changed, directory: { treeName: context.payload?.directory?.treeName || context.payload?.directory?.tree } });
+    }
+    const placements = new Map();
+    for (const prefix of autoLink ? [...prefixes].sort((a, b) => String(b).length - String(a).length) : prefixes) {
+        const all = c.pathMatches(prefix).filter((match) => rule?.when?.pathExact === undefined || match.rel === '');
+        if (autoLink) {
+            for (const match of all) {
+                const key = `${match.tree}:${match.path}`;
+                if (!placements.has(key)) placements.set(key, match);
+            }
+        } else if (all.length) {
+            return { prefix: String(prefix), tree: all[0].tree, path: all[0].path, rel: all[0].rel, all };
+        }
+    }
+    if (placements.size) {
+        const all = [...new Map([...placements.values()].map(match => [match.rel, match])).values()];
+        return { ...all[0], all };
+    }
+    return null;
+}
+
+/**
+ * Execute a matched rule's `then` actions sequentially. Action errors are
+ * logged (warn) and swallowed so one broken action never blocks the rest of
+ * the rule or other rules; the per-action outcome is returned for the run log.
+ *
+ * @param {Object} rule
+ * @param {Object} context - hook context (from HookService#buildHookContext)
+ * @param {Object} logger
+ * @returns {Promise<Array<{ action: string, status: 'ok'|'error'|'skipped', error?: string }>>}
+ */
+export async function executeRuleActions(rule, context, logger) {
+    const { workspace, payload, eventName } = context;
+    const doc = payload?.document || null;
+    const scope = {
+        doc,
+        payload,
+        event: eventName,
+        workspace: { id: workspace.id, name: workspace.name },
+        rule: { id: rule.id, description: rule.description },
+        match: matchedPath(rule, context),
+    };
+    // Writes this rule makes are automation caused by the triggering event.
+    // Actions routed through the hook context (agent output, script output,
+    // notify) inherit the same stamp from the context's own helpers.
+    const provenance = {
+        origin: 'rule',
+        causedBy: payload?.eventId ?? null,
+        depth: (Number.isInteger(payload?.depth) ? payload.depth : 0) + 1,
+    };
+
+    const results = [];
+    for (const action of rule.then) {
+        const handler = ACTIONS[action?.action];
+        if (!handler) {
+            logger.warn(`rule ${rule.id || '?'}: unknown action "${action?.action}"`);
+            results.push({ action: String(action?.action ?? '?'), status: 'skipped', error: 'unknown action' });
+            continue;
+        }
+        try {
+            // A handler may return { status: 'skipped', error } to say why it
+            // did nothing; anything else is a plain success.
+            const outcome = await handler(action, { workspace, doc, payload, context, scope, logger, provenance });
+            results.push(outcome && typeof outcome === 'object' && outcome.status === 'skipped'
+                ? { action: action.action, status: 'skipped', ...(outcome.error ? { error: String(outcome.error) } : {}) }
+                : { action: action.action, status: 'ok' });
+        } catch (err) {
+            logger.warn(`rule ${rule.id || '?'} action ${action.action} failed: ${err.message}`);
+            results.push({ action: action.action, status: 'error', error: err.message });
+        }
+    }
+    return results;
+}

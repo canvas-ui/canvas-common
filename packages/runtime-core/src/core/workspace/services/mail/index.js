@@ -1,0 +1,1145 @@
+import { readStoredConfig } from '../stored-config.js';
+import { containsSecrets, writePrivateJson } from '../../lib/WorkspaceCrypto.js';
+'use strict';
+
+import EventEmitter from 'eventemitter2';
+import path from 'path';
+import fs from 'fs/promises';
+import crypto from 'crypto';
+import { simpleParser } from 'mailparser';
+import ImapBackend from './ImapBackend.js';
+import { normalizeSmtp, emailAddresses } from '../messages/email.js';
+import Email from 'canvas-synapsd/src/schemas/core/Email.js';
+import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
+import { getBackendEmailContext, normalizeSegment } from '../../../../utils/backend-documents.js';
+import { timeSpan } from '../../../../utils/perf-monitor.js';
+
+/*
+ * WorkspaceMailIndex (ImapService)
+ *
+ * Per-workspace IMAP connector: manages mailbox accounts (config/stored.json),
+ * runs incremental sync + poll, and ingests messages as Email documents (raw
+ * .eml + attachment blobs persisted under data/email/, indexed into the
+ * backends tree's /imap/<account>/<folder> subtree).
+ *
+ * Fully self-owned: it instantiates and owns its ImapBackend instances directly
+ * (its own registry + event wiring + lifecycle) — it does NOT ride the stored
+ * blob store. Email raw .eml + attachment blobs are persisted into the local
+ * content-addressable data store via the injected persistBlob seam and addressed
+ * by `stored://workspace:data/<checksum>` (deduped; opaque on-disk layout — the
+ * synapsd tree is the navigation).
+ *
+ * Emits the uniform workspace-service event contract for the Workspace to
+ * forward (see services event convention):
+ *   object:add | object:change | object:unlink   { kind, docId?, payload }
+ *   source:state                                  { source, ... }
+ *   error                                         { error, ... }
+ *
+ * Threads (docs/connectors.md "Threads"): one document per message, the
+ * thread is a `replies-to` edge to the IMMEDIATE parent (In-Reply-To, else
+ * the nearest References ancestor that is indexed), asserted through the
+ * reply's own data.relations after the row lands. Email identity is the raw
+ * .eml hash, so a Message-ID lookup needs its own key: every Email carries
+ * two alias entries in checksumArray besides the primary —
+ *   mail-id/<sha256(Message-ID)>                          Message-ID -> doc
+ *   mail-parent/<sha256(In-Reply-To)>/<sha256(Message-ID)> parent -> replies
+ * The checksum index maps every entry to the id and range-scans by prefix,
+ * which is what makes both directions side-car free: a parent arriving AFTER
+ * its replies (Sent folder synced later, initial sync newest-first) finds
+ * them by the second key and draws the edges then. Only the primary entry is
+ * ever treated as a content hash by consumers.
+ */
+
+const IMAP_BACKEND_PREFIX = 'imap';
+const IMAP_DEFAULT_FOLDER = 'INBOX';
+const IMAP_DEFAULT_POLL_INTERVAL = 60000;
+const IMAP_DEFAULT_INITIAL_SYNC_DAYS = 180;
+// Parallel simpleParser + blob writes per fetch batch. Unbounded concurrency
+// starved the event loop during large initial syncs (server "unavailable").
+const IMAP_INGEST_CONCURRENCY = 4;
+// Attachment File docs are filed one level below their mailbox folder, so a
+// folder listing stays a list of MESSAGES. Collides only with a real IMAP
+// folder literally named 'attachments' (harmless: both are just tree nodes).
+const IMAP_ATTACHMENTS_SEGMENT = 'attachments';
+
+export class WorkspaceMailIndex extends EventEmitter {
+    #resolveCredentials;
+    #protectConfig;
+    #secretsLocked;
+    #configDir;
+    #workspaceId;
+    #logger;
+
+    // Injected dependencies
+    #put;
+    #putMany;
+    #link;
+    #linkMany;
+    #assertRelation;
+    #getBackendsTreeSelector;
+    #insertBackendPath;
+    #getDb;
+    #persistBlob;
+    // Optional backend-node enable-lock hooks (lock /imap/<account> in the
+    // backends tree while a mailbox on that account is enabled).
+    #lockBackendNode;
+    #unlockBackendNode;
+    // Threading: copy the parent's context placements onto a new reply.
+    #inheritThreadMemberships;
+
+    #started = false;
+    #backends = new Map(); // name -> ImapBackend
+    #backendStatus = new Map();
+
+    constructor({ resolveCredentials = (value) => value, protectConfig = (value) => value, secretsLocked = () => false, rootPath, configDir = path.join(rootPath, 'config'), workspaceId, logger, put, putMany = null, link = null, linkMany = null, assertRelation = null, getBackendsTreeSelector, insertBackendPath = null, getDb, persistBlob, lockBackendNode = null, unlockBackendNode = null, inheritThreadMemberships = null }) {
+        super({ wildcard: true, delimiter: '.', maxListeners: 100 });
+        if (!rootPath) throw new Error('rootPath is required');
+        if (!put || !getBackendsTreeSelector || !getDb || !persistBlob) {
+            throw new Error('put, getBackendsTreeSelector, getDb, persistBlob are required');
+        }
+        this.#configDir = configDir;
+        this.#resolveCredentials = resolveCredentials;
+        this.#protectConfig = protectConfig;
+        this.#secretsLocked = secretsLocked;
+        this.#workspaceId = workspaceId;
+        this.#logger = logger || console;
+        this.#put = put;
+        this.#putMany = putMany;
+        this.#link = link;
+        this.#linkMany = linkMany;
+        this.#assertRelation = assertRelation;
+        this.#getBackendsTreeSelector = getBackendsTreeSelector;
+        this.#insertBackendPath = insertBackendPath;
+        this.#getDb = getDb;
+        this.#persistBlob = persistBlob;
+        this.#lockBackendNode = lockBackendNode;
+        this.#unlockBackendNode = unlockBackendNode;
+        this.#inheritThreadMemberships = inheritThreadMemberships;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Thread identity keys (see class comment)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    static normalizeMessageId(value) {
+        const id = String(value || '').trim().replace(/^<|>$/g, '').trim();
+        return id || null;
+    }
+
+    static #sha(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
+
+    static messageIdKey(messageId) {
+        const id = WorkspaceMailIndex.normalizeMessageId(messageId);
+        return id ? `mail-id/${WorkspaceMailIndex.#sha(id)}` : null;
+    }
+
+    static parentKeyPrefix(parentMessageId) {
+        const id = WorkspaceMailIndex.normalizeMessageId(parentMessageId);
+        return id ? `mail-parent/${WorkspaceMailIndex.#sha(id)}/` : null;
+    }
+
+    static parentKey(parentMessageId, messageId) {
+        const prefix = WorkspaceMailIndex.parentKeyPrefix(parentMessageId);
+        const id = WorkspaceMailIndex.normalizeMessageId(messageId);
+        return prefix && id ? `${prefix}${WorkspaceMailIndex.#sha(id)}` : null;
+    }
+
+    static threadAliases(data = {}) {
+        const own = WorkspaceMailIndex.messageIdKey(data.messageId);
+        if (!own) return [];
+        const parent = WorkspaceMailIndex.parentKey(data.inReplyTo, data.messageId);
+        return parent && parent !== own ? [own, parent] : [own];
+    }
+
+    get isRunning() { return this.#started; }
+
+    async start() {
+        if (this.#started) return;
+        this.#started = true;
+        try {
+            await this.#registerStoredConfigBackends();
+            await this.#startStoredConfigSources();
+        } catch (error) {
+            this.#logger.warn({ workspaceId: this.#workspaceId, error: error.message }, 'IMAP service unavailable');
+            await this.stop();
+        }
+    }
+
+    async stop() {
+        for (const backend of this.#backends.values()) {
+            await backend.stop().catch(() => {});
+        }
+        this.#backends.clear();
+        this.#backendStatus.clear();
+        this.#started = false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Owned ImapBackend registry — instances + their event wiring live here, not
+    // in stored. Each backend emits object:add (kind:message) / backend:state /
+    // error directly to this service.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #registerBackend(name, config) {
+        let backend = this.#backends.get(name);
+        if (backend) return backend;
+        backend = new ImapBackend(name, this.#resolveCredentials(config));
+
+        // Awaited ingest — the backend advances its UID cursor only after this
+        // resolves, so a failed index never silently skips a message. Whole
+        // fetch batches land through ingestBatch (bounded parse concurrency +
+        // one putMany per feature group instead of one put per message).
+        backend.onFolder = async ({ account, folder, delimiter }) => {
+            if (!this.#insertBackendPath) return;
+            const treePath = getBackendEmailContext('imap', account, folder, delimiter === undefined ? '/' : delimiter);
+            await this.#insertBackendPath(treePath);
+            // SynapsD announces actual path creation. Rechecking a mailbox on
+            // every scan must not announce a structural change.
+        };
+        backend.onMessage = (payload) => this.#onObject(payload);
+        backend.onBatch = (payloads) => this.ingestBatch(payloads);
+        backend.on('backend:state', (payload) => this.#persistBackendState(payload));
+        backend.on('error', (error) => {
+            this.#setBackendError(name, error);
+            this.emit('error', { source: name, error: error?.message || String(error) });
+        });
+
+        this.#backends.set(name, backend);
+        this.#backendStatus.set(name, { lastScanAt: null, lastError: null });
+        this.#applyAccountNodeLock(name, config, true);
+        return backend;
+    }
+
+    #getBackend(name) { return this.#backends.get(name); }
+
+    async #removeBackend(name) {
+        const backend = this.#backends.get(name);
+        if (!backend) return;
+        await backend.stop().catch(() => {});
+        this.#backends.delete(name);
+        this.#applyAccountNodeLock(name, backend.config, false);
+    }
+
+    // Enable-lock on the shared account node /imap/<account> in the backends
+    // tree. Holder is the mailbox backend name (imap:<id>): lockedBy is an
+    // array, so two mailboxes on one account each hold their own entry and the
+    // node unlocks only when the last one releases. Fire-and-forget: lock state
+    // is a guard rail, never worth failing a sync over.
+    #applyAccountNodeLock(name, config = {}, locked) {
+        const hook = locked ? this.#lockBackendNode : this.#unlockBackendNode;
+        if (!hook) return;
+        const account = this.#safeAccount(config.account || config.user);
+        const nodePath = `/${IMAP_BACKEND_PREFIX}/${normalizeSegment(account)}`;
+        Promise.resolve(hook(nodePath, name)).catch((err) =>
+            this.#logger.warn({ workspaceId: this.#workspaceId, backend: name, error: err.message }, 'IMAP account node lock update failed'));
+    }
+
+    // Awaited by ImapBackend.#fetchBatch. Errors propagate so the backend leaves
+    // its UID cursor unadvanced and refetches the message on the next pass.
+    async #onObject(payload = {}) {
+        if (payload?.kind !== 'message') return;
+        await this.ingestMessage(payload);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Email indexing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    async #persistBackendState(payload = {}) {
+        if (!payload.backend) return;
+        await this.patchStoredBackend(payload.backend, {
+            lastUid: payload.lastUid,
+            lastSyncAt: new Date().toISOString(),
+        }).catch((error) => this.#logger.warn({ workspaceId: this.#workspaceId, backend: payload.backend, error: error.message }, 'Failed to persist backend state'));
+        this.emit('source:state', { source: payload.backend, lastUid: payload.lastUid });
+    }
+
+    // Parse one fetched message into an Email document + its feature/directory
+    // spec. Shared by the single and batch ingest paths.
+    async #prepareMessage(payload = {}) {
+        const { raw, uid, seqno, flags, folder, account } = payload;
+        if (!Buffer.isBuffer(raw)) return null;
+
+        const parsed = await simpleParser(raw);
+        const { emailDoc, attachmentDocs } = await this.#buildEmailDocument(parsed, raw, {
+            uid, seqno, flags,
+            provider: 'imap',
+            accountId: account,
+            folderName: folder,
+            folderPath: folder,
+        });
+
+        // SMTP providers may add Received/DKIM headers to our Sent copy. Keep
+        // the local document ID when the indexed outgoing message and content
+        // match; Message-ID alone is not enough to trust an incoming message.
+        const messageKey = WorkspaceMailIndex.messageIdKey(emailDoc.data.messageId);
+        const existing = messageKey && this.#getDb
+            ? await this.#getDb().getByChecksumString(messageKey).catch(() => null) : null;
+        if (existing?.metadata?.outgoing && existing.metadata.mailAccount === account
+            && existing.data?.subject === emailDoc.data.subject
+            && existing.data?.body === emailDoc.data.body
+            && existing.data?.bodyHtml === emailDoc.data.bodyHtml
+            && JSON.stringify(existing.data?.from) === JSON.stringify(emailDoc.data.from)
+            && JSON.stringify(existing.data?.to) === JSON.stringify(emailDoc.data.to)) {
+            emailDoc.id = existing.id;
+            emailDoc.metadata = { ...existing.metadata, ...emailDoc.metadata };
+            emailDoc.locations = [...new Map([...(existing.locations || []), ...emailDoc.locations].map((l) => [l.url, l])).values()];
+            emailDoc.checksumArray = [...new Set([...emailDoc.checksumArray, ...(existing.checksumArray || [])])];
+        }
+
+        const features = Email.getFeatureBitmapArray(emailDoc, { mailboxPath: folder });
+        // Canonical source-backend tag (observability/selection, not a purge driver).
+        // data/backend/imap/<account> is DERIVED by synapsd from the message's
+        // imap:// location (scheme + authority), not asserted here.
+        return { payload, emailDoc, attachmentDocs, features };
+    }
+
+    // Ingested email is filed ONLY under the backends tree's
+    // /imap/<account>/<folder> — context:null keeps it out of the context root
+    // (no "all emails dumped into /"; the tree's linkContextRoot:false setting
+    // enforces the same for directory-only inserts).
+    #directoryFor(account, folder) {
+        const backend = [...this.#backends.values()].find((entry) =>
+            (entry.config.account || entry.config.user) === account && entry.config.folder === folder);
+        const delimiter = backend?.config.folderDelimiter;
+        const backendContext = getBackendEmailContext('imap', account, folder || 'inbox', delimiter === undefined ? '/' : delimiter);
+        return this.#getBackendsTreeSelector(backendContext);
+    }
+
+    // /imap/<account>/<folder>/attachments — where the File docs for a mailbox
+    // folder's attachments are filed.
+    #attachmentsDirectoryFor(account, folder) {
+        const backend = [...this.#backends.values()].find((entry) =>
+            (entry.config.account || entry.config.user) === account && entry.config.folder === folder);
+        const delimiter = backend?.config.folderDelimiter;
+        const backendContext = getBackendEmailContext('imap', account, folder || 'inbox', delimiter === undefined ? '/' : delimiter);
+        return this.#getBackendsTreeSelector(`${backendContext}/${IMAP_ATTACHMENTS_SEGMENT}`);
+    }
+
+
+    // Ingest one fetched message into an Email document. Entry point for any
+    // connector that pushes single raw messages; the owned ImapBackends land
+    // whole fetch batches through ingestBatch instead.
+    async ingestMessage(payload = {}) {
+        const item = await this.#prepareMessage(payload);
+        if (!item) return null;
+        const { folder, account, uid } = item.payload;
+        const docId = await this.#put(item.emailDoc, {
+            context: null,
+            directory: this.#directoryFor(account, folder),
+            features: item.features,
+            emitEvent: true,
+        });
+        item.emailDoc.id = docId;
+        this.emit('object:add', { kind: 'message', docId, source: account, payload: { folder, account, uid } });
+        await this.#ingestAttachments(docId, item.attachmentDocs, { account, folder });
+        await this.#linkThread(docId, item.emailDoc.data);
+        return docId;
+    }
+
+    // Batch ingest for one IMAP fetch batch: parse with bounded concurrency,
+    // then group by folder + feature signature and write each group with a
+    // single putMany (one LMDB tx, one bitmap flush, one Lance batch add,
+    // batch events) instead of one put per message. Falls back to sequential
+    // single puts when no putMany seam is injected.
+    async ingestBatch(payloads = []) {
+        return timeSpan('mail.ingestBatch', () => this.#ingestBatch(payloads));
+    }
+
+    async #ingestBatch(payloads) {
+        const messages = (payloads || []).filter((p) => p?.kind === 'message' && Buffer.isBuffer(p.raw));
+        if (!messages.length) return [];
+        if (!this.#putMany) {
+            const ids = [];
+            for (const payload of messages) ids.push(await this.ingestMessage(payload));
+            return ids;
+        }
+
+        const prepared = (await timeSpan('mail.parse(batch)', () => this.#mapWithConcurrency(messages, IMAP_INGEST_CONCURRENCY, (p) => this.#prepareMessage(p))))
+            .filter(Boolean);
+
+        // Feature arrays differ only by per-message flags (attachment/flagged),
+        // so a fetch batch collapses into a handful of putMany groups.
+        const groups = new Map();
+        for (const item of prepared) {
+            const { folder, account } = item.payload;
+            const key = `${account}\n${folder || ''}\n${[...item.features].sort().join(',')}`;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(item);
+        }
+
+        const docIds = [];
+        for (const items of groups.values()) {
+            const { folder, account } = items[0].payload;
+            // Attachments first, so each email carries its `includes` edges in
+            // data.relations and synapsd draws them inside the emails' own
+            // putMany transaction (no assertRelation write per attachment).
+            if (this.#assertRelation) {
+                const attachmentIds = await timeSpan('mail.attachments(batch)', () => this.#ingestAttachmentBatch(items, { account, folder }));
+                for (const item of items) {
+                    const targets = [...new Set((item.attachmentDocs || [])
+                        .map((doc) => attachmentIds.get(doc.checksumArray?.[0]))
+                        .filter((id) => id != null))];
+                    if (targets.length) {
+                        item.emailDoc.data.relations = [
+                            ...(item.emailDoc.data.relations || []).filter((r) => r?.p !== 'includes'),
+                            ...targets.map((to) => ({ p: 'includes', to })),
+                        ];
+                    }
+                }
+            }
+            let ids;
+            try {
+                ids = await timeSpan('mail.putMany', () => this.#putMany(items.map((i) => i.emailDoc), {
+                    context: null,
+                    directory: this.#directoryFor(account, folder),
+                    features: items[0].features,
+                }));
+            } catch (error) {
+                // One malformed message (a header the schema rejects) must not
+                // sink the whole fetch batch: fall back to single puts, keep
+                // what validates, report the rest per message.
+                this.#logger?.warn?.({ workspaceId: this.#workspaceId, account, folder, count: items.length, error: error.message }, 'IMAP batch put failed, retrying messages one by one');
+                ids = [];
+                for (const item of items) {
+                    try {
+                        ids.push(await this.ingestMessage(item.payload));
+                    } catch (single) {
+                        this.#logger?.warn?.({ workspaceId: this.#workspaceId, account, folder, uid: item.payload.uid, error: single.message }, 'IMAP message skipped');
+                        ids.push(undefined);
+                    }
+                }
+                docIds.push(...ids.filter((id) => id != null));
+                continue;
+            }
+            docIds.push(...ids);
+            // ids align with input unless putMany's in-batch checksum dedup
+            // collapsed identical raw messages — then skip per-uid attribution.
+            const aligned = ids.length === items.length;
+            for (const [idx, item] of items.entries()) {
+                const docId = aligned ? ids[idx] : undefined;
+                if (docId != null) item.emailDoc.id = docId;
+                this.emit('object:add', {
+                    kind: 'message', docId, source: account,
+                    payload: { folder, account, uid: item.payload.uid },
+                });
+                // After the whole group landed: a parent in the same batch is
+                // already resolvable by its alias key. A batch whose in-batch
+                // dedup collapsed identical raw messages has no per-uid id to
+                // hang the thread edge on; the next non-collapsed ingest does.
+                if (docId != null) {
+                    await timeSpan('mail.linkThread(msg)', () => this.#linkThread(docId, item.emailDoc.data));
+                }
+            }
+        }
+        return docIds;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Threads — `replies-to` edges + reply-follows-parent placement
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Draw this message's thread edges once its row exists. Both directions:
+     *
+     *   1. UP: In-Reply-To, else the nearest indexed References ancestor (a
+     *      thread partner's message that never reached this mailbox leaves a
+     *      gap; the fallback keeps the reply attached to the thread). The
+     *      reply then inherits the parent's context placements — the parent
+     *      already inherited its own parent's, so chains need no walk here.
+     *   2. DOWN: replies that landed BEFORE this message (range scan on the
+     *      mail-parent/ prefix) get their edge now. No placement copy in this
+     *      direction — a parent never inherits from its replies.
+     *
+     * assertRelation is idempotent, so a re-fetch is a no-op. Never fails the
+     * ingest: an edge is worth less than the message.
+     */
+    async #linkThread(docId, data = {}) {
+        if (!docId || !this.#assertRelation) return;
+        const db = this.#getDb?.();
+        const index = db?.checksumIndex;
+        if (!index?.checksumStringToId) return;
+        const messageId = WorkspaceMailIndex.normalizeMessageId(data.messageId);
+        if (!messageId) return;
+
+        try {
+            const candidates = [data.inReplyTo, ...[...(Array.isArray(data.references) ? data.references : [])].reverse()]
+                .map(WorkspaceMailIndex.normalizeMessageId)
+                .filter((id, i, all) => id && id !== messageId && all.indexOf(id) === i);
+            for (const candidate of candidates) {
+                const parentId = await index.checksumStringToId(WorkspaceMailIndex.messageIdKey(candidate));
+                if (!parentId || Number(parentId) === Number(docId)) continue;
+                await this.#assertRelation(docId, 'replies-to', parentId);
+                if (this.#inheritThreadMemberships) await this.#inheritThreadMemberships(docId, parentId);
+                break;
+            }
+
+            const prefix = WorkspaceMailIndex.parentKeyPrefix(messageId);
+            const waiting = typeof index.list === 'function' ? await index.list(prefix) : [];
+            for (const key of waiting) {
+                const childId = await index.checksumStringToId(key);
+                if (!childId || Number(childId) === Number(docId)) continue;
+                await this.#assertRelation(childId, 'replies-to', docId);
+            }
+        } catch (error) {
+            this.#logger.warn({ workspaceId: this.#workspaceId, docId, error: error.message }, 'Email thread linking failed');
+        }
+    }
+
+    // Order-preserving concurrent map with a fixed worker pool.
+    async #mapWithConcurrency(items, limit, fn) {
+        const results = new Array(items.length);
+        let next = 0;
+        const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+            while (next < items.length) {
+                const idx = next++;
+                results[idx] = await fn(items[idx], idx);
+            }
+        });
+        await Promise.all(workers);
+        return results;
+    }
+
+    #createChecksum(buffer) {
+        return crypto.createHash('sha256').update(buffer).digest('hex');
+    }
+
+    #safeFileName(name, fallback = 'attachment.bin') {
+        const value = String(name || fallback).trim()
+            .replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+        return value || fallback;
+    }
+
+    #safeAccount(value) {
+        return String(value || 'unknown').replace(/[/\\]+/g, '_').trim() || 'unknown';
+    }
+
+    #encodeFolder(value) {
+        return String(value || 'INBOX').split('/').map(encodeURIComponent).join('/') || 'INBOX';
+    }
+
+    async #buildEmailDocument(parsed, rawBuffer, imapMetadata = {}) {
+        const account = this.#safeAccount(imapMetadata.accountId);
+        const folder = this.#encodeFolder(imapMetadata.folderPath || imapMetadata.folderName);
+
+        // Persist the raw .eml into the content-addressable data store (deduped).
+        const raw = await this.#persistBlob(rawBuffer);
+        const rawChecksum = raw.checksum || this.#createChecksum(rawBuffer);
+
+        const attachments = [];
+        const attachmentDocs = [];
+        for (const attachment of parsed.attachments || []) {
+            const content = Buffer.isBuffer(attachment.content) ? attachment.content : Buffer.from(attachment.content || '');
+            const blob = await this.#persistBlob(content);
+            const checksum = blob.checksum || this.#createChecksum(content);
+            const filename = attachment.filename || this.#safeFileName(attachment.filename, `${checksum}.bin`);
+            const size = Number.isFinite(attachment.size) ? attachment.size : content.length;
+            // The per-message view of the attachment stays on the Email: name,
+            // contentId and INLINE-ness are facts about this message's use of
+            // the blob, not about the blob (the same signature logo is an inline
+            // part in one mail and a plain attachment in another), so they have
+            // no home on the shared File document or on its edge.
+            const isInline = attachment.contentDisposition === 'inline'
+                || (attachment.contentDisposition !== 'attachment' && attachment.related === true);
+            attachments.push({
+                filename,
+                contentType: attachment.contentType,
+                size,
+                contentId: attachment.contentId,
+                isInline,
+                checksum: `sha256/${checksum}`,
+                url: blob.url,
+            });
+            // Keep inline resources available for rendering the email without
+            // promoting signature logos/tracking pixels into standalone files.
+            // An explicit attachment remains a file even when it has a CID.
+            if (!isInline) {
+                attachmentDocs.push(this.#buildAttachmentDocument({
+                    filename, contentType: attachment.contentType, size, checksum, url: blob.url,
+                }));
+            }
+        }
+
+        const emailDoc = Email.fromIMAP(parsed, imapMetadata);
+        emailDoc.data.attachments = attachments.length ? attachments : emailDoc.data.attachments;
+        emailDoc.data.folder = {
+            ...(emailDoc.data.folder || {}),
+            path: imapMetadata.folderPath || emailDoc.data.folder?.path,
+            name: imapMetadata.folderName || emailDoc.data.folder?.name,
+        };
+
+        const uid = Number(imapMetadata.uid) || null;
+        const provenanceUrl = `imap://${account}/${folder}${uid ? `;UID=${uid}` : ''}`;
+        emailDoc.locations = [
+            { url: raw.url, metadata: { size: rawBuffer.length, synced: true } },
+            { url: provenanceUrl, metadata: { provenance: true } },
+        ];
+        // Primary = raw bytes (content identity); the rest are thread alias
+        // keys (class comment). Consumers only ever read [0] as a hash.
+        emailDoc.checksumArray = [`sha256/${rawChecksum}`, ...WorkspaceMailIndex.threadAliases(emailDoc.data)];
+        emailDoc.metadata = {
+            ...(emailDoc.metadata || {}),
+            source: 'imap',
+            workspaceId: this.#workspaceId,
+        };
+        return { emailDoc, attachmentDocs };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Attachments as File documents + `includes` edges
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // One attachment blob as a File document.
+    //
+    // NO imap:// location, deliberately: an attachment's provenance is the
+    // `includes` edge from its Email, and an imap:// location here would route
+    // a destroy of the ATTACHMENT into destroyImapLocation(), EXPUNGEing the
+    // whole message server-side. The stored:// blob is the only thing this
+    // document owns.
+    //
+    // The name goes in the LOCATION metadata, not metadata.filename: a blob is
+    // named differently at every copy (see File.js), and metadata.filename is
+    // reserved for an explicit rename, which must outrank whatever the last
+    // message that carried these bytes called them.
+    #buildAttachmentDocument({ filename, contentType, size, checksum, url }) {
+        return {
+            schema: 'data/schema/file',
+            checksumArray: [`sha256/${checksum}`],
+            data: {},
+            locations: [{ url, metadata: { filename, size, synced: true } }],
+            metadata: {
+                contentType: contentType || 'application/octet-stream',
+                size,
+                source: 'imap',
+                workspaceId: this.#workspaceId,
+            },
+        };
+    }
+
+    // File an email's attachments and draw `email --includes--> file` for each.
+    //
+    // Runs AFTER the Email lands: both ids must exist before the edge can be
+    // drawn, and asserting (rather than writing data.relations at build time)
+    // keeps a re-sync of the same message from clobbering relations a user or
+    // an extractor added to that email. assertRelation is idempotent, so a
+    // refetch is a no-op.
+    //
+    // Sequential by design: two messages in one batch carrying the same blob
+    // would otherwise both miss the checksum lookup and allocate two documents
+    // for one attachment.
+    // Batch counterpart of #ingestAttachments for one putMany group of
+    // messages: every attachment File doc of the group lands in one putMany
+    // (bytes not indexed yet) plus one linkMany (bytes already a document),
+    // instead of a put/link + an assertRelation transaction per attachment.
+    // Runs BEFORE the emails are written; returns Map primary checksum → doc
+    // id for their `includes` relations. Never fails the ingest: what did not
+    // land simply gets no edge (an edge is worth less than the message).
+    async #ingestAttachmentBatch(items, { account, folder }) {
+        const ids = new Map();
+        const byChecksum = new Map();
+        for (const item of items) {
+            for (const doc of item.attachmentDocs || []) {
+                const checksum = doc.checksumArray?.[0];
+                // Same bytes twice in a batch → one document, as putMany's own
+                // in-batch dedup would do; deduping here keeps ids aligned.
+                if (checksum && !byChecksum.has(checksum)) byChecksum.set(checksum, doc);
+            }
+        }
+        if (!byChecksum.size) return ids;
+
+        const directory = this.#attachmentsDirectoryFor(account, folder);
+        const db = this.#getDb();
+        const fresh = [];
+        const known = [];
+        const locationUpdates = [];
+        for (const [checksum, doc] of byChecksum) {
+            const existing = await db.getByChecksumString(checksum).catch(() => null);
+            if (!existing?.id) { fresh.push([checksum, doc]); continue; }
+            // Already a document (another message, or a copy the file indexer
+            // found on disk): LINK it into this mailbox and add our location —
+            // a re-put would replace the locations it already has with ours.
+            ids.set(checksum, existing.id);
+            known.push(existing.id);
+            const locations = Array.isArray(existing.locations) ? existing.locations : [];
+            if (!locations.some((location) => location?.url === doc.locations[0].url)) {
+                locationUpdates.push({ id: existing.id, locations: [...locations, doc.locations[0]] });
+            }
+        }
+
+        try {
+            if (known.length) {
+                if (this.#linkMany) await this.#linkMany(known, { context: null, directory, emitEvent: false });
+                else if (this.#link) for (const id of known) await this.#link(id, { context: null, directory, emitEvent: false });
+            }
+            if (locationUpdates.length) await this.#putMany(locationUpdates, { context: null });
+            if (fresh.length) {
+                const stored = await this.#putMany(fresh.map(([, doc]) => doc), { context: null, directory });
+                if (stored.length !== fresh.length) throw new Error(`putMany returned ${stored.length} ids for ${fresh.length} attachments`);
+                fresh.forEach(([checksum], i) => {
+                    ids.set(checksum, stored[i]);
+                    this.emit('object:add', { kind: 'file', docId: stored[i], source: account, payload: { folder, account } });
+                });
+            }
+        } catch (error) {
+            this.#logger.warn({ workspaceId: this.#workspaceId, account, folder, count: byChecksum.size, error: error.message }, 'Failed to index email attachments');
+        }
+        return ids;
+    }
+
+    async #ingestAttachments(emailDocId, attachmentDocs = [], { account, folder } = {}) {
+        if (!emailDocId || !attachmentDocs?.length || !this.#assertRelation) { return []; }
+
+        const directory = this.#attachmentsDirectoryFor(account, folder);
+        const db = this.#getDb();
+        const docIds = [];
+
+        for (const doc of attachmentDocs) {
+            try {
+                const url = doc.locations[0].url;
+                const existing = await db.getByChecksumString(doc.checksumArray[0]).catch(() => null);
+                let docId;
+
+                if (existing?.id) {
+                    // These bytes are already a document (another message, or a
+                    // copy the file indexer picked up on disk). LINK it into this
+                    // mailbox instead of re-putting: a put would replace the
+                    // locations it already has with just ours.
+                    docId = existing.id;
+                    if (this.#link) { await this.#link(docId, { context: null, directory, emitEvent: false }); }
+                    const locations = Array.isArray(existing.locations) ? existing.locations : [];
+                    if (!locations.some((location) => location?.url === url)) {
+                        await this.#put({ id: docId, locations: [...locations, doc.locations[0]] }, { context: null });
+                    }
+                } else {
+                    docId = await this.#put(doc, { context: null, directory, emitEvent: true });
+                    this.emit('object:add', { kind: 'file', docId, source: account, payload: { folder, account } });
+                }
+
+                await this.#assertRelation(emailDocId, 'includes', docId);
+                docIds.push(docId);
+            } catch (error) {
+                this.#logger.warn(
+                    { workspaceId: this.#workspaceId, emailDocId, error: error.message },
+                    'Failed to index email attachment',
+                );
+            }
+        }
+
+        return docIds;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // imap:// location ops — backs the Workspace Destroy/describe path for imap
+    // provenance locations (the blob indexer delegates these here).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Resolve creds for an account from stored.json and return an ImapBackend
+    // able to EXPUNGE (registered mailbox if one matches, else a transient one).
+    async #ensureImapBackend(account) {
+        if (!account) return null;
+        for (const backend of this.#backends.values()) {
+            if ((backend.config.account || backend.config.user) === account) return backend;
+        }
+        const cfg = await this.#findImapConfig(account);
+        if (!cfg) return null;
+        return new ImapBackend(`${IMAP_BACKEND_PREFIX}:${account}`, this.#resolveCredentials({ account, ...cfg }));
+    }
+
+    async #findImapConfig(account) {
+        const { backends } = await this.readStoredConfig();
+        const entry = Object.values(backends).find(
+            (b) => b?.driver === 'imap' && (b.account === account || b.user === account),
+        );
+        if (!entry) return null;
+        return {
+            user: entry.user,
+            password: entry.password,
+            host: entry.host,
+            port: entry.port || 993,
+            tls: entry.tls !== false,
+            allowSelfSigned: entry.allowSelfSigned === true,
+            folder: entry.folder,
+            readOnly: entry.readOnly === true,
+        };
+    }
+
+    async describeImapLocation(url) {
+        const p = parseLocationUrl(url);
+        const backend = await this.#ensureImapBackend(p?.backend);
+        // Config-level readOnly declares the mailbox hands-off: describe it as
+        // non-deletable even with working credentials (destroy reference-drops).
+        const deletable = !!backend && backend.canDelete && backend.config?.readOnly !== true;
+        return { url, scheme: 'imap', backend: p?.backend, kind: 'imap', deletable };
+    }
+
+    // EXPUNGE the message behind an imap:// url. Returns { ok } — ok:false means
+    // no credentials wired or readOnly mailbox (caller reference-drops only).
+    async destroyImapLocation(url) {
+        const p = parseLocationUrl(url);
+        const backend = await this.#ensureImapBackend(p?.backend);
+        if (!backend || !backend.canDelete || backend.config?.readOnly === true) return { ok: false };
+        await backend.delete(p.key); // STORE \Deleted + EXPUNGE by UID
+        return { ok: true };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // config/stored.json — user-configurable imap accounts.
+    // Shape: { backends: { "<name>": { driver: 'imap', ... } } }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #storedConfigPath() {
+        return path.join(this.#configDir, 'stored.json');
+    }
+
+    async readStoredConfig() {
+        const parsed = await readStoredConfig(this.#configDir);
+        return { ...parsed, backends: parsed.backends || {} };
+    }
+
+    async writeStoredConfig(config) {
+        const target = this.#storedConfigPath();
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        writePrivateJson(target, this.#protectConfig({ ...config, backends: config.backends || {} }));
+    }
+
+    async patchStoredBackend(name, patch = {}) {
+        const config = await this.readStoredConfig();
+        config.backends[name] = { ...(config.backends[name] || {}), ...patch };
+        await this.writeStoredConfig(config);
+        return config.backends[name];
+    }
+
+    // Register every enabled imap backend from stored.json. Does not start
+    // sources — that happens in #startStoredConfigSources.
+    async #registerStoredConfigBackends() {
+        const config = await this.readStoredConfig();
+        for (const [name, backendConfig] of Object.entries(config.backends || {})) {
+            if (backendConfig?.enabled === false || (this.#secretsLocked() && containsSecrets(backendConfig))) continue;
+            if (backendConfig?.driver !== 'imap') continue;
+            if (this.#backends.has(name)) continue;
+            try {
+                this.#registerBackend(name, backendConfig);
+            } catch (error) {
+                this.#logger.warn({ workspaceId: this.#workspaceId, backend: name, error: error.message }, 'Failed to register imap backend');
+            }
+        }
+    }
+
+
+    // Kick the initial incremental sync + poll loop for each imap account.
+    // Syncs run in the background — service start (and the HTTP requests that
+    // trigger it) must never block on a potentially hours-long initial sync.
+    async #startStoredConfigSources() {
+        for (const [name, backend] of this.#backends) {
+            this.#kickBackendSync(name, backend);
+        }
+    }
+
+    // Run a backend sync in the background: mark it syncing (surfaces as
+    // runtime.status 'syncing'), record errors, and always start the poll
+    // loop afterwards (its exponential backoff owns the retry cadence).
+    #kickBackendSync(name, backend) {
+        const status = this.#backendStatus.get(name) || {};
+        if (status.syncing) return;
+        this.#backendStatus.set(name, { ...status, syncing: true });
+        (async () => {
+            try {
+                await this.#syncImapBackend(name, backend);
+            } catch (error) {
+                this.#setBackendError(name, error);
+                this.#logger.warn({ workspaceId: this.#workspaceId, backend: name, error: error.message }, 'IMAP sync failed');
+            } finally {
+                this.#backendStatus.set(name, { ...(this.#backendStatus.get(name) || {}), syncing: false });
+                // The backend may have been removed (config change) mid-sync.
+                if (this.#backends.get(name) === backend) backend.watch?.();
+            }
+        })();
+    }
+
+    async #syncImapBackend(name, backend) {
+        const result = await backend.scan();
+        await this.patchStoredBackend(name, {
+            lastUid: result.lastUid,
+            lastSyncAt: new Date().toISOString(),
+            lastError: null,
+        });
+        this.#backendStatus.set(name, { ...(this.#backendStatus.get(name) || {}), lastScanAt: new Date().toISOString(), lastError: null });
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Mailbox management — a "mailbox" is an imap backend entry in stored.json
+    // (name `imap:<id>`). Protocol is delegated to ImapBackend.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #mailboxName(id) { return `${IMAP_BACKEND_PREFIX}:${id}`; }
+    #mailboxIdFromName(name) {
+        return name.startsWith(`${IMAP_BACKEND_PREFIX}:`) ? name.slice(IMAP_BACKEND_PREFIX.length + 1) : name;
+    }
+
+    #generateMailboxId(input = {}) {
+        const base = [input.user, input.host, input.folder || IMAP_DEFAULT_FOLDER]
+            .filter(Boolean).join('-').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        return base || `mailbox-${Date.now()}`;
+    }
+
+    #normalizeMailbox(input = {}, fallbackId = 'mailbox') {
+        const id = String(input.id || fallbackId).trim();
+        if (!id) throw new Error('Mailbox id is required');
+        const host = String(input.host || '').trim();
+        const user = String(input.user || '').trim();
+        const password = String(input.password || '');
+        if (!host) throw new Error(`Mailbox "${id}" is missing host`);
+        if (!user) throw new Error(`Mailbox "${id}" is missing user`);
+        if (!password) throw new Error(`Mailbox "${id}" is missing password`);
+        const port = Number(input.port || 993);
+        if (!Number.isInteger(port) || port <= 0) throw new Error(`Mailbox "${id}" has invalid port`);
+        const pollInterval = Number(input.pollInterval || IMAP_DEFAULT_POLL_INTERVAL);
+        if (!Number.isInteger(pollInterval) || pollInterval <= 0) throw new Error(`Mailbox "${id}" has invalid poll interval`);
+        const initialSyncDays = Number(input.initialSyncDays ?? IMAP_DEFAULT_INITIAL_SYNC_DAYS);
+        if (!Number.isInteger(initialSyncDays) || initialSyncDays < 0) throw new Error(`Mailbox "${id}" has invalid initial sync window`);
+        return {
+            driver: 'imap',
+            enabled: input.enabled !== false,
+            host, port,
+            tls: input.tls !== false,
+            allowSelfSigned: input.allowSelfSigned !== false,
+            user, password,
+            account: user,
+            folder: String(input.folder || IMAP_DEFAULT_FOLDER).trim() || IMAP_DEFAULT_FOLDER,
+            mode: 'poll',
+            // readOnly: never delete on the server (Destroy degrades to a
+            // reference drop) even though the imap driver supports EXPUNGE.
+            readOnly: input.readOnly === true,
+            smtp: normalizeSmtp(input.smtp),
+            pollInterval, initialSyncDays,
+            lastUid: Math.max(0, Number(input.lastUid || 0)),
+            lastSyncAt: input.lastSyncAt || null,
+            lastError: input.lastError || null,
+        };
+    }
+
+    #serializeMailbox(id, config) {
+        const name = this.#mailboxName(id);
+        const backend = this.#getBackend(name);
+        const syncing = this.#backendStatus.get(name)?.syncing === true;
+        return {
+            id,
+            enabled: config.enabled !== false,
+            host: config.host, port: config.port, tls: config.tls, allowSelfSigned: config.allowSelfSigned,
+            user: config.user, folder: config.folder, mode: config.mode || 'poll',
+            readOnly: config.readOnly === true,
+            pollInterval: config.pollInterval, initialSyncDays: config.initialSyncDays,
+            lastUid: config.lastUid || 0, lastSyncAt: config.lastSyncAt || null, lastError: this.#secretsLocked() && containsSecrets(config) ? 'Credentials locked — start with PIN/password' : config.lastError || null,
+            passwordConfigured: Boolean(config.password),
+            smtp: { ...config.smtp, password: undefined, passwordConfigured: Boolean(config.smtp?.password) },
+            runtime: {
+                active: !!backend,
+                watching: backend?.watching === true,
+                syncing,
+                status: syncing ? 'syncing' : (backend ? (backend.watching ? 'running' : 'idle') : 'stopped'),
+            },
+        };
+    }
+
+    async #imapEntries() {
+        const config = await this.readStoredConfig();
+        return Object.entries(config.backends || {})
+            .filter(([, c]) => c?.driver === 'imap')
+            .map(([name, c]) => ({ id: this.#mailboxIdFromName(name), name, config: c }));
+    }
+
+    // Every address this workspace's mail accounts send or receive as — login,
+    // account label and SMTP From. Contact extraction skips them.
+    async ownAddresses() {
+        const entries = await this.#imapEntries();
+        return [...new Set(entries.flatMap(({ config }) => [config.account, config.user, ...emailAddresses(config.smtp?.from)])
+            .filter((a) => typeof a === 'string' && a.includes('@'))
+            .map((a) => a.trim().toLowerCase()))];
+    }
+
+    async senderConfig(account) {
+        const entries = await this.#imapEntries();
+        const candidates = entries.filter(({ config }) => config.enabled !== false
+            && normalizeSegment(config.account || config.user) === normalizeSegment(account));
+        const config = candidates.find(({ config }) => config.smtp?.enabled && !config.readOnly)?.config;
+        if (!config) throw new Error('Email account is missing or SMTP sending is disabled');
+        return this.#resolveCredentials(config);
+    }
+
+    async storeSentMessage(config, raw) {
+        let uid = null;
+        const warnings = [];
+        const folder = config.smtp.sentFolder || 'Sent';
+        if (config.smtp.appendSent) {
+            try { uid = await new ImapBackend('sent-copy', this.#resolveCredentials(config)).appendSent(raw, folder); }
+            catch { warnings.push('Message accepted, but saving a copy to the IMAP Sent folder failed.'); }
+        }
+        const item = await this.#prepareMessage({ raw, account: config.account || config.user, folder, uid });
+        if (!uid) item.emailDoc.locations = item.emailDoc.locations.filter((l) => !l.url.startsWith('imap://'));
+        item.emailDoc.metadata.outgoing = true;
+        item.emailDoc.metadata.mailAccount = config.account || config.user;
+        const docId = await this.#put(item.emailDoc, {
+            context: null, directory: this.#directoryFor(config.account || config.user, folder),
+            features: item.features, emitEvent: true,
+        });
+        await this.#linkThread(docId, item.emailDoc.data);
+        return { docId, warnings };
+    }
+
+    async listMailboxes() {
+        const entries = await this.#imapEntries();
+        return entries.map(({ id, config }) => this.#serializeMailbox(id, config));
+    }
+
+    async saveMailbox(input = {}) {
+        const stored = await this.readStoredConfig();
+        const id = String(input.id || '').trim() || this.#generateMailboxId(input);
+        const name = this.#mailboxName(id);
+        const current = stored.backends[name] || null;
+        const merged = { ...(current || {}), ...input, id };
+        merged.smtp = normalizeSmtp(input.smtp, current?.smtp);
+        if (current && typeof input.password === 'string' && input.password.length === 0) merged.password = current.password;
+        // initialSyncDays only governs the first sync (lastUid==0); see
+        // ImapBackend#searchCriteria. Reset the cursor only when the window
+        // WIDENED (older mail now wanted) — a same/narrower value must not
+        // force a full re-ingest on every save (re-ingest dedups, but it
+        // refetches and re-parses everything).
+        if (current && input.initialSyncDays != null && Number(input.initialSyncDays) > Number(current.initialSyncDays)) {
+            merged.lastUid = 0;
+            merged.lastSyncAt = null;
+        }
+        const mailbox = this.#normalizeMailbox(merged, id);
+        // Drop any running instance first so its in-memory cursor can't re-persist
+        // stale state, and so the rebuilt backend picks up the new config/cursor.
+        await this.#removeBackend(name);
+        stored.backends[name] = mailbox;
+        await this.writeStoredConfig(stored);
+        await this.#refreshMailboxBackend(id, mailbox);
+        return this.#serializeMailbox(id, mailbox);
+    }
+
+    // Resync every enabled mailbox on an account, addressed by its normalized
+    // /imap/<account> tree segment. The tree segment was built with
+    // normalizeSegment(accountId), so we normalize each mailbox's account the
+    // same way to match. MVP resyncs the whole account (folder ignored).
+    async resyncAccount(accountSegment) {
+        const wanted = normalizeSegment(accountSegment);
+        const config = await this.readStoredConfig();
+        const ids = [];
+        for (const [name, entry] of Object.entries(config.backends || {})) {
+            if (entry?.driver !== 'imap') continue;
+            if (entry?.enabled === false) continue;
+            const acc = normalizeSegment(entry.account || entry.user || '');
+            if (acc === wanted) ids.push(this.#mailboxIdFromName(name));
+        }
+        if (!ids.length) throw new Error(`No IMAP mailbox found for account "${accountSegment}"`);
+        const results = [];
+        for (const id of ids) results.push(await this.syncMailbox(id));
+        return { account: wanted, mailboxes: results.length, results };
+    }
+
+    async removeMailbox(id) {
+        const stored = await this.readStoredConfig();
+        const name = this.#mailboxName(id);
+        const removed = stored.backends[name];
+        if (!removed) return false;
+        await this.#removeBackend(name);
+        delete stored.backends[name];
+        await this.writeStoredConfig(stored);
+        return this.#serializeMailbox(id, removed);
+    }
+
+    async testMailbox(id) {
+        const config = await this.readStoredConfig();
+        const entry = config.backends[this.#mailboxName(id)];
+        if (!entry) throw new Error(`Mailbox "${id}" not found`);
+        const result = await new ImapBackend(this.#mailboxName(id), this.#resolveCredentials(entry)).verify();
+        await this.patchStoredBackend(this.#mailboxName(id), { lastError: null });
+        return { mailbox: this.#serializeMailbox(id, entry), result };
+    }
+
+    async listMailboxFolders(id) {
+        const config = await this.readStoredConfig();
+        const entry = config.backends[this.#mailboxName(id)];
+        if (!entry) throw new Error(`Mailbox "${id}" not found`);
+        return new ImapBackend(this.#mailboxName(id), this.#resolveCredentials(entry)).listFolders();
+    }
+
+    async discoverFolders(input = {}) {
+        const mailbox = this.#normalizeMailbox({ ...input, id: input.id || 'folder-discovery' }, 'folder-discovery');
+        return new ImapBackend('imap:folder-discovery', this.#resolveCredentials(mailbox)).listFolders();
+    }
+
+    async subscribeFolders(id, folderPaths = []) {
+        const stored = await this.readStoredConfig();
+        const source = stored.backends[this.#mailboxName(id)];
+        if (!source) throw new Error(`Mailbox "${id}" not found`);
+        const folders = Array.from(new Set((folderPaths || []).map((f) => String(f || '').trim()).filter(Boolean)));
+        const result = [];
+        for (const folder of folders) {
+            const childId = this.#generateMailboxId({ ...source, folder });
+            const name = this.#mailboxName(childId);
+            if (!stored.backends[name]) {
+                stored.backends[name] = this.#normalizeMailbox({ ...source, folder, id: childId, lastUid: 0, lastSyncAt: null, lastError: null }, childId);
+            }
+            result.push({ id: childId, config: stored.backends[name] });
+        }
+        await this.writeStoredConfig(stored);
+        for (const { id: childId, config } of result) {
+            if (config.enabled !== false) await this.#refreshMailboxBackend(childId, config);
+        }
+        return result.map(({ id: childId, config }) => this.#serializeMailbox(childId, config));
+    }
+
+    // Kick a sync for one mailbox. Non-blocking: a full (re)sync can take
+    // longer than any sane HTTP timeout — progress surfaces via
+    // runtime.status 'syncing' and the persisted lastUid/lastSyncAt.
+    async syncMailbox(id) {
+        const name = this.#mailboxName(id);
+        let backend = this.#getBackend(name);
+        if (!backend) {
+            const config = await this.readStoredConfig();
+            const entry = config.backends[name];
+            if (!entry) throw new Error(`Mailbox "${id}" not found`);
+            backend = this.#registerBackend(name, entry);
+        }
+        this.#kickBackendSync(name, backend);
+        const config = await this.readStoredConfig();
+        return { mailbox: this.#serializeMailbox(id, config.backends[name]), syncing: true };
+    }
+
+    // Register (if needed) + start/stop a mailbox backend to match its enabled
+    // flag. The sync itself runs in the background — callers (save/subscribe
+    // HTTP requests) return immediately with runtime.status 'syncing'.
+    async #refreshMailboxBackend(id, config) {
+        const name = this.#mailboxName(id);
+        if (config.enabled === false || (this.#secretsLocked() && containsSecrets(config))) { await this.#removeBackend(name); return; }
+        const backend = this.#registerBackend(name, config);
+        this.#kickBackendSync(name, backend);
+    }
+
+    // Workspace 'imap' service hooks.
+    async getImapStatus() {
+        const mailboxes = await this.listMailboxes();
+        return {
+            initialized: this.isRunning,
+            mailboxCount: mailboxes.length,
+            activeMailboxCount: mailboxes.filter((m) => m.runtime.active).length,
+            mailboxes,
+        };
+    }
+
+    async disableImap() {
+        for (const name of [...this.#backends.keys()]) await this.#removeBackend(name);
+    }
+
+    #setBackendError(backendName, error) {
+        this.#backendStatus.set(backendName, {
+            ...(this.#backendStatus.get(backendName) || {}),
+            lastError: error?.message || String(error),
+        });
+    }
+}
+
+export default WorkspaceMailIndex;

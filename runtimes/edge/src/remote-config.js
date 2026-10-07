@@ -19,7 +19,8 @@ import path from 'node:path';
  */
 
 export function workspaceConfigPath(dir) {
-    return path.join(dir, 'workspace.json');
+    const home = path.join(dir, '.workspace', 'workspace.json');
+    return fs.existsSync(home) ? home : path.join(dir, 'workspace.json');
 }
 
 export function readWorkspaceConfig(dir) {

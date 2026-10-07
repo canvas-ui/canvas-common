@@ -33,6 +33,7 @@ export const DEFAULT_SYNC_EXCLUSIONS = Object.freeze([
 // regardless of layout. Dotfiles are excluded by default anyway; spelled out
 // so it survives any future relaxation of the dotfile rule.
 export const WORKSPACE_INTERNAL_EXCLUSIONS = Object.freeze([
+    '.agent', '.agent/**',
     WORKSPACE_INTERNAL_DIRNAME,
     `${WORKSPACE_INTERNAL_DIRNAME}/**`,
 ]);

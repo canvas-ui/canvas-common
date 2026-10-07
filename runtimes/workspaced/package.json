@@ -1,0 +1,8 @@
+{
+  "name": "@augmentd-labs/canvas-workspaced", "version": "0.1.0", "type": "module",
+  "description": "Local Canvas workspace and Pi agent host with outbound registration",
+  "license": "AGPL-3.0-or-later", "engines": { "node": ">=22.0.0" },
+  "bin": { "canvas-workspace": "bin/canvas-workspace.js", "canvas-agent": "bin/canvas-agent.js" },
+  "exports": { ".": "./src/main.js" }, "files": ["src", "bin", "deploy", "NOTICE"],
+  "dependencies": { "@augmentd-labs/canvas-runtime-core": "workspace:*", "@augmentd-labs/canvas-edge": "workspace:*", "proper-lockfile": "^4.1.2" }
+}
