@@ -564,6 +564,8 @@ export default class RemoteWorkspace extends EventEmitter {
         socket.onAny((event, payload) => this.#relay(event, payload));
     }
 
+    receiveEvent(event, payload) { this.#relay(event, payload); }
+
     #relay(event, payload) {
         if (this.#disposed || typeof event !== 'string' || SOCKET_INTERNAL_EVENTS.has(event)) return;
         const remoteId = this.#entry.remote.workspaceId;

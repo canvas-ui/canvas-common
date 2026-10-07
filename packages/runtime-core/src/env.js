@@ -219,7 +219,7 @@ export const env = {
         password: process.env.CANVAS_ADMIN_PASSWORD || null, // null will trigger auto-generation
         forceReset: process.env.CANVAS_ADMIN_RESET === 'true' || false
     }
-}
+};
 
 /**
  * Private Utils

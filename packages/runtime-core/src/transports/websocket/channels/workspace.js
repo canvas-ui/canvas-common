@@ -85,8 +85,12 @@ export default function registerWorkspaceWebSocket(fastify, socket) {
         return;
       }
 
-      // Verify access (cached positives skip revalidation on the hot path).
-      let hasAccess = workspaceIdentifiers.some((identifier) => accessCache.has(identifier));
+      // Edge ACLs and share tokens can be revoked while a socket remains connected.
+      if (binding && workspaceManager.resolveWorkspaceShareToken &&
+          !workspaceManager.resolveWorkspaceShareToken(socket.handshake?.auth?.token)?.permissions?.includes('read')) return;
+      const liveAcl = binding || fastify.edges?.registrations().some(entry =>
+        entry.announce.exports.some(exp => exp.type === 'workspace' && workspaceIdentifiers.includes(exp.id)));
+      let hasAccess = !liveAcl && workspaceIdentifiers.some((identifier) => accessCache.has(identifier));
       if (!hasAccess) {
         hasAccess = await validateWorkspaceAccess(socket, workspaceIdentifiers, workspaceManager);
         if (hasAccess) {

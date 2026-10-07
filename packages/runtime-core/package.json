@@ -1,11 +1,11 @@
 {
   "name": "@augmentd-labs/canvas-runtime-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shared Canvas workspace, context, Pi agent and resource API implementation",
   "type": "module",
   "license": "AGPL-3.0-or-later",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.19.0"
   },
   "exports": {
     "./*": "./src/*",
@@ -16,8 +16,8 @@
     "NOTICE"
   ],
   "dependencies": {
-    "@augmentd-labs/canvas-protocol": "^0.4.0",
-    "@augmentd-labs/canvas-web": "^2.14.26",
+    "@augmentd-labs/canvas-protocol": "workspace:*",
+    "@augmentd-labs/canvas-web": "^2.15.0",
     "@azure/identity": "^4.13.0",
     "@fastify/auth": "^4.6.1",
     "@fastify/compress": "^7.0.3",

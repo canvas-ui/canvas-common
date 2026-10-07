@@ -168,7 +168,7 @@ class Agents extends EventEmitter {
      * @param {Object} options.users            - Users service
      */
     constructor(options = {}) {
-        super(options.eventEmitterOptions || {});
+        super({ wildcard: true, delimiter: '.', newListener: false, maxListeners: 100, ...(options.eventEmitterOptions || {}) });
         if (!options.defaultRootPath) throw new Error('defaultRootPath required');
         if (!options.indexStore)      throw new Error('indexStore required');
         if (!options.users)           throw new Error('users service required');
@@ -911,7 +911,7 @@ class Agents extends EventEmitter {
         const updated = { ...config, ...updates, updatedAt: new Date().toISOString() };
         updated.config = this.#mergeAgentConfig(config.config, updates.config);
 
-        await validateAgentProvider(updated);
+        if (!updateData.deferProviderValidation) await validateAgentProvider(updated);
         await fsPromises.writeFile(entry.configPath, JSON.stringify(updated, null, 2));
         await materializeAgentRuntimeFiles(entry.rootPath, updated);
 

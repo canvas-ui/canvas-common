@@ -1,12 +1,17 @@
 services:
   agent:
     build: .
-    init: true
     restart: unless-stopped
     user: "${CANVAS_UID:-1000}:${CANVAS_GID:-1000}"
     ports: ["127.0.0.1:${CANVAS_LOCAL_PORT:-8012}:8012"]
     volumes: ["${CANVAS_WORK_DIR:-./workspace}:/workspace"]
-    command: ["/workspace", "--foreground", "--host", "0.0.0.0", "--port", "8012", "--model", "${OLLAMA_MODEL:-qwen3:latest}", "--ollama-url", "http://ollama:11434/v1", "--stt-url", "http://speaches:8000", "--stt-model", "${STT_MODEL:-Systran/faster-whisper-small}", "--tts-url", "http://kokoro:8880"]
+    command: ["/workspace", "--foreground", "--host", "0.0.0.0", "--port", "8012", "--model", "${OLLAMA_MODEL:-qwen3:latest}", "--ollama-url", "${OLLAMA_URL:-http://ollama:11434/v1}", "--stt-url", "${STT_URL:-http://speaches:8000}", "--stt-model", "${STT_MODEL:-Systran/faster-whisper-small}", "--tts-url", "${TTS_URL:-http://kokoro:8880}"]
+    environment:
+      OLLAMA_URL: "${OLLAMA_URL:-http://ollama:11434/v1}"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3:latest}"
+      STT_URL: "${STT_URL:-http://speaches:8000}"
+      STT_MODEL: "${STT_MODEL:-Systran/faster-whisper-small}"
+    extra_hosts: ["host.docker.internal:host-gateway"]
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
     healthcheck:

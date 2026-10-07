@@ -156,12 +156,15 @@ export default class EdgeClient {
             const allowed = target.pathname === prefix || target.pathname.startsWith(`${prefix}/`);
             if (!allowed && !(resource.type === 'workspace' && target.pathname.startsWith('/rest/v2/contexts'))) throw new Error('Resource path mismatch');
             const headers = Object.fromEntries(Object.entries(frame.headers || {}).filter(([key]) =>
-                !['authorization', 'cookie', 'host', 'connection', 'content-length', 'transfer-encoding'].includes(key.toLowerCase()) && !key.toLowerCase().startsWith('x-canvas-')));
+                !['authorization', 'cookie', 'host', 'connection', 'content-length', 'transfer-encoding', 'x-canvas-edge-context', 'x-canvas-device-id'].includes(key.toLowerCase())));
             headers.authorization = `Bearer ${this.#localToken}`;
             headers['x-canvas-edge-context'] = Buffer.from(JSON.stringify(context)).toString('base64url');
             const response = await fetch(target, { method, headers, body: upload || undefined,
                 ...(upload ? { duplex: 'half' } : {}), signal: controller.signal, redirect: 'manual' });
-            socket.emit('edge:res', { id, status: response.status, headers: Object.fromEntries(response.headers) });
+            // fetch decodes compressed responses; forward the decoded representation.
+            const responseHeaders = Object.fromEntries(response.headers);
+            delete responseHeaders['content-encoding']; delete responseHeaders['content-length'];
+            socket.emit('edge:res', { id, status: response.status, headers: responseHeaders });
             let seq = 0;
             for await (const chunk of response.body || []) {
                 const bytes = Buffer.from(chunk);

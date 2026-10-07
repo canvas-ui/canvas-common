@@ -255,6 +255,7 @@ export default class WhatsAppConnector extends BaseConnector {
         if (media) {
             const [key, type, folder, extension] = media;
             const mime = content.mimetype || ({ imageMessage: 'image/jpeg', videoMessage: 'video/mp4', ptvMessage: 'video/mp4', audioMessage: 'audio/ogg', stickerMessage: 'image/webp' }[key]) || 'application/octet-stream';
+            // eslint-disable-next-line no-control-regex -- strip control characters from untrusted attachment filenames
             const filename = String(content.fileName || `${hash(`${jid}/${message.key.id}`)}${extension}`).replace(/[\\/?#\x00-\x1f]/g, '_').replace(/^\.+/, '_').slice(0, 180);
             const storedName = `${hash(`${jid}/${message.key.id}`).slice(0, 16)}-${filename}`;
             const target = path.join(this.#mediaRoot, folder, storedName);

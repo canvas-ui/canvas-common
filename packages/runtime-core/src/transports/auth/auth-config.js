@@ -274,7 +274,7 @@ export async function testLdapServer(server, { email } = {}) {
     tlsOptions: server.tls ? { rejectUnauthorized: false } : undefined,
   });
   client.on('error', () => {}); // surfaced through the callbacks below
-  const close = () => { try { client.unbind() } catch { /* ignore */ } };
+  const close = () => { try { client.unbind(); } catch { /* ignore */ } };
   try {
     if (server.bindDN) {
       await withTimeout(new Promise((resolve, reject) => client.bind(server.bindDN, server.bindPassword || '', (err) => err ? reject(err) : resolve())), 10000, 'Bind');
@@ -334,6 +334,6 @@ export async function testImapDomain(domainConfig, { email, password }) {
     const msg = err?.authenticationFailed ? 'The server rejected those credentials.' : (err?.responseText || err?.message || String(err));
     return { ok: false, message: msg };
   } finally {
-    try { await client.logout() } catch { /* ignore */ }
+    try { await client.logout(); } catch { /* ignore */ }
   }
 }

@@ -577,7 +577,7 @@ class Workspace extends EventEmitter {
         }
         const internals = this.internalsPath;
         for (const dir of this.internalPaths) {
-            if (dir === internals) { continue; }
+            if (dir === internals || dir === path.join(this.#rootPath, '.agent')) { continue; }
             if (!path.resolve(dir).startsWith(path.resolve(internals) + path.sep)) {
                 this.#logger.warn({ workspaceId: this.id, dir },
                     'home-layout workspace: internal dir lives outside .workspace/ (excluded from indexing, but visible to the user)');

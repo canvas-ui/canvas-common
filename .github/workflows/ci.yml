@@ -36,4 +36,11 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund "$tgz"
           test -d node_modules/@augmentd-labs/canvas-edge/node_modules/canvas-stored
           CANVAS_USER_HOME=/tmp/edge-ci timeout 8 node node_modules/.bin/canvas-edge --foreground || [ $? -eq 124 ]
-
+      - name: Smoke-test the local runtime distribution
+        run: |
+          set -e
+          node scripts/pack-dist.mjs workspaced --out runtime-artifacts --pack
+          tgz=$(ls "$PWD"/runtime-artifacts/augmentd-labs-canvas-workspaced-*.tgz)
+          consumer=$(mktemp -d)
+          npm install --prefix "$consumer" --no-audit --no-fund "$tgz"
+          node scripts/smoke-runtime.mjs "$consumer/node_modules/@augmentd-labs/canvas-workspaced"

@@ -8,3 +8,14 @@ packages:
 onlyBuiltDependencies:
   - lmdb
   - msgpackr-extract
+  - roaring
+  - sharp
+  - onnxruntime-node
+  - koffi
+  - protobufjs
+  - ssh2
+  - cpu-features
+
+# Match the server override: fast-jwt 3 excludes Node 22.
+overrides:
+  fast-jwt: 6.2.4

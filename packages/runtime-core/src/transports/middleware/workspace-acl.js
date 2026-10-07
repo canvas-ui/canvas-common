@@ -504,7 +504,14 @@ export async function enforceWorkspaceTokenScope(request, reply) {
   const matchesBinding = workspaceId === binding.workspaceId
     || workspaceId === binding.workspaceName;
 
-  if (inWorkspacesApi && matchesBinding) return;
+  if (inWorkspacesApi && matchesBinding) {
+    const method = request.method || 'GET';
+    const readPost = method === 'POST' && /\/(search(\/image)?|query|resolve|preview|exports\/ticket|copy-to-workspace)(\/|$)/.test(url);
+    const permission = ['GET', 'HEAD', 'OPTIONS', 'PROPFIND'].includes(method) || readPost ? 'read' : 'write';
+    if (binding.permissions?.includes(permission)) return;
+    const response = new ResponseObject().forbidden(`Workspace token lacks required permission: ${permission}`);
+    return reply.code(response.statusCode).send(response.getResponse());
+  }
   // Self-describing endpoint: lets a token holder discover its workspace.
   if (url === '/rest/v2/workspaces/token-info') return;
 

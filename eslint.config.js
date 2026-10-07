@@ -21,7 +21,7 @@ export default [
         }
     },
     {
-        files: ['packages/**/*.js', 'runtimes/**/*.js', 'runtimes/**/bin/*'],
+        files: ['packages/**/*.{js,mjs}', 'runtimes/**/*.{js,mjs}', 'runtimes/**/bin/*'],
         languageOptions: {
             ecmaVersion: 'latest',
             sourceType: 'module',

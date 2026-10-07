@@ -25,6 +25,7 @@ import registerAgent from '../transports/websocket/channels/agent.js';
 import registerContext from '../transports/websocket/channels/context.js';
 import { enforceAgentBinding } from '../transports/middleware/agent-acl.js';
 import { enforceWorkspaceTokenScope } from '../transports/middleware/workspace-acl.js';
+import { resolveAclAccess } from '../core/workspace/lib/access.js';
 
 const envelope = payload => ({ status: 'success', statusCode: 200, payload });
 function privateJson(file, value) {
@@ -37,7 +38,7 @@ function equals(a, b) {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
-export async function createLocalHost({ root, kind = 'workspace', name, model = 'qwen3:latest', ollamaUrl = 'http://127.0.0.1:11434/v1', voice = {}, webRoot, logger = false } = {}) {
+export async function createLocalHost({ root, kind = 'workspace', name, model, ollamaUrl, voice = {}, webRoot, logger = false } = {}) {
   if (!root || !['workspace', 'agent'].includes(kind)) throw new Error('A root folder and valid runtime kind are required');
   root = fs.realpathSync(root);
   const state = path.join(root, '.workspace');
@@ -50,10 +51,16 @@ export async function createLocalHost({ root, kind = 'workspace', name, model = 
     config = { version: 1, instanceId: randomUUID(), userId: oldConfig?.owner || randomUUID(), kind,
       name: name || path.basename(root).toLowerCase().replace(/[^a-z0-9._-]/g, '-') || 'local',
       token: `canvas-local-${randomBytes(32).toString('hex')}`, tunnelToken: randomBytes(32).toString('hex'),
-      jwtSecret: randomBytes(32).toString('hex'), voice, model, ollamaUrl, remotes: [] };
+      jwtSecret: randomBytes(32).toString('hex'), voice, model: model || 'qwen3:latest', ollamaUrl: ollamaUrl || 'http://127.0.0.1:11434/v1', remotes: [] };
     privateJson(runtimeFile, config);
   }
   if (kind === 'agent' && config.kind === 'workspace') { config.kind = 'agent'; privateJson(runtimeFile, config); }
+  if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(config.name)) throw new Error('Runtime name must be 1–100 lowercase letters, digits, dots, underscores or hyphens, beginning with a letter or digit');
+  if (model) config.model = model;
+  if (ollamaUrl) config.ollamaUrl = ollamaUrl;
+  config.voice ||= {};
+  for (const [key, value] of Object.entries(voice)) if (value) config.voice[key] = value;
+  privateJson(runtimeFile, config);
   const user = { id: config.userId, email: 'local@canvas.local', name: 'Local owner', status: 'active', userType: 'user', homePath: state };
   const jim = new Jim({ rootPath: path.join(state, 'host'), driver: 'conf', driverOptions: { accessPropertiesByDotNotation: false } });
   const userIndex = jim.createIndex('users'); userIndex.set(user.id, user);
@@ -85,6 +92,8 @@ export async function createLocalHost({ root, kind = 'workspace', name, model = 
     config.agentId = agent.id;
     privateJson(runtimeFile, config);
     await agents.setAccess(user.id, agent.id, { binding: { type: 'workspace', workspace: workspaceId }, permissions: ['read', 'write'] });
+  } else if (config.agentId && (model || ollamaUrl)) {
+    await agents.update(user.id, config.agentId, { model: config.model, config: { baseUrl: config.ollamaUrl }, deferProviderValidation: true }, user.id);
   }
   workspaceManager.hookService?.setAgents(agents);
   const policyListeners = new Set();
@@ -112,7 +121,15 @@ export async function createLocalHost({ root, kind = 'workspace', name, model = 
       try { context = JSON.parse(Buffer.from(request.headers['x-canvas-edge-context'] || '', 'base64url')); } catch { /* rejected below */ }
       if (!context || !['workspace', 'agent'].includes(context.resourceType) ||
         (context.resourceType === 'workspace' ? context.resourceId !== workspaceId : context.resourceId !== config.agentId)) return reply.code(403).send({ message: 'Invalid tunnel context' });
-      if (context.resourceType === 'workspace' && context.binding) request.resourceToken = context.binding;
+      if (context.resourceType === 'workspace' && context.binding) {
+        request.resourceToken = context.binding;
+        if (context.binding.type === 'workspace') {
+          const workspace = await workspaceManager.getWorkspace(workspaceId, user.id);
+          const grant = context.shareToken ? workspaceManager.resolveWorkspaceShareToken(context.shareToken) : resolveAclAccess(workspace.acl, context.principal);
+          if (!grant?.permissions?.includes('read')) return reply.code(403).send({ message: 'Workspace access revoked locally' });
+          request.resourceToken = { ...context.binding, permissions: grant.permissions };
+        }
+      }
       return;
     }
     const binding = await (value?.startsWith('canvas-agent-') ? agents.verifyAgentToken(value) : null);
@@ -123,8 +140,14 @@ export async function createLocalHost({ root, kind = 'workspace', name, model = 
   };
   app.decorate('authenticate', authenticate); app.decorate('authenticateClient', authenticate);
   app.addHook('onRequest', async (req, reply) => {
-    if (req.method === 'POST' && /^\/rest\/v2\/(workspaces|agents)\/?$/.test(req.url)) return reply.code(409).send({ message: 'This runtime hosts one workspace and one optional agent; initialize another folder for another runtime' });
-    if (req.url.startsWith('/rest/v2/') && !req.url.startsWith('/rest/v2/ping') && !req.url.startsWith('/rest/v2/runtime/capabilities') && !req.url.startsWith('/rest/v2/auth/config')) await authenticate(req, reply);
+    const url = req.url.split('?')[0];
+    if (url.startsWith('/rest/v2/') && !['/rest/v2/ping', '/rest/v2/runtime/capabilities', '/rest/v2/auth/config'].includes(url)) {
+      await authenticate(req, reply);
+      if (!reply.sent) await enforceWorkspaceTokenScope(req, reply);
+      if (reply.sent) return;
+    }
+    if (req.method === 'DELETE' && /^\/rest\/v2\/(workspaces|agents)\/[^/]+\/?$/.test(url)) return reply.code(409).send({ message: 'Stop this runtime with canvas runtime stop; its local resource cannot be deleted through the API' });
+    if (req.method === 'POST' && /^\/rest\/v2\/(workspaces|agents)\/?$/.test(url)) return reply.code(409).send({ message: 'This runtime hosts one workspace and one optional agent; initialize another folder for another runtime' });
   });
   app.addHook('preHandler', enforceWorkspaceTokenScope);
   app.addHook('preHandler', enforceAgentBinding);
@@ -181,7 +204,9 @@ export async function createLocalHost({ root, kind = 'workspace', name, model = 
     subscribePolicy(listener) { policyListeners.add(listener); return () => policyListeners.delete(listener); },
     async start({ host = '127.0.0.1', port = 0 } = {}) {
       await app.listen({ host, port });
-      const address = `http://127.0.0.1:${app.server.address().port}`;
+      const bind = app.server.address().address;
+      const localHost = bind === '0.0.0.0' ? '127.0.0.1' : bind === '::' ? '[::1]' : bind.includes(':') ? `[${bind}]` : bind;
+      const address = `http://${localHost}:${app.server.address().port}`;
       agents.setApiBaseUrl(`${address}/rest/v2`);
       await workspaceManager.startWorkspace(workspaceId, user.id);
       return address;
