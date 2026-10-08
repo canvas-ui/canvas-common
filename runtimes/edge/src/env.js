@@ -99,7 +99,7 @@ export function ensureEnvConfig(env = process.env) {
         mountpoint: path.resolve(env.CANVAS_MIRROR_PATH ? String(env.CANVAS_MIRROR_PATH) : (existing.mountpoint || '/data')),
         pins: env.CANVAS_PINS != null ? list(env.CANVAS_PINS) : (existing.pins || []),
         ignore: env.CANVAS_IGNORE != null ? list(env.CANVAS_IGNORE) : (existing.ignore || []),
-        conflicts: oneOf(env.CANVAS_CONFLICTS, ['prompt', 'rename'], existing.conflicts || 'prompt'),
+        conflicts: oneOf(env.CANVAS_CONFLICTS, ['prompt', 'rename'], existing.conflicts || 'rename'),
         deletes: oneOf(env.CANVAS_DELETES, ['propagate', 'keep'], existing.deletes || 'propagate'),
         direction: oneOf(env.CANVAS_DIRECTION, ['bi', 'pull', 'push'], existing.direction || 'bi'),
         client: 'daemon',

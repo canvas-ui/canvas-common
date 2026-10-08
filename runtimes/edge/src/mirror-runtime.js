@@ -98,7 +98,7 @@ export class MirrorRuntime {
         this.#engine = new Mirror(this.#stored, {
             id: this.#mirror.id, local: 'local', remote: 'canvas:hub', trash: 'trash', conflicts: 'conflicts',
             prefixes: this.#mirror.pins || [], ignore: this.#mirror.ignore || [],
-            deletes: this.#mirror.deletes || 'propagate', conflictMode: this.#mirror.conflicts || 'prompt',
+            deletes: this.#mirror.deletes || 'propagate', conflictMode: this.#mirror.conflicts || 'rename',
             direction: this.#mirror.direction || 'bi',
             deviceId: this.#identity.deviceId, deviceName: this.#identity.deviceName,
         });

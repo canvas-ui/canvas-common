@@ -76,6 +76,11 @@ mirrors.json). `CANVAS_DIRECTION=pull` makes the container a backup target
 Protocol: canvas-server `docs/canvas-edge-protocol.md` (tunnel) and
 `docs/sync-protocol.md` (file plane).
 
+New mirrors default to `rename` conflict handling: the hub version keeps its
+name and the device version gets a conflict-copy name. Set `CANVAS_CONFLICTS=prompt`
+for the hub conflict inbox instead. Existing `mirrors.json` conflict policies
+are preserved unless explicitly overridden.
+
 ### Client certificates (0.5.0+)
 
 Hub remotes retain `tls: { certFile, keyFile }` from the shared client config.

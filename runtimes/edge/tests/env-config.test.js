@@ -28,6 +28,7 @@ test('ensureEnvConfig seeds one remote + one daemon mirror, idempotently, env fi
     assert.equal(m.workspaceName, 'augmentd');
     assert.equal(m.folderName, 'Augmentd');
     assert.equal(m.direction, 'pull');
+    assert.equal(m.conflicts, 'rename');
     assert.equal(m.client, 'daemon');
     assert.equal(m.mountpoint, path.resolve('/data'));
     assert.deepEqual(m.pins, ['Accounting/**', 'Docs/**']);
@@ -45,6 +46,8 @@ test('ensureEnvConfig seeds one remote + one daemon mirror, idempotently, env fi
     assert.equal(cfg.mirrors.length, 1);
     assert.deepEqual(JSON.parse(fs.readFileSync(env.EDGE_PATHS.remotes, 'utf8')).hub.device, { deviceId: 'dev-1', token: 'canvas-device' });
     assert.equal(env.hubFor('hub').token, 'canvas-device', 'device token is used once present');
+    assert.equal(env.ensureEnvConfig({ ...e, CANVAS_CONFLICTS: 'prompt' }).conflicts, 'prompt', 'explicit policy wins');
+    assert.equal(env.ensureEnvConfig(e).conflicts, 'prompt', 'stored explicit policy survives restart');
 });
 
 test('daemonMirrors attaches the resolved state dir: explicit stateDir, else <root>/<id>', () => {

@@ -14,7 +14,7 @@ services:
       CANVAS_DIRECTION: pull                         # backup target; use `bi` while seeding
       CANVAS_DEVICE_ID: nas-synology
       CANVAS_DEVICE_NAME: Synology NAS
-      # CANVAS_CONFLICTS: prompt   CANVAS_DELETES: propagate   CANVAS_PINS: Accounting/**
+      # CANVAS_CONFLICTS: rename   CANVAS_DELETES: propagate   CANVAS_PINS: Accounting/**
     volumes:
       - /volume1/work/Augmentd:/data
       - canvas-edge-config:/config
