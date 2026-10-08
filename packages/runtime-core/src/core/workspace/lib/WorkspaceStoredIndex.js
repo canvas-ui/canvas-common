@@ -330,13 +330,20 @@ export class WorkspaceStoredIndex {
 
     /** Run `fn` while holding this key's write lock (promise chain per key). */
     withKeyLock(backendName, key, fn) {
-        const lockKey = `${backendName}:${key}`;
-        const prior = this.#keyLocks.get(lockKey) || Promise.resolve();
-        const run = prior.catch(() => {}).then(fn);
+        return this.withKeysLock(backendName, [key], fn);
+    }
+
+    // Acquire all endpoints together; folder operations also fence descendant
+    // writes. Nested endpoint locks would deadlock for parent/child paths.
+    withKeysLock(backendName, keys, fn) {
+        const names = keys.map(key => `${backendName}:${key}`);
+        const overlap = (a, b) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+        const prior = [...this.#keyLocks].filter(([held]) => names.some(key => overlap(key, held))).map(([, task]) => task);
+        const run = Promise.all(prior.map(task => task.catch(() => {}))).then(fn);
         const chain = run.catch(() => {}).finally(() => {
-            if (this.#keyLocks.get(lockKey) === chain) this.#keyLocks.delete(lockKey);
+            for (const name of names) if (this.#keyLocks.get(name) === chain) this.#keyLocks.delete(name);
         });
-        this.#keyLocks.set(lockKey, chain);
+        for (const name of names) this.#keyLocks.set(name, chain);
         return run;
     }
 
@@ -667,15 +674,20 @@ export class WorkspaceStoredIndex {
         const { backend, root } = this.#objectsBackend(backendName, { write: true });
         const fromKey = this.#objectKey(backend, root, from);
         const toKey = this.#objectKey(backend, root, to);
-        const [first, second] = [fromKey, toKey].sort();
-        return this.withKeyLock(backendName, first, () => this.withKeyLock(backendName, second, async () => {
+        return this.withKeysLock(backendName, [fromKey, toKey], async () => {
+            if (options.directory === true) {
+                if (typeof this.#stored.renameDirectory !== 'function') {
+                    throw objectsError('Directory rename requires an updated canvas-stored', 'NOT_IMPLEMENTED', 501);
+                }
+                return this.#stored.renameDirectory(backendName, fromKey, toKey, options);
+            }
             const pre = await this.#resolveVersionPrecondition(backendName, fromKey, options);
             if (pre.failure) return pre.failure;
             const result = await this.#stored.renameObject(backendName, fromKey, toKey, pre.options);
             if (!result?.ok) return result;
             const docId = await this.#awaitDocId(`${backendName}:${toKey}`, result.id);
             return { ...result, docId, version: await this.#docVersion(docId) };
-        }));
+        });
     }
 
     /** `{ key, id, sha256, size, mtime, mimeType, docId, version }` for an indexed key, or null. */

@@ -277,20 +277,27 @@ async function readRoutes(fastify) {
                     from: { type: 'string', minLength: 1 },
                     to: { type: 'string', minLength: 1 },
                     ifMatch: { type: 'string' },
+                    directory: { type: 'boolean' },
+                    operationId: { type: 'string', minLength: 1, maxLength: 128 },
                     origin: { type: 'string', maxLength: 128 },
                 },
+                allOf: [{
+                    if: { required: ['directory'], properties: { directory: { const: true } } },
+                    then: { required: ['operationId'], not: { required: ['ifMatch'] } },
+                }],
             },
         },
     }, async (request, reply) => {
         try {
-            const { from, to, ifMatch, origin } = request.body;
+            const { from, to, ifMatch, origin, directory, operationId } = request.body;
             const result = await request.workspace.renameBackendObject(drv(request.params.driver), arg(request.params.address), from, to, {
                 ifMatch: shortString(ifMatch),
+                ...(directory === true ? { directory, operationId } : {}),
                 origin: shortString(origin, 128) ?? shortString(request.headers['x-canvas-origin'], 128),
             });
             if (!result?.ok) return sendFailure(reply, result);
             return send(reply, new ResponseObject().updated({
-                from: result.from, to: result.to, sha256: result.sha256, seq: result.seq, docId: result.docId ?? null, version: result.version ?? null, state: result.state,
+                from: result.from, to: result.to, sha256: result.sha256, seq: result.seq, docId: result.docId ?? null, version: result.version ?? null, state: result.state, directory: result.directory,
             }, 'Object renamed'));
         } catch (error) { return sendError(request, reply, error); }
     });
