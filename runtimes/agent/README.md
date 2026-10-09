@@ -99,6 +99,20 @@ node scripts/pack-dist.mjs agent --out artifacts --pack
 
 `CANVAS_RUNTIME_NO_DEV=1` bypasses the CLI's sibling-checkout detection. `CANVAS_AGENT_PACKAGE` selects an agent version or tarball. `CANVAS_RUNTIME_PACKAGE` remains a generic override for the selected runtime kind.
 
+### Installing the runtime from Git or a tarball
+
+The package is not published to npm yet. `--runtime-package` on `canvas init agent` and `canvas runtime start|restart` accepts any npm package spec and takes precedence over the environment variables and over a sibling checkout:
+
+```sh
+# A Git repository (public, or private with Git credentials on the host) that provides the canvas-agent executable
+canvas init agent ./gpu-agent --yes --local-only --runtime-package github:canvas-ui/canvas-agentd#main
+# A packed tarball (node scripts/pack-dist.mjs agent --pack) or a release asset URL
+canvas init agent ./gpu-agent --yes --runtime-package ./augmentd-labs-canvas-agent-runtime-0.1.0.tgz
+canvas runtime restart ./gpu-agent --runtime-package https://github.com/canvas-ui/canvas-common/releases/download/agent-v0.1.0/augmentd-labs-canvas-agent-runtime-0.1.0.tgz
+```
+
+The source package is installed under the `@augmentd-labs/canvas-agent-runtime` name whatever it calls itself; it must provide a `canvas-agent` executable in its `bin`. The chosen spec is recorded in `~/.canvas/runtime/agent/package.json`, so a later `canvas runtime start` without the flag keeps it. Git sources of a Git source resolve through npm as usual, so every dependency of the pointed-to repository must itself be installable (a registry version, a Git URL or a tarball).
+
 The installer creates `.public-workspace` with only public source packages and their exact lockfile resolutions. Public CI and releases run there without fetching synapsd. The npm allowlist contains protocol, schemas, wallpapers, api-client, edge and agent. Publish api-client before agent. Both packing and publishing reject private packages and dependencies, including transitive synapsd references. The agent tarball is tested in a clean npm installation without access to private repositories. Runtime-core and workspaced remain private and are tested/deployed through Git; see [workspaced](../workspaced/README.md).
 
 No model weights are included. One hub per runtime and turn-based audio are supported; realtime full-duplex voice remains separate work.

@@ -24,7 +24,7 @@ canvas init workspace ./workspace --yes \
   --server-url https://canvas.example --token-file ./pairing-token
 ```
 
-`CANVAS_WORKSPACE_PACKAGE` selects another Git ref or a local test artifact. `CANVAS_RUNTIME_NO_DEV=1` bypasses sibling-checkout detection. Without that variable, the CLI uses an installed sibling canvas-common checkout. Agent and workspace dependencies are installed separately.
+`--runtime-package <spec>` (also on `canvas runtime start|restart`) or `CANVAS_WORKSPACE_PACKAGE` selects another Git ref, fork or local test artifact, for example `--runtime-package github:canvas-ui/canvas-common#<sha>`; the spec sticks for later `canvas runtime start` calls. `CANVAS_RUNTIME_NO_DEV=1` bypasses sibling-checkout detection. Without that variable, the CLI uses an installed sibling canvas-common checkout. Agent and workspace dependencies are installed separately.
 
 ## Development and tests from a Git checkout
 
