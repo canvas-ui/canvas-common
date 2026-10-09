@@ -625,14 +625,19 @@ class Workspace extends EventEmitter {
     }
 
     // Database maintenance settings (Workspaces > Settings > Database).
-    // orphanRetentionDays: window before GC purges feature/orphaned docs;
-    // -1 (default) keeps orphans forever — explicit cleanup goes through the
-    // feature/orphaned filter or gcOrphanedDocuments().
+    // Last-location removal drops the index entry by default. Opt into keeping
+    // orphaned documents (and their curation), optionally with a GC window.
     get databaseSettings() {
-        return { orphanRetentionDays: -1, ...(this.#configStore.get('database') || {}) };
+        return { orphanPolicy: 'remove', orphanRetentionDays: -1, ...(this.#configStore.get('database') || {}) };
     }
 
     setDatabaseSettings(patch = {}) {
+        if ('orphanPolicy' in patch && !['remove', 'keep'].includes(patch.orphanPolicy)) {
+            throw Object.assign(new Error('orphanPolicy must be remove or keep'), { statusCode: 400 });
+        }
+        if ('orphanRetentionDays' in patch && (!Number.isInteger(patch.orphanRetentionDays) || patch.orphanRetentionDays < -1)) {
+            throw Object.assign(new Error('orphanRetentionDays must be an integer >= -1'), { statusCode: 400 });
+        }
         const next = { ...this.databaseSettings, ...patch };
         this.#configStore.set('database', next);
         this.emit('databaseSettings.changed', { workspaceId: this.id, settings: next });
@@ -4273,6 +4278,7 @@ class Workspace extends EventEmitter {
             },
             // Orphan-GC retention (Settings > Database), -1 = keep forever.
             getOrphanRetentionDays: () => Number(this.databaseSettings.orphanRetentionDays ?? -1),
+            getOrphanPolicy: () => this.databaseSettings.orphanPolicy,
         });
     }
 

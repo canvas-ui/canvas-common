@@ -45,12 +45,8 @@ const CONTAINER_DRIVERS = new Set(['file', 'gdrive']);
 // touching one re-registers the backend (credentials/root/poll cadence).
 const REMOTE_RESTART_KEYS = ['clientId', 'clientSecret', 'refreshToken', 'folderId', 'pollInterval', 'permanentDelete'];
 const CHECKSUM_PRIORITY = ['sha256', 'sha1', 'md5'];
-// Orphan lifecycle: a doc whose last resolvable location vanished keeps its
-// row, checksums and curated placements, and gains empty locations[] + orphanedAt.
-// That pair is what the engine ticks feature/orphaned from, so stamping
-// orphanedAt here IS what makes the doc listable below. Purged only by retention
-// GC or explicit user action. If its bytes reappear anywhere, the checksum index
-// re-binds the new location to the same doc and curation survives the round trip.
+// Last-location removal deletes the index row by default. With orphanPolicy
+// 'keep', retain metadata/curation and stamp orphanedAt for optional retention GC.
 const ORPHANED_FEATURE = 'feature/orphaned';
 
 // `backend.changed` nudges are throttled per backend: a folder drop of a
@@ -141,6 +137,11 @@ export class WorkspaceStoredIndex {
     // Optional: orphan-GC retention in days (-1 = keep forever). Read after
     // each successful resync; also used by explicit gcOrphanedDocuments calls.
     #getOrphanRetentionDays;
+    #getOrphanPolicy;
+    // Serialize document mutations across watcher events and explicit scans.
+    // In particular, an old unlink must not overwrite a concurrently added
+    // location, and succession must migrate curation before deleting its row.
+    #documentMutations = Promise.resolve();
     // Optional: `({ backend, seq }) => void`, fired (throttled) whenever a
     // backend's change log advances — the Workspace turns it into the
     // `backend.changed` event device mirrors subscribe to.
@@ -155,7 +156,7 @@ export class WorkspaceStoredIndex {
     // learns the document id behind the bytes it just landed.
     #inflightUpserts = new Map();
 
-    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, onBackendChanged = null }) {
+    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, getOrphanPolicy = null, onBackendChanged = null }) {
         if (!dataPath || !homePath) throw new Error('dataPath and homePath are required');
         if (!put || !unlink || !getBackendsTreeSelector || !getDb) throw new Error('put, unlink, getBackendsTreeSelector, getDb are required');
 
@@ -186,6 +187,7 @@ export class WorkspaceStoredIndex {
         this.#onResyncStateChange = onResyncStateChange;
         this.#persistBackendConfig = persistBackendConfig;
         this.#getOrphanRetentionDays = getOrphanRetentionDays;
+        this.#getOrphanPolicy = getOrphanPolicy;
         this.#onBackendChanged = typeof onBackendChanged === 'function' ? onBackendChanged : null;
     }
 
@@ -303,7 +305,9 @@ export class WorkspaceStoredIndex {
      */
     async copyObject(url, { to, key, onConflict } = {}) {
         const idOrKey = this.#transferEndpoints(url, to);
-        return this.#stored.copy(idOrKey, { to, key, onConflict, from: url });
+        const result = await this.#stored.copy(idOrKey, { to, key, onConflict, from: url });
+        await this.#documentMutations;
+        return result;
     }
 
     /**
@@ -316,7 +320,9 @@ export class WorkspaceStoredIndex {
         if (this.#dataBackends[parseLocationUrl(url).backend]?.readOnly === true) {
             throw new Error('Source backend is read-only — copy instead of move');
         }
-        return this.#stored.move(idOrKey, { to, key, onConflict, from: url });
+        const result = await this.#stored.move(idOrKey, { to, key, onConflict, from: url });
+        await this.#documentMutations;
+        return result;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -619,17 +625,18 @@ export class WorkspaceStoredIndex {
         });
     }
 
-    /** Delete `backend:key` (precondition-checked); the document is orphaned, never destroyed. */
+    /** Delete only `backend:key`; last-location index removal follows workspace policy. */
     async removeObject(backendName, key, options = {}) {
         const { backend, root } = this.#objectsBackend(backendName, { write: true });
         const normalized = this.#objectKey(backend, root, key);
         return this.withKeyLock(backendName, normalized, async () => {
             const pre = await this.#resolveVersionPrecondition(backendName, normalized, options);
             if (pre.failure) return pre.failure;
+            const before = await this.statObject(backendName, normalized);
             const result = await this.#stored.removeObject(backendName, normalized, pre.options);
             if (!result?.ok) return result;
-            const docId = await this.#docIdForStoredId(result.id);
-            return { ...result, key: normalized, docId, version: await this.#docVersion(docId) };
+            await this.#documentMutations;
+            return { ...result, key: normalized, docId: before?.docId ?? null, version: before?.version ?? null };
         });
     }
 
@@ -817,6 +824,7 @@ export class WorkspaceStoredIndex {
         for (const timer of this.#prunePending.values()) clearTimeout(timer);
         this.#prunePending.clear();
         this.#unbindEvents();
+        await this.#documentMutations;
         if (!this.#stored) return;
 
         try {
@@ -1452,11 +1460,11 @@ export class WorkspaceStoredIndex {
      * never touched. Per-entry semantics:
      *   - checksum present in scan        → unchanged, skip
      *   - path present, new checksum      → in-place edit: migrate curated
-     *     placements to the successor doc (derivedFrom breadcrumb), then orphan
+     *     placements to the successor doc, then apply the last-location policy
      *   - path under an unreadable subtree→ carry forward (stale, not deleted)
      *   - path hashed-failed              → present-but-unverified, carry forward
      *   - path gone                       → drop this backend's locations; doc
-     *     orphans (never deletes) if none survive
+     *     follows the configured orphan policy if none survive
      * Returns the number of docs that lost locations here.
      */
     async #purgeOrphanedPaths(backendName, presentFiles = [], scanErrors = null) {
@@ -1519,11 +1527,15 @@ export class WorkspaceStoredIndex {
             if (survivorFiles.some((f) => !f.checksums)) continue;
 
             // Same path, new bytes: content identity made a new doc — migrate
-            // the predecessor's curated placements to it before orphaning.
+            // the predecessor's curated placements to it before applying the last-location policy.
             const successorFile = survivorFiles.find((f) => f.checksums);
             if (successorFile) {
-                await this.#migrateToSuccessor(doc, successorFile).catch((error) =>
-                    this.#logger.warn({ workspaceId: this.#workspaceId, docId: doc.id, key: successorFile.key, error: error.message }, 'Placement migration to successor failed'));
+                try {
+                    await this.#migrateToSuccessor(doc, successorFile);
+                } catch (error) {
+                    this.#logger.warn({ workspaceId: this.#workspaceId, docId: doc.id, key: successorFile.key, error: error.message }, 'Placement migration failed; retaining predecessor for retry');
+                    continue;
+                }
             }
 
             const removedUrls = ownedLocations.map((l) => l.url);
@@ -1531,7 +1543,7 @@ export class WorkspaceStoredIndex {
             reconciled += 1;
         }
         if (reconciled > 0) {
-            this.#logger.info({ workspaceId: this.#workspaceId, backend: backendName, docs: reconciled }, 'Resync: reconciled removed locations (orphan-not-delete)');
+            this.#logger.info({ workspaceId: this.#workspaceId, backend: backendName, docs: reconciled }, 'Resync: reconciled removed locations');
         }
         return reconciled;
     }
@@ -1561,15 +1573,38 @@ export class WorkspaceStoredIndex {
         const successorChecksum = this.#buildChecksumArray(successorFile.checksums)[0];
         if (!successorChecksum) return;
         const successor = await db.getByChecksumString(successorChecksum).catch(() => null);
-        if (!successor?.id || successor.id === oldDoc.id) return;
+        if (!successor?.id) throw new Error('Successor is not indexed yet');
+        if (successor.id === oldDoc.id) return;
 
         if (typeof db.migrateDocumentMemberships === 'function') {
-            await db.migrateDocumentMemberships(oldDoc.id, successor.id, { excludeTrees: [BACKENDS_TREE_NAME] });
+            await this.#migrateCuration(oldDoc.id, successor.id);
         }
         await this.#put({
             id: successor.id,
             metadata: { derivedFrom: oldDoc.checksumArray?.[0] || null },
         }, { context: null });
+    }
+
+    // Finish all user-owned curation before a last-location predecessor may
+    // be removed. A failure leaves that predecessor for the next rescan.
+    async #migrateCuration(fromId, toId) {
+        const db = this.#getDb();
+        await db.migrateDocumentMemberships(fromId, toId, { excludeTrees: [BACKENDS_TREE_NAME] });
+        if (db.getBitmapsForDocument && db.link) {
+            const tags = await db.getBitmapsForDocument(fromId, 'tag/');
+            if (tags.length) await db.link(toId, { context: null, features: tags });
+        }
+        if (db.edges && db.assertRelation) {
+            const { outgoing, incoming } = db.edges.edgesOf(fromId);
+            for (const { p, to } of outgoing) {
+                if (to === fromId || to === toId || db.edges.edge(fromId, p, to)?.meta?.src !== 'doc') continue;
+                await db.assertRelation(toId, p, to);
+            }
+            for (const { p, from } of incoming) {
+                if (from === fromId || from === toId || db.edges.edge(from, p, fromId)?.meta?.src !== 'doc') continue;
+                await db.assertRelation(from, p, toId);
+            }
+        }
     }
 
     /**
@@ -1586,7 +1621,7 @@ export class WorkspaceStoredIndex {
      * untouched. A backend that is merely DISABLED keeps its config, so
      * #isConfiguredLocalBackend stays true and its paths are preserved — only a
      * fully-removed backend (config gone) is treated as dead. If a doc loses its
-     * last location, #reconcileRemovedLocations orphans it (feature/orphaned).
+     * last location, #reconcileRemovedLocations applies the configured policy.
      */
     async #purgeDeadBackendLocations() {
         const db = this.#getDb();
@@ -1616,6 +1651,18 @@ export class WorkspaceStoredIndex {
     }
 
     async #upsertDocument(storedFile = {}) {
+        return this.#mutateDocuments(() => this.#upsertDocumentNow(storedFile));
+    }
+
+    #mutateDocuments(operation) {
+        const pending = this.#documentMutations.then(operation);
+        // A failed operation is reported to its caller; it must not prevent
+        // unrelated subsequent events from being indexed.
+        this.#documentMutations = pending.catch(() => {});
+        return pending;
+    }
+
+    async #upsertDocumentNow(storedFile = {}) {
         const checksumArray = this.#buildChecksumArray(storedFile.checksums);
         if (checksumArray.length === 0) return null;
 
@@ -1640,6 +1687,14 @@ export class WorkspaceStoredIndex {
         const currentBackendPaths = existingDocument?.id
             ? await db.listDocumentTreePaths(existingDocument.id, BACKENDS_TREE_NAME).catch(() => [])
             : [];
+
+        const managedRoots = Object.keys(this.#dataBackends || {})
+            .filter((name) => this.#stored.getBackend(name))
+            .map((name) => this.#getBackendRootPath(name)).filter(Boolean);
+        for (const directory of currentBackendPaths) {
+            if (!managedRoots.some((root) => directory === root || directory.startsWith(`${root}/`))
+                && !backendPaths.includes(directory)) backendPaths.push(directory);
+        }
 
         // A warm rescan still validates each file and repairs missing documents
         // and tree paths, but must not re-write identical docs (and re-trigger
@@ -1672,8 +1727,11 @@ export class WorkspaceStoredIndex {
         if (prevChecksum && prevChecksum !== primaryChecksum) {
             const predecessor = await db.getByChecksumString(prevChecksum).catch(() => null);
             if (predecessor?.id && predecessor.id !== docId && typeof db.migrateDocumentMemberships === 'function') {
-                await db.migrateDocumentMemberships(predecessor.id, docId, { excludeTrees: [BACKENDS_TREE_NAME] }).catch((error) =>
-                    this.#logger.warn({ workspaceId: this.#workspaceId, docId, predecessorId: predecessor.id, error: error.message }, 'Placement migration from predecessor failed'));
+                await this.#migrateCuration(predecessor.id, docId);
+                const removed = [`stored://${storedFile.backend}/${storedFile.key}`];
+                const twin = this.#deviceFileLocationUrl(storedFile.backend, storedFile.key);
+                if (twin) removed.push(twin);
+                await this.#reconcileRemovedLocationsNow(predecessor, removed);
             }
         }
         return docId;
@@ -1697,9 +1755,11 @@ export class WorkspaceStoredIndex {
      * object no longer has.
      */
     async #applyLocationChange(payload = {}) {
-        const docId = await this.#upsertDocument(payload);
-        if (docId) return docId;
-        return this.#patchDocumentLocations(payload);
+        return this.#mutateDocuments(async () => {
+            const docId = await this.#upsertDocumentNow(payload);
+            if (docId) return docId;
+            return this.#patchDocumentLocations(payload);
+        });
     }
 
     async #patchDocumentLocations(payload = {}) {
@@ -1710,17 +1770,24 @@ export class WorkspaceStoredIndex {
         const doc = await db.getByChecksumString(checksumArray[0]).catch(() => null);
         if (!doc?.id) return null;
 
-        const locations = this.#buildDocumentLocations(Array.isArray(payload.locations) ? payload.locations : []);
+        const locations = this.#mergeDocumentLocations(doc, Array.isArray(payload.locations) ? payload.locations : []);
         if (locations.length === 0) {
             // Nothing left to point at — hand over to the orphan path so the
             // orphanedAt stamp and retention semantics stay in one place.
-            return this.#reconcileRemovedLocations(doc, (doc.locations || []).map((l) => l.url));
+            return this.#reconcileRemovedLocationsNow(doc, (doc.locations || []).map((l) => l.url));
         }
         await this.#put({ id: doc.id, locations }, { context: null });
         return doc.id;
     }
 
     async #unlinkDocument(storedFile = {}) {
+        // Stored emits the predecessor unlink BEFORE the successor add.
+        // The add migrates memberships and then reconciles the predecessor.
+        if (storedFile.successor) return null;
+        return this.#mutateDocuments(() => this.#unlinkDocumentNow(storedFile));
+    }
+
+    async #unlinkDocumentNow(storedFile = {}) {
         const checksumArray = this.#buildChecksumArray(storedFile.checksums);
         if (checksumArray.length === 0) return null;
         if (!storedFile.backend || !storedFile.key) return null;
@@ -1735,12 +1802,12 @@ export class WorkspaceStoredIndex {
         const removedUrls = [`stored://${storedFile.backend}/${storedFile.key}`];
         const twin = this.#deviceFileLocationUrl(storedFile.backend, storedFile.key);
         if (twin) removedUrls.push(twin);
-        return this.#reconcileRemovedLocations(existingDocument, removedUrls);
+        return this.#reconcileRemovedLocationsNow(existingDocument, removedUrls);
     }
 
     /**
      * Public entry for other services (connector deletion-sync): drop the
-     * given location URLs from a document, with the full orphan-not-delete
+     * given location URLs from a document, with the configured last-location
      * semantics of #reconcileRemovedLocations below.
      */
     async reconcileRemovedLocations(doc, removedUrls = []) {
@@ -1750,21 +1817,33 @@ export class WorkspaceStoredIndex {
     /**
      * A backing blob vanished from one or more locations. Drop those locations;
      * the doc keeps its survivors and unticks only the backends-tree path(s) the
-     * dead locations backed. When NO locations survive the doc is ORPHANED,
-     * never deleted: it keeps its row, checksums and curated placements, gains
-     * empty locations + orphanedAt (which is what the engine ticks
-     * feature/orphaned from), and is
-     * purged only by retention GC or explicit user action (destroy). Orphaning is
-     * what makes a resync bug survivable — promotions are user intent and outrank
-     * backend liveness, and an orphan-with-checksum re-binds if the bytes reappear.
+     * dead locations backed. With no survivors, remove the index row by default.
+     * orphanPolicy:'keep' instead retains curation and marks an orphan for
+     * optional retention GC. Never infer absence from an incomplete scan.
      */
     async #reconcileRemovedLocations(doc, removedUrls = []) {
+        return this.#mutateDocuments(() => this.#reconcileRemovedLocationsNow(doc, removedUrls));
+    }
+
+    async #reconcileRemovedLocationsNow(doc, removedUrls = []) {
         const db = this.#getDb();
+        // Scan snapshots and connector events may carry an older location set.
+        if (typeof db.getDocument === 'function') {
+            doc = await db.getDocument(doc.id);
+            if (!doc) return null;
+        }
         const removed = new Set(removedUrls);
         const remaining = (Array.isArray(doc.locations) ? doc.locations : []).filter((l) => !removed.has(l.url));
+        if (remaining.length === (doc.locations || []).length) return doc.id;
         const currentBackendPaths = await db.listDocumentTreePaths(doc.id, BACKENDS_TREE_NAME).catch(() => []);
 
         if (remaining.length === 0) {
+            const policy = this.#getOrphanPolicy?.() ?? 'remove';
+            if (policy === 'remove') {
+                await db.delete(doc.id);
+                await this.purgeThumbnails([doc]).catch(() => {});
+                return doc.id;
+            }
             await this.#put({
                 id: doc.id,
                 locations: [],
@@ -1794,7 +1873,11 @@ export class WorkspaceStoredIndex {
      * retention never purges (the default). Explicit user cleanup can also just
      * bulk-delete via the feature/orphaned filter.
      */
-    async gcOrphanedDocuments({ retentionDays } = {}) {
+    async gcOrphanedDocuments(options = {}) {
+        return this.#mutateDocuments(() => this.#gcOrphanedDocumentsNow(options));
+    }
+
+    async #gcOrphanedDocumentsNow({ retentionDays } = {}) {
         const db = this.#getDb();
         const days = Number.isFinite(retentionDays)
             ? retentionDays
@@ -1804,7 +1887,9 @@ export class WorkspaceStoredIndex {
         const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
         const orphans = await db.list({ features: { allOf: [ORPHANED_FEATURE] } }).catch(() => []);
         let purged = 0;
-        for (const doc of orphans) {
+        for (let doc of orphans) {
+            if (typeof db.getDocument === 'function') doc = await db.getDocument(doc.id);
+            if (!doc) continue;
             const orphanedAt = doc.orphanedAt ? Date.parse(doc.orphanedAt) : NaN;
             if (!Number.isFinite(orphanedAt) || orphanedAt > cutoff) continue;
             // Belt-and-braces: never GC a doc that somehow regained locations.
@@ -2294,7 +2379,7 @@ export class WorkspaceStoredIndex {
     // anything else is derivable from the URL via `stored`.
     #buildDocument(storedFile = {}, checksumArray = [], backends = [], existingDocument = null, meta = null) {
         const size = Number.isFinite(storedFile.size) ? storedFile.size : existingDocument?.metadata?.size;
-        const locations = this.#buildDocumentLocations(backends);
+        const locations = this.#mergeDocumentLocations(existingDocument, backends);
         // Fall back to a filename-derived mime when `stored` didn't detect one
         // (filesystem-indexed files often have no sniffed mime) — otherwise the
         // File doc defaults to 'application/json' and images never get classified
@@ -2360,6 +2445,21 @@ export class WorkspaceStoredIndex {
         }
 
         return doc;
+    }
+
+    #mergeDocumentLocations(doc, backends) {
+        const next = this.#buildDocumentLocations(backends);
+        const urls = new Set(next.map((l) => l.url));
+        for (const location of doc?.locations || []) {
+            const endpoint = this.#locationEndpoint(location);
+            // Stored's canonical list only describes its enabled backends.
+            // It cannot retract IMAP/web/foreign-device or disabled locations.
+            if ((!endpoint || !this.#stored.getBackend(endpoint.backend)) && !urls.has(location.url)) {
+                next.push(location);
+                urls.add(location.url);
+            }
+        }
+        return next;
     }
 
     #buildDocumentLocations(backends = []) {

@@ -1,7 +1,7 @@
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
-import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
+import { requireWorkspaceRead, requireWorkspaceWrite, requireWorkspaceAdmin } from '../../middleware/workspace-acl.js';
 
 // Sync conflicts (device mirrors): list what is waiting in the inbox and
 // resolve entries. Creation happens through PUT objects/* with
@@ -16,6 +16,31 @@ export default async function workspaceSyncRoutes(fastify) {
         if (statusCode >= 500) request.log.error(error);
         return send(reply, new ResponseObject().error(error?.message || 'Internal error', null, statusCode), error?.code || undefined);
     };
+
+    // Workspace-wide index lifecycle, shared by mirrors, backend watchers and
+    // completed scans. This does not delete other backend copies.
+    fastify.get('/settings', {
+        onRequest: [fastify.authenticate, requireWorkspaceRead()],
+    }, async (request, reply) => {
+        return send(reply, new ResponseObject().found(request.workspace.databaseSettings, 'OK'));
+    });
+
+    fastify.patch('/settings', {
+        onRequest: [fastify.authenticate, requireWorkspaceAdmin()],
+        schema: {
+            body: {
+                type: 'object', minProperties: 1, additionalProperties: false,
+                properties: {
+                    orphanPolicy: { type: 'string', enum: ['remove', 'keep'] },
+                    orphanRetentionDays: { type: 'integer', minimum: -1 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            return send(reply, new ResponseObject().updated(request.workspace.setDatabaseSettings(request.body), 'Sync settings updated'));
+        } catch (error) { return fail(request, reply, error); }
+    });
 
     fastify.get('/conflicts', {
         onRequest: [fastify.authenticate, requireWorkspaceRead()],
