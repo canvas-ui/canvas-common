@@ -3629,6 +3629,14 @@ class Workspace extends EventEmitter {
         return result;
     }
 
+    async discardBackendTrash(driver, address, ids) {
+        if (driver !== 'file') throw Object.assign(new Error('Backend Trash is supported by file backends'), { statusCode: 400 });
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        const result = await this.#storedIndex.discardTrash(address, ids);
+        this.emit('backend.tree.changed', { workspaceId: this.id, treeName: Workspace.BACKENDS_TREE_NAME, backend: address });
+        return result;
+    }
+
     getBackendTrashTree() {
         const node = (name, label, metadata, children = []) => ({
             id: `backend-trash:${name}`, name, label, type: 'directory', description: 'Deleted backend files and folders',

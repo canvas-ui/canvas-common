@@ -262,6 +262,19 @@ async function readRoutes(fastify) {
         } catch (error) { return sendError(request, reply, error); }
     });
 
+    fastify.post('/:driver/:address/trash/discard', {
+        onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+        schema: { body: { type: 'object', required: ['ids'], additionalProperties: false, properties: {
+            ids: { type: 'array', minItems: 1, maxItems: 200, uniqueItems: true,
+                items: { type: 'string', pattern: '^[a-f0-9-]{36,64}$' } },
+        } } },
+    }, async (request, reply) => {
+        try {
+            const result = await request.workspace.discardBackendTrash(drv(request.params.driver), arg(request.params.address), request.body.ids);
+            return send(reply, new ResponseObject().success(result, 'Trash deletion completed'));
+        } catch (error) { return sendError(request, reply, error); }
+    });
+
     fastify.post('/:driver/:address/retained/:sha256/restore', {
         onRequest: [fastify.authenticate, requireWorkspaceWrite()],
         schema: {

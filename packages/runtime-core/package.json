@@ -1,6 +1,6 @@
 {
   "name": "@augmentd-labs/canvas-runtime-core",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Shared Canvas workspace, context, Pi agent and resource API implementation",
   "type": "module",
   "license": "AGPL-3.0-or-later",

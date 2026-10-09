@@ -712,6 +712,26 @@ export class WorkspaceStoredIndex {
         return { results };
     }
 
+    async discardTrash(backendName, ids) {
+        this.#objectsBackend(backendName, { write: true });
+        if (typeof this.#stored.discardTrash !== 'function') throw objectsError('Upgrade canvas-stored for permanent Trash deletion', 'NOT_IMPLEMENTED', 501);
+        const results = [];
+        for (const id of [...new Set(ids)]) {
+            try {
+                const item = await this.#stored.getTrashItem(backendName, id);
+                if (!item) { results.push({ id, ok: false, reason: 'not-found' }); continue; }
+                // Same lock order as Restore; never resolve or mutate the live
+                // original path, which may now contain a different file.
+                results.push(await this.withKeyLock(backendName, item.key, async () => {
+                    const release = await this.#acquireBackendNamespace(backendName);
+                    try { return await this.#stored.discardTrash(backendName, id); }
+                    finally { release(); }
+                }));
+            } catch (error) { results.push({ id, ok: false, reason: 'discard-failed', message: error.message }); }
+        }
+        return { results };
+    }
+
     /** Rename within one backend: same bytes, same document, new key. */
     async renameObject(backendName, from, to, options = {}) {
         const { backend, root } = this.#objectsBackend(backendName, { write: true });
