@@ -680,6 +680,38 @@ export class WorkspaceStoredIndex {
 
     get retention() { return this.#stored?.retention ?? null; }
 
+    async listTrash(backendName, options = {}) {
+        this.#objectsBackend(backendName);
+        if (typeof this.#stored.listTrash !== 'function') throw objectsError('Upgrade canvas-stored for backend Trash', 'NOT_IMPLEMENTED', 501);
+        return this.#stored.listTrash(backendName, options);
+    }
+
+    async restoreTrash(backendName, ids, options = {}) {
+        const { backend, root } = this.#objectsBackend(backendName, { write: true });
+        if (typeof this.#stored.restoreTrash !== 'function') throw objectsError('Upgrade canvas-stored for backend Trash', 'NOT_IMPLEMENTED', 501);
+        const results = [];
+        let restoredDirectory = false;
+        for (const id of [...new Set(ids)]) {
+            try {
+                const item = await this.#stored.getTrashItem(backendName, id);
+                if (!item) { results.push({ id, ok: false, reason: 'not-found' }); continue; }
+                const key = this.#objectKey(backend, root, item.key);
+                const result = await this.withKeyLock(backendName, key, async () => {
+                    const release = await this.#acquireBackendNamespace(backendName);
+                    try { return await this.#stored.restoreTrash(backendName, id, options); }
+                    finally { release(); }
+                });
+                restoredDirectory ||= result.ok && result.type === 'directory';
+                results.push(result);
+            } catch (error) { results.push({ id, ok: false, reason: 'restore-failed', message: error.message }); }
+        }
+        // Folder trash is one native rename; catch up the index after the
+        // complete batch, including empty folders and files added off-index.
+        if (restoredDirectory) await this.resync(backendName);
+        await this.#documentMutations;
+        return { results };
+    }
+
     /** Rename within one backend: same bytes, same document, new key. */
     async renameObject(backendName, from, to, options = {}) {
         const { backend, root } = this.#objectsBackend(backendName, { write: true });
@@ -899,7 +931,18 @@ export class WorkspaceStoredIndex {
     }
 
     async deleteBackendContainer(backendName, key) {
-        return this.#mutableFileBackend(backendName).deleteContainer(key);
+        const backend = this.#mutableFileBackend(backendName);
+        const root = this.#objectsBackend(backendName, { write: true }).root;
+        const normalized = this.#objectKey(backend, root, key);
+        if (typeof this.#stored.trashDirectory !== 'function') throw objectsError('Upgrade canvas-stored for recoverable folder deletion', 'NOT_IMPLEMENTED', 501);
+        return this.withKeyLock(backendName, normalized, async () => {
+            const release = await this.#acquireBackendNamespace(backendName);
+            try {
+                const result = await this.#stored.trashDirectory(backendName, normalized);
+                await this.#documentMutations;
+                return result;
+            } finally { release(); }
+        });
     }
 
     async renameBackendContainer(backendName, fromKey, toKey) {

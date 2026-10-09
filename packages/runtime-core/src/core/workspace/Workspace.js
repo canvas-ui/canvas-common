@@ -3615,6 +3615,30 @@ class Workspace extends EventEmitter {
         return { retention: this.#storedIndex.retention, retained: this.#storedIndex.listRetained(address, options) };
     }
 
+    async listBackendTrash(driver, address, options = {}) {
+        if (driver !== 'file') throw Object.assign(new Error('Backend Trash is supported by file backends'), { statusCode: 400 });
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        return this.#storedIndex.listTrash(address, options);
+    }
+
+    async restoreBackendTrash(driver, address, ids, options = {}) {
+        if (driver !== 'file') throw Object.assign(new Error('Backend Trash is supported by file backends'), { statusCode: 400 });
+        if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
+        const result = await this.#storedIndex.restoreTrash(address, ids, options);
+        this.emit('backend.tree.changed', { workspaceId: this.id, treeName: Workspace.BACKENDS_TREE_NAME, backend: address });
+        return result;
+    }
+
+    getBackendTrashTree() {
+        const node = (name, label, metadata, children = []) => ({
+            id: `backend-trash:${name}`, name, label, type: 'directory', description: 'Deleted backend files and folders',
+            color: null, locked: true, metadata: { backendTrash: true, ...metadata }, children,
+        });
+        return node('Trash', 'Trash', {}, this.#listStorageBackends()
+            .filter(b => b.driver === 'file' && b.enabled !== false)
+            .map(b => node(encodeURIComponent(b.address), b.label || b.address, { driver: b.driver, address: b.address })));
+    }
+
     async restoreBackendRetained(driver, address, sha256, options = {}) {
         this.#assertObjectsDriver(driver, address);
         if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
@@ -4168,8 +4192,8 @@ class Workspace extends EventEmitter {
         if (driver !== 'file') throw new Error(`Driver "${driver}" has no mutable folders`);
         const key = this.#backendFolderKey(name);
         const tree = await this.#directoryTreeForBackends();
-        // rm -rf on disk removes the files → the watcher drops their docs; the
-        // structural tree node is removed here (it survives empty otherwise).
+        // Stored moves the complete directory into recoverable backend Trash
+        // and drops indexed locations, including when the watcher is disabled.
         await this.#storedIndex.deleteBackendContainer(address, key);
         const root = this.#storedIndex.getBackendTreeRoot(address);
         if (root) await tree.removePath(`${root}/${key}`, true).catch(() => {});

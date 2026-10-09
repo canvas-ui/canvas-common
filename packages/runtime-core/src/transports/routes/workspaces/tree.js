@@ -310,7 +310,11 @@ export default async function workspaceTreeRoutes(fastify) {
     try {
       const resolved = await getTreeInstance(request, reply);
       if (!resolved) return;
-      const responseObject = new ResponseObject().found(resolved.tree.buildJsonTree(), 'Workspace tree retrieved successfully');
+      const treeView = resolved.tree.buildJsonTree();
+      if (isBackendsTree(resolved.workspace, resolved.tree) && typeof resolved.workspace.getBackendTrashTree === 'function') {
+        treeView.children = [...(treeView.children || []), resolved.workspace.getBackendTrashTree()];
+      }
+      const responseObject = new ResponseObject().found(treeView, 'Workspace tree retrieved successfully');
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     } catch (error) {
       fastify.log.error(`Get workspace tree error for ID ${request.params.id}: ${error.message}`);

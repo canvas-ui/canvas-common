@@ -235,6 +235,33 @@ async function readRoutes(fastify) {
         } catch (error) { return sendError(request, reply, error); }
     });
 
+    fastify.get('/:driver/:address/trash', {
+        onRequest: [fastify.authenticate, requireWorkspaceRead()],
+    }, async (request, reply) => {
+        try {
+            const page = await request.workspace.listBackendTrash(drv(request.params.driver), arg(request.params.address), {
+                cursor: shortString(request.query?.cursor, 128) || null,
+                limit: clampLimit(request.query?.limit, 200, 1000),
+            });
+            return send(reply, new ResponseObject().found(page, 'OK', 200, page.items.length));
+        } catch (error) { return sendError(request, reply, error); }
+    });
+
+    fastify.post('/:driver/:address/trash/restore', {
+        onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+        schema: { body: { type: 'object', required: ['ids'], additionalProperties: false, properties: {
+            ids: { type: 'array', minItems: 1, maxItems: 200, uniqueItems: true,
+                items: { type: 'string', pattern: '^[a-f0-9-]{36,64}$' } },
+        } } },
+    }, async (request, reply) => {
+        try {
+            const result = await request.workspace.restoreBackendTrash(drv(request.params.driver), arg(request.params.address), request.body.ids, {
+                origin: shortString(request.headers['x-canvas-origin'], 128),
+            });
+            return send(reply, new ResponseObject().success(result, 'Trash restore completed'));
+        } catch (error) { return sendError(request, reply, error); }
+    });
+
     fastify.post('/:driver/:address/retained/:sha256/restore', {
         onRequest: [fastify.authenticate, requireWorkspaceWrite()],
         schema: {
