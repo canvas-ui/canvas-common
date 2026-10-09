@@ -1,6 +1,7 @@
 'use strict';
 
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import fs from 'fs/promises';
 import { createReadStream } from 'fs';
@@ -123,6 +124,8 @@ export class WorkspaceStoredIndex {
     // (skeleton mirroring — docs create their paths themselves), and observe
     // resync lifecycle/progress (Workspace re-emits it as a ws event).
     #insertBackendPath;
+    #moveBackendPath;
+    #backendNamespaces = new Map();
     // Empty-folder hygiene for the backends tree: `(treePath) => removed` walks
     // up from a folder a file just left; `(rootPath, keepDirs) => removed`
     // sweeps a whole mirror after a resync (keepDirs = what is on disk).
@@ -156,7 +159,7 @@ export class WorkspaceStoredIndex {
     // learns the document id behind the bytes it just landed.
     #inflightUpserts = new Map();
 
-    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, getOrphanPolicy = null, onBackendChanged = null }) {
+    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, moveBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, getOrphanPolicy = null, onBackendChanged = null }) {
         if (!dataPath || !homePath) throw new Error('dataPath and homePath are required');
         if (!put || !unlink || !getBackendsTreeSelector || !getDb) throw new Error('put, unlink, getBackendsTreeSelector, getDb are required');
 
@@ -182,6 +185,7 @@ export class WorkspaceStoredIndex {
         this.#lockBackendNode = lockBackendNode;
         this.#unlockBackendNode = unlockBackendNode;
         this.#insertBackendPath = insertBackendPath;
+        this.#moveBackendPath = moveBackendPath;
         this.#pruneBackendPath = pruneBackendPath;
         this.#sweepBackendPaths = sweepBackendPaths;
         this.#onResyncStateChange = onResyncStateChange;
@@ -686,7 +690,33 @@ export class WorkspaceStoredIndex {
                 if (typeof this.#stored.renameDirectory !== 'function') {
                     throw objectsError('Directory rename requires an updated canvas-stored', 'NOT_IMPLEMENTED', 501);
                 }
-                return this.#stored.renameDirectory(backendName, fromKey, toKey, options);
+                const release = await this.#acquireBackendNamespace(backendName);
+                try {
+                    let projections = [];
+                    // Hold document projection while Stored emits its per-content
+                    // move events. Move the directory node once before those events
+                    // refresh location URLs, preserving node ids and memberships.
+                    const result = await this.#mutateDocuments(async () => {
+                        const root = this.#getBackendRootPath(backendName);
+                        if (root && this.#moveBackendPath) await this.#moveBackendPath(`${root}/${fromKey}`, `${root}/${toKey}`, { validateOnly: true });
+                        const moved = await this.#stored.renameDirectory(backendName, fromKey, toKey, options);
+                        projections = [...this.#inflightUpserts]
+                            .filter(([key]) => key.startsWith(`${backendName}:${toKey}/`))
+                            .map(([, pending]) => pending);
+                        // A replayed receipt must not move a newly recreated
+                        // source's tree node. The completed move leaves no source.
+                        const sourceExists = moved?.ok && await fs.lstat(backend.resolveKeyPath(fromKey))
+                            .then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+                        if (moved?.ok && !sourceExists && this.#moveBackendPath) {
+                            if (root) await this.#moveBackendPath(`${root}/${fromKey}`, `${root}/${toKey}`);
+                        }
+                        return moved;
+                    });
+                    // Observe the actual event promises: the queue's tail catches
+                    // errors to keep running, but an API move must report them.
+                    await Promise.all(projections);
+                    return result;
+                } finally { release(); }
             }
             const pre = await this.#resolveVersionPrecondition(backendName, fromKey, options);
             if (pre.failure) return pre.failure;
@@ -821,6 +851,7 @@ export class WorkspaceStoredIndex {
     async stop() {
         for (const name of this.#resyncing) this.#resyncCancels.add(name);
         await Promise.allSettled([...this.#backgroundResyncs]);
+        await Promise.all([...this.#backendNamespaces.values()]);
         for (const timer of this.#prunePending.values()) clearTimeout(timer);
         this.#prunePending.clear();
         this.#unbindEvents();
@@ -872,7 +903,27 @@ export class WorkspaceStoredIndex {
     }
 
     async renameBackendContainer(backendName, fromKey, toKey) {
-        return this.#mutableFileBackend(backendName).renameContainer(fromKey, toKey);
+        this.#mutableFileBackend(backendName);
+        const result = await this.renameObject(backendName, fromKey, toKey, { directory: true, operationId: randomUUID() });
+        if (!result?.ok) {
+            const status = { 'not-found': 404, 'target-exists': 409, 'read-only-target': 403, 'invalid-key': 400 }[result?.reason] || 409;
+            throw objectsError(`Folder move refused: ${result?.reason || 'unknown error'}`, result?.reason || 'MOVE_FAILED', status);
+        }
+        return result;
+    }
+
+    // A rescan's absence decisions and a directory move must observe the same
+    // namespace. Reserve the slot synchronously, including queued operations.
+    async #acquireBackendNamespace(backendName) {
+        const prior = this.#backendNamespaces.get(backendName) || Promise.resolve();
+        let release;
+        const current = new Promise(resolve => { release = resolve; });
+        this.#backendNamespaces.set(backendName, current);
+        await prior;
+        return () => {
+            if (this.#backendNamespaces.get(backendName) === current) this.#backendNamespaces.delete(backendName);
+            release();
+        };
     }
 
     /**
@@ -925,6 +976,7 @@ export class WorkspaceStoredIndex {
             progress: { scanned: 0, total: null },
         });
 
+        const releaseNamespace = await this.#acquireBackendNamespace(backendName);
         try {
             // Liveness gate: an absent mountpoint or a different filesystem at
             // the root scans as "empty", which a differ would read as "all
@@ -992,8 +1044,11 @@ export class WorkspaceStoredIndex {
             let scanResult;
             try {
                 scanResult = await this.#stored.scan(backendName, { onFile: consume });
+                if (scanResult?.ok === false || !Array.isArray(scanResult?.files)) {
+                    throw new Error(`Backend scan did not return a usable snapshot: ${scanResult?.reason || 'missing files'}`);
+                }
                 // Backends whose scan() does not stream still get their rows here.
-                for (const file of scanResult.files || []) await consume(file);
+                for (const file of scanResult.files) await consume(file);
             } catch (error) {
                 if (error?.code !== 'RESYNC_CANCELLED') throw error;
                 // Cancelled: the snapshot is partial, so NOTHING may be
@@ -1004,7 +1059,7 @@ export class WorkspaceStoredIndex {
                 this.#patchResyncState(backendName, { lastError: null, cancelledAt: new Date().toISOString() });
                 return { backend: backendName, cancelled: true, scanned };
             }
-            const { files = [] } = scanResult;
+            const { files } = scanResult;
             const scanErrors = scanResult.errors?.[backendName] || null;
 
             // Reconcile absences only against a usable snapshot: a dead root
@@ -1013,6 +1068,10 @@ export class WorkspaceStoredIndex {
             if (scanErrors?.root) {
                 this.#patchResyncState(backendName, { offline: true, lastError: `mount unavailable (${scanErrors.root})` });
                 return { backend: backendName, ok: false, offline: true, reason: scanErrors.root };
+            }
+            if (scanResult.complete === false) {
+                this.#patchResyncState(backendName, { lastError: 'Scan incomplete; absence reconciliation skipped' });
+                return { backend: backendName, ok: false, complete: false, count: files.length, failed, orphaned: 0 };
             }
             const orphaned = await this.#purgeOrphanedPaths(backendName, files, scanErrors);
             // Global stale-local-path cleanup: drop locations whose backend was
@@ -1053,6 +1112,7 @@ export class WorkspaceStoredIndex {
 
             return { backend: backendName, count: files.length, failed, orphaned };
         } finally {
+            releaseNamespace();
             this.#resyncing.delete(backendName);
             this.#resyncCancels.delete(backendName);
             this.#patchResyncState(backendName, { resyncing: false });

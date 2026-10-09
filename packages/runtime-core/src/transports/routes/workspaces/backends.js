@@ -20,10 +20,12 @@ export default async function workspaceBackendRoutes(fastify) {
     };
     const fail = (request, reply, error) => {
         request.log.error(error);
-        const response = new ResponseObject().error(error.message);
+        const response = new ResponseObject().error(error.message, null, error.statusCode || 500);
         return reply.code(response.statusCode).send(response.getResponse());
     };
-    const arg = (v) => decodeURIComponent(String(v || ''));
+    // Fastify has already decoded path parameters; a second decode corrupts
+    // literal percent sequences in folder names and addresses.
+    const arg = (v) => String(v || '');
     // 'fs' is a UX alias for the local-folder driver; canonical name is 'file'.
     const drv = (v) => { const d = arg(v); return d === 'fs' ? 'file' : d; };
 

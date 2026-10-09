@@ -1,9 +1,10 @@
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import { requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
 
-// The dedicated backends tree mirrors backend storage 1:1 — generic tree-path
-// writes don't belong there (backend container ops go through /:id/backends).
+// The dedicated backends tree mirrors backend storage 1:1. Folder moves must
+// go through storage; purely structural writes cannot create backend folders.
 function isBackendsTree(workspace, tree) {
   if (!tree || tree.type !== 'directory') { return false; }
   try { return workspace.getBackendsTree()?.id === tree.id; }
@@ -429,9 +430,19 @@ export default async function workspaceTreeRoutes(fastify) {
       if (body.to || body.name) {
         const targetPath = body.to || `${path.split('/').slice(0, -1).join('/') || '/'}/${body.name}`;
         const targetTree = resolveTargetTree(resolved.workspace, resolved.tree, body.targetTreeNameOrTreeId);
-        const result = targetTree.id === resolved.tree.id
-          ? await moveTreePath(resolved.tree, path, targetPath, body.recursive, { mergeDown: body.mergeDown })
-          : await copyAcrossTrees(resolved.workspace, resolved.tree, targetTree, path, targetPath, body.recursive, true);
+        let result;
+        if (targetTree.id === resolved.tree.id && isBackendsTree(resolved.workspace, resolved.tree)) {
+          await requireWorkspaceWrite()(request, reply);
+          if (reply.sent) return;
+          // A name is an exact sibling rename; only drag/drop `to` treats an
+          // existing directory as the destination parent.
+          const destination = body.to ? resolveDirectoryTargetPath(resolved.tree, path, targetPath) : { finalPath: targetPath };
+          result = destination.error ? destination : await resolved.workspace.moveBackendsTreePath(path, destination.finalPath);
+        } else {
+          result = targetTree.id === resolved.tree.id
+            ? await moveTreePath(resolved.tree, path, targetPath, body.recursive, { mergeDown: body.mergeDown })
+            : await copyAcrossTrees(resolved.workspace, resolved.tree, targetTree, path, targetPath, body.recursive, true);
+        }
         const responseObject = result?.error
           ? new ResponseObject().badRequest(result.error)
           : new ResponseObject().success(result, 'Tree path moved successfully');
@@ -458,7 +469,7 @@ export default async function workspaceTreeRoutes(fastify) {
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     } catch (error) {
       fastify.log.error(`Update workspace path error for ID ${request.params.id}: ${error.message}`);
-      const responseObject = new ResponseObject().serverError(error.message || 'Failed to update path');
+      const responseObject = new ResponseObject().error(error.message || 'Failed to update path', null, error.statusCode || 500);
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     }
   };
@@ -491,6 +502,10 @@ export default async function workspaceTreeRoutes(fastify) {
           ? new ResponseObject().badRequest(result.error)
           : new ResponseObject().success(result, 'Tree path copied successfully');
         return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      }
+      if (isBackendsTree(resolved.workspace, resolved.tree)) {
+        const response = new ResponseObject().badRequest('Backend folders must be copied through storage; metadata-only copies are not supported');
+        return reply.code(response.statusCode).send(response.getResponse());
       }
       if (resolved.tree.type !== 'context') {
         const r = resolveDirectoryTargetPath(resolved.tree, fromPath, toPath);

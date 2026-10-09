@@ -4179,22 +4179,41 @@ class Workspace extends EventEmitter {
     async renameBackendFolder(driver, address, fromName, toName) {
         if (driver !== 'file') throw new Error(`Driver "${driver}" has no mutable folders`);
         const fromKey = this.#backendFolderKey(fromName);
+        const wanted = this.#backendFolderKey(toName);
+        // UI rename sends a leaf name. An explicit path is backend-relative;
+        // callers moving to the root can use moveBackendFolder directly.
+        const toKey = String(toName).includes('/') ? wanted : path.posix.join(path.posix.dirname(fromKey), wanted);
+        return this.moveBackendFolder(driver, address, fromKey, toKey);
+    }
+
+    async moveBackendFolder(driver, address, fromName, toName) {
+        if (driver !== 'file') throw new Error(`Driver "${driver}" has no mutable folders`);
+        const fromKey = this.#backendFolderKey(fromName);
         const toKey = this.#backendFolderKey(toName);
-        const tree = await this.#directoryTreeForBackends();
-        // fs move relocates the bytes; the watcher re-files contained docs under
-        // the new path (checksum-deduped). movePath keeps the structural node in
-        // sync immediately (and carries empty folders the watcher can't see).
+        await this.#directoryTreeForBackends();
         await this.#storedIndex.renameBackendContainer(address, fromKey, toKey);
-        const root = this.#storedIndex.getBackendTreeRoot(address);
-        if (root) {
-            // movePath asserts mutability with no ignoreLocks escape under the
-            // locked backends-tree root, so mirror the move as remove-old +
-            // insert-new (same pattern as create/delete). The watcher re-files
-            // the contained docs under the new path.
-            await tree.removePath(`${root}/${fromKey}`, true).catch(() => {});
-            await tree.insertPath(`${root}/${toKey}`, { ignoreLocks: true });
-        }
         return { driver, address, from: fromKey, to: toKey };
+    }
+
+    // The backends tree is a projection of storage. Its drag/drop operation
+    // must move bytes through Stored, never mutate directory metadata alone.
+    async moveBackendsTreePath(fromPath, toPath) {
+        await this.#directoryTreeForBackends();
+        const locate = (value) => {
+            const normalized = `/${String(value).split('/').filter(Boolean).join('/')}`;
+            const roots = Object.entries(this.dataBackends).map(([address, config]) => ({
+                address, driver: config.driver, root: this.#storedIndex.getBackendTreeRoot(address),
+            })).filter(b => b.root).sort((a, b) => b.root.length - a.root.length);
+            const backend = roots.find(b => normalized === b.root || normalized.startsWith(`${b.root}/`));
+            return backend ? { ...backend, key: normalized.slice(backend.root.length + 1) } : null;
+        };
+        const from = locate(fromPath);
+        const to = locate(toPath);
+        if (!from?.key || !to?.key || from.driver !== 'file' || to.driver !== 'file' || from.address !== to.address) {
+            throw Object.assign(new Error('Folder moves require two paths within the same writable file backend; backend roots cannot be moved'), { statusCode: 400 });
+        }
+        const moved = await this.moveBackendFolder('file', from.address, from.key, to.key);
+        return { data: { ...moved, pathFrom: fromPath, pathTo: toPath }, count: 1, error: null };
     }
 
     // Pre-create folder discovery — probe a connector with candidate creds
@@ -4262,6 +4281,13 @@ class Workspace extends EventEmitter {
             // Skeleton mirroring: bare directory nodes under the backend's
             // mirror root (documents insert their own paths as they stream in).
             insertBackendPath: (treePath) => this.getBackendsTree().insertPath(treePath, { ignoreLocks: true }),
+            moveBackendPath: async (from, to, { validateOnly = false } = {}) => {
+                const tree = this.getBackendsTree();
+                if (!tree.supportsStorageMoves) throw Object.assign(new Error('Folder moves require canvas-synapsd 3.23.5 or newer'), { statusCode: 503 });
+                if (validateOnly) return;
+                if (tree.pathExists(from)) await tree.movePath(from, to, true, { ignoreLocks: true });
+                else if (!tree.pathExists(to)) await tree.insertPath(to, { ignoreLocks: true });
+            },
             pruneBackendPath: (treePath) => this.pruneEmptyBackendPaths(treePath),
             sweepBackendPaths: (rootPath, keepDirs) => this.sweepEmptyBackendPaths(rootPath, keepDirs),
             // Resync lifecycle/progress → ws clients (tree spinner, settings).
