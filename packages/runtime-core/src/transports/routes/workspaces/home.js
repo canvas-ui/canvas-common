@@ -199,6 +199,46 @@ export default async function homeRoutes(fastify) {
   // ─────────────────────────────────────────────────────────────────────────
   // Delete
   // ─────────────────────────────────────────────────────────────────────────
+  // Mirrors can expose a directory before its children have downloaded.
+  // Keep POSIX rmdir separate from the recursive DELETE route: older hubs
+  // must reject an unsupported operation rather than erase unseen contents.
+  fastify.post('/rmdir', {
+    onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+    schema: {
+      body: {
+        type: 'object', required: ['path'], additionalProperties: false,
+        properties: { path: { type: 'string', minLength: 1 } },
+      },
+    },
+  }, async (request, reply) => {
+    const dirPath = request.body.path;
+    const abs = resolveSafe(request.workspace, dirPath);
+    if (!abs || abs === path.resolve(request.workspace.homePath)) {
+      return reply.code(403).send(new ResponseObject().forbidden('Invalid directory path').getResponse());
+    }
+    try {
+      // Reject symlink ancestors as well as a symlink at the requested name.
+      let current = request.workspace.homePath;
+      for (const segment of path.relative(current, abs).split(path.sep)) {
+        current = path.join(current, segment);
+        if ((await fs.lstat(current)).isSymbolicLink()) {
+          return reply.code(403).send(new ResponseObject().forbidden('Symlink directory path').getResponse());
+        }
+      }
+      // One atomic empty-directory check/removal; never readdir + recursive rm.
+      await fs.rmdir(abs);
+    } catch (error) {
+      if (error.code === 'ENOTEMPTY' || error.code === 'EEXIST') {
+        return reply.code(409).send(new ResponseObject().error('Directory is not empty', null, 409).getResponse());
+      }
+      if (error.code === 'ENOTDIR') {
+        return reply.code(409).send(new ResponseObject().error('Path is not a directory', null, 409).getResponse());
+      }
+      if (error.code !== 'ENOENT') throw error;
+      // Missing is an idempotent success. A 404 means the hub lacks this route.
+    }
+    return reply.send(new ResponseObject().success(true, 'Directory removed').getResponse());
+  });
 
   fastify.delete('/*', {
     onRequest: [fastify.authenticate, requireWorkspaceWrite()],
