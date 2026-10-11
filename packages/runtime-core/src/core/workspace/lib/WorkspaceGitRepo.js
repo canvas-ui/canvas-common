@@ -27,47 +27,45 @@ function spawnPromise(command, args, options = {}) {
 
 /**
  * Smart HTTP and hook commits for a checked-out workspace repository.
- * `barePath` is retained as the API name for its Git metadata directory (.git).
  * Git's updateInstead receive policy updates the work tree only when clean.
  */
 export class WorkspaceGitRepo {
-    #barePath;
     #gitDir;
+    #repoPath;
     #logger;
 
-    constructor({ barePath, gitDir, logger } = {}) {
-        if (!barePath || !gitDir) throw new Error('barePath and gitDir are required');
-        this.#barePath = barePath;
-        this.#gitDir = gitDir;
+    constructor({ repoPath, logger } = {}) {
+        if (!repoPath) throw new Error('repoPath is required');
+        this.#repoPath = repoPath;
+        this.#gitDir = path.join(repoPath, '.git');
         this.#logger = logger || defaultLogger;
     }
 
-    get barePath() { return this.#barePath; }
     get gitDir() { return this.#gitDir; }
 
     exists() {
-        return existsSync(this.#barePath);
+        return existsSync(this.#gitDir);
     }
 
-    // True once the bare repo carries at least one ref (i.e. has been seeded).
+    // True once the repo carries at least one ref (i.e. has been seeded).
     async hasCommits() {
         try {
-            const { stdout } = await spawnPromise('git', ['show-ref'], { cwd: this.#barePath });
+            const { stdout } = await spawnPromise('git', ['show-ref'], { cwd: this.#gitDir });
             return Boolean(stdout?.trim());
         } catch {
             return false;
         }
     }
 
-    async initBare() {
-        if (existsSync(this.#barePath)) return { created: false };
-        await fsPromises.mkdir(this.#gitDir, { recursive: true });
-        await spawnPromise('git', ['init', '--initial-branch=main'], { cwd: this.#gitDir });
-        await spawnPromise('git', ['config', 'receive.denyCurrentBranch', 'updateInstead'], { cwd: this.#gitDir });
+    async init() {
+        if (existsSync(this.#gitDir)) return { created: false };
+        await fsPromises.mkdir(this.#repoPath, { recursive: true });
+        await spawnPromise('git', ['init', '--initial-branch=main'], { cwd: this.#repoPath });
+        await spawnPromise('git', ['config', 'receive.denyCurrentBranch', 'updateInstead'], { cwd: this.#repoPath });
         return { created: true };
     }
 
-    // Commit an already-populated work directory and push it to the bare repo as
+    // Commit an already-populated work directory and push it to the repository as
     // the initial `main`. The caller owns what goes into `workDir`.
     async pushSeed(workDir, message) {
         await spawnPromise('git', ['init', '--initial-branch=main'], { cwd: workDir });
@@ -75,33 +73,14 @@ export class WorkspaceGitRepo {
         await spawnPromise('git', ['config', 'user.name', 'canvas-server'], { cwd: workDir });
         await spawnPromise('git', ['config', 'user.email', 'noreply@canvas.local'], { cwd: workDir });
         await spawnPromise('git', ['commit', '-m', message], { cwd: workDir });
-        await spawnPromise('git', ['remote', 'add', 'origin', this.#barePath], { cwd: workDir });
+        await spawnPromise('git', ['remote', 'add', 'origin', this.#gitDir], { cwd: workDir });
         await spawnPromise('git', ['push', '-u', 'origin', 'main'], { cwd: workDir });
     }
 
-    // Check out the given pathspecs from bare HEAD into the work tree. Each spec
-    // is deployed independently so a repo missing one (older repos predate
-    // scripts/) still deploys the others.
-    async deploy(pathspecs = ['hooks/', 'scripts/']) {
-        if (!existsSync(this.#barePath)) return;
-        // A standard work tree is updated atomically by receive-pack (updateInstead).
-        if (path.basename(this.#barePath) === '.git') return;
-        await fsPromises.mkdir(this.#gitDir, { recursive: true });
-        for (const pathspec of pathspecs) {
-            try {
-                await spawnPromise('git', [...this.#repoArgs(), 'checkout', '-f', 'main', '--', pathspec]);
-            } catch (err) {
-                this.#logger.debug(`Deploy of ${pathspec} skipped: ${err.message}`);
-            }
-        }
-    }
-
-    // Stage the work-tree state of `pathspec` on top of bare HEAD and commit it.
-    // Used to persist edits made directly in the work tree (e.g. webui hook
-    // edits) back into the bare repo so they survive the next deploy and reach
-    // clients on clone. No-op when the repo does not exist.
+    // Commit hook/script edits made in the work tree so clones receive them.
+    // No-op when the repo does not exist.
     async commitWorkTree(pathspec, message) {
-        if (!existsSync(this.#barePath)) return { success: false, skipped: true };
+        if (!existsSync(this.#gitDir)) return { success: false, skipped: true };
 
         const pathspecs = Array.isArray(pathspec) ? pathspec : [pathspec];
         const repoArgs = this.#repoArgs();
@@ -136,10 +115,9 @@ export class WorkspaceGitRepo {
     }
 
     // ── Smart-HTTP backend ──────────────────────────────────────────────────
-    // Dispatch a git smart-HTTP request. `onReceivePack` runs after a successful
-    // push so callers can redeploy hooks/scripts.
-    async serveHttp(service, request, reply, { onReceivePack } = {}) {
-        if (!existsSync(this.#barePath)) {
+    // Dispatch a Git smart-HTTP request; receive-pack updates the checkout.
+    async serveHttp(service, request, reply) {
+        if (!existsSync(this.#gitDir)) {
             // Typed so the transport can answer 404 with something actionable:
             // an uninitialized repo is a normal state (nobody has run init on
             // this workspace yet), not a server fault.
@@ -153,14 +131,14 @@ export class WorkspaceGitRepo {
             case 'git-upload-pack':
                 return this.#handleUploadPack(request, reply);
             case 'git-receive-pack':
-                return this.#handleReceivePack(request, reply, onReceivePack);
+                return this.#streamPack('receive-pack', request, reply);
             default:
                 throw new Error(`Unsupported Git service: ${service}`);
         }
     }
 
     #repoArgs() {
-        return [`--git-dir=${this.#barePath}`, `--work-tree=${this.#gitDir}`];
+        return [`--git-dir=${this.#gitDir}`, `--work-tree=${this.#repoPath}`];
     }
 
     #childEnv(request, extra = {}) {
@@ -180,7 +158,7 @@ export class WorkspaceGitRepo {
             .header('cache-control', 'no-cache, max-age=0, must-revalidate');
 
         const serviceName = service.replace('git-', '');
-        const gitProcess = spawn('git', [serviceName, '--stateless-rpc', '--advertise-refs', this.#barePath], {
+        const gitProcess = spawn('git', [serviceName, '--stateless-rpc', '--advertise-refs', this.#gitDir], {
             stdio: ['pipe', 'pipe', 'pipe'],
             env: this.#childEnv(request),
         });
@@ -211,14 +189,6 @@ export class WorkspaceGitRepo {
         return this.#streamPack('upload-pack', request, reply);
     }
 
-    async #handleReceivePack(request, reply, onReceivePack) {
-        await this.#streamPack('receive-pack', request, reply);
-        if (onReceivePack) {
-            try { await onReceivePack(); }
-            catch (err) { this.#logger.debug(`receive-pack post-hook failed: ${err.message}`); }
-        }
-    }
-
     // Shared stateless-rpc streaming for upload-pack / receive-pack.
     #streamPack(serviceName, request, reply) {
         reply.hijack();
@@ -228,7 +198,7 @@ export class WorkspaceGitRepo {
         });
 
         const env = this.#childEnv(request, { SSH_ORIGINAL_COMMAND: serviceName });
-        const gitProcess = spawn('git', [serviceName, '--stateless-rpc', this.#barePath], { stdio: ['pipe', 'pipe', 'pipe'], env });
+        const gitProcess = spawn('git', [serviceName, '--stateless-rpc', this.#gitDir], { stdio: ['pipe', 'pipe', 'pipe'], env });
         gitProcess.stdout.pipe(reply.raw, { end: false });
         gitProcess.stderr.on('data', (data) => this.#logger.debug(`Git ${serviceName}: ${data.toString().trim()}`));
 

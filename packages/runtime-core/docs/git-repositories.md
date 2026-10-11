@@ -1,6 +1,6 @@
 # Workspace Git repositories
 
-Repositories live in `Git/<name>/.git`. The home layout uses `.workspace/Git`; a configured `services.git.root` still overrides the repository container. `internal` holds hooks, scripts and dotfiles. On startup the old `git/bare.git` layout is copied into `Git/internal`, preserving refs and uncommitted hooks; the original remains a recovery copy. Native Git worktrees with a `.git` pointer file are not discovered.
+Repositories live in `Git/<name>/.git`. The home layout uses `.workspace/Git`; a configured `services.git.root` still overrides the repository container. `internal` holds hooks, scripts and dotfiles. Native Git worktrees with a `.git` pointer file are not discovered.
 
 In Settings → Data Backends → Connectors, choose **Git repository**. Enter a repository name and an HTTPS or SSH URL to clone a remote, or leave the URL empty to create a local repository. Private remotes use the runtime user's Git credential helper or SSH configuration. A sync fetches origin without resetting the checkout or changing local files. Branches follow origin when the local tip is behind it; local-ahead and diverged commits remain visible. Local-only branches are also available. Commit local changes before expecting them in a branch tree. Submodules and symbolic links are not traversed.
 
@@ -14,7 +14,6 @@ The same connector form can follow a branch or folder into a virtual tree. For e
 - `POST /workspaces/:id/git/`: create a repository/backend with `{ "address": "company", "url": "https://example.com/company.git" }`; omit `url` for a local repository.
 - `GET /workspaces/:id/git/:repo/branches`: branch descriptors.
 - `/workspaces/:id/git/:repo`: smart HTTP clone/fetch/push endpoint. Push is available for local repositories; remote clones are read-only through this endpoint, with pushes going to their origin.
-- `/workspaces/:id/git` remains an alias for `internal` for older clients.
 - Standard `/workspaces/:id/backends/git/:repo` CRUD (DELETE stops syncing and preserves the checkout), `/sync`, `/test` and `/containers` manage the Git data source.
 
 A backend supports `branches: ["main", "feature/name"]` (empty means all). The form's `linkBranch`, `linkPath`, `targetTree` and `targetPath` create one mapping. API clients can additionally supply `mounts: [{ "branch": "main", "sourcePath": "docs/UI", "tree": "context", "path": "/company/Branding/UI" }]` for multiple mappings.

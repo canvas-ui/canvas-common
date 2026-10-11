@@ -13,7 +13,7 @@ import { classifyDocument } from '../../lib/classifier.js';
 /**
  * Declarative hook rules (canvas.hook-rules/v1).
  *
- * Rules live next to JS hooks in `{WORKSPACE_ROOT}/git/hooks` as `rules.json`
+ * Rules live next to JS hooks in `{WORKSPACE_ROOT}/Git/internal/hooks` as `rules.json`
  * plus `rules/*.json` (merged in filename sort order). An `example-`,
  * `disabled-` or `_` prefix deactivates a file (same convention as JS hooks);
  * a rule with `enabled: false` is skipped individually.

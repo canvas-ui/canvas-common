@@ -49,7 +49,6 @@ import { getServerDevice } from '../device/ServerDevice.js';
 // Constants
 import {
     WORKSPACE_STATUS_CODES,
-    WORKSPACE_GIT_BARE_DIR,
     WORKSPACE_INTERNAL_DIRNAME,
     WORKSPACE_LAYOUTS,
     normalizeWorkspaceLayout,
@@ -511,13 +510,9 @@ class Workspace extends EventEmitter {
 
     get gitInternalPath() { return path.join(this.gitPath, 'internal'); }
 
-    get gitBarePath() {
-        return path.join(this.gitInternalPath, WORKSPACE_GIT_BARE_DIR);
-    }
-
     // Derived from gitPath, not resolved independently: hooks live INSIDE the
     // git working dir, so a remapped/relocated git root (or the `home` layout's
-    // .workspace/git) must take them with it.
+    // .workspace/Git) must take them with it.
     get hooksPath() {
         const configured = (this.#configStore.get('internals', {}) || {}).hooks
             ?? (this.#configStore.get('directories', {}) || {}).hooks;
@@ -563,7 +558,6 @@ class Workspace extends EventEmitter {
             this.cachePath,
             this.dataPath,
             this.gitPath,
-            path.join(this.rootPath, this.layout === 'home' ? '.workspace/git' : 'git'),
             this.configDir,
             this.varPath,
             this.rolesPath,
@@ -922,23 +916,6 @@ class Workspace extends EventEmitter {
         }
     }
 
-    async #migrateGitLayout() {
-        const services = this.#configStore.get('services', {}) || {};
-        const oldDefault = path.join(this.rootPath, this.layout === 'home' ? '.workspace/git' : 'git');
-        const configured = this.gitPath;
-        const legacyRoot = existsSync(path.join(configured, 'bare.git')) ? configured : oldDefault;
-        const nextRoot = configured === oldDefault ? path.join(path.dirname(oldDefault), 'Git') : configured;
-        await new GitRepositories(nextRoot).migrateInternal(legacyRoot);
-        if (configured !== nextRoot) this.#configStore.set('services', { ...services, git: { ...services.git, root: nextRoot.replace(this.rootPath, '{WORKSPACE_ROOT}') } });
-        // Only remap the old default hook location; custom hook roots stay custom.
-        for (const key of ['internals', 'directories']) {
-            const values = this.#configStore.get(key, {}) || {};
-            if (values.hooks && this.#resolveWorkspacePath(values.hooks) === path.join(legacyRoot, 'hooks')) {
-                this.#configStore.set(key, { ...values, hooks: path.join(nextRoot, 'internal/hooks').replace(this.rootPath, '{WORKSPACE_ROOT}') });
-            }
-        }
-    }
-
     async #doStart({ passphrase, withoutSecrets = false } = {}) {
         this.#logger.debug({ workspaceId: this.id }, 'Starting workspace');
         try {
@@ -951,7 +928,6 @@ class Workspace extends EventEmitter {
             } else if (withoutSecrets) this.#withoutSecrets = true;
             this.#inferd = this.#withoutSecrets ? null : this.#configuredInferd;
             this.#migrateConfigSchema();
-            await this.#migrateGitLayout();
             this.#migrateSecrets();
             this.#assertLayoutSane();
             await Promise.all([

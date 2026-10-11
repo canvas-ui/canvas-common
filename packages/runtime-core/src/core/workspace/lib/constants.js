@@ -90,8 +90,6 @@ function workspaceDirectories(layout) {
         : WORKSPACE_DIRECTORIES;
 }
 
-const WORKSPACE_GIT_BARE_DIR = '.git';
-
 // Default sync exclusions for enumerable file backends (workspace:home).
 // Merged with the per-backend `exclude` list from workspace config; applied
 // identically to the live watcher and to list()/scan() resyncs. Patterns
@@ -297,7 +295,6 @@ export {
     WORKSPACE_DIRECTORIES,
     WORKSPACE_DIRECTORIES_HOME,
     WORKSPACE_INTERNALS_HOME,
-    WORKSPACE_GIT_BARE_DIR,
     WORKSPACE_ORIGINS,
     WORKSPACE_STATUS_CODES,
     WORKSPACE_INTERNALS,

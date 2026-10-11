@@ -7,13 +7,12 @@ import { existsSync } from 'fs';
 import * as fsPromises from 'fs/promises';
 import EventEmitter from 'eventemitter2';
 import { createLogger } from '../../../../utils/log.js';
-import { WORKSPACE_GIT_BARE_DIR } from '../../lib/constants.js';
 import WorkspaceGitRepo from '../../lib/WorkspaceGitRepo.js';
 import { enabledName } from '../hook/naming.js';
 
 const logger = createLogger('dotfile-manager');
 const TEMPLATE_DIRNAME = 'files';
-const DEPLOY_PATHSPECS = ['hooks/', 'scripts/'];
+const SEED_PATHSPECS = ['hooks/', 'scripts/'];
 // Seed files that are documentation: backfill refreshes these in place when
 // the shipped copy changed (unlike hooks/scripts, which are never overwritten).
 const DOC_SEED_FILES = new Set([path.join('hooks', 'README.md')]);
@@ -71,8 +70,8 @@ async function listFilesRecursive(root, base = root) {
 /**
  * DotfileManager
  *
- * Owns the internal git repository as a *service*: what to seed it with,
- * when to deploy, and the public surface routes call. All git mechanics live in
+ * Owns the internal Git repository service: seeding and the public API.
+ * All Git mechanics live in
  * WorkspaceGitRepo; this class only orchestrates and emits service events.
  */
 class DotfileManager extends EventEmitter {
@@ -94,19 +93,11 @@ class DotfileManager extends EventEmitter {
     #getGitDir(workspace) {
         // Layout-aware (Git/internal or .workspace/Git/internal), honours a remapped
         // services.git.root.
-        return workspace.gitInternalPath || path.join(workspace.gitPath, 'internal');
-    }
-
-    #getBareRepoPath(workspace) {
-        return path.join(this.#getGitDir(workspace), WORKSPACE_GIT_BARE_DIR);
+        return workspace.gitInternalPath;
     }
 
     #repo(workspace) {
-        return new WorkspaceGitRepo({
-            barePath: this.#getBareRepoPath(workspace),
-            gitDir: this.#getGitDir(workspace),
-            logger,
-        });
+        return new WorkspaceGitRepo({ repoPath: this.#getGitDir(workspace), logger });
     }
 
     async #resolveWorkspace(workspaceIdOrObject, requestingUserId) {
@@ -128,7 +119,7 @@ class DotfileManager extends EventEmitter {
     async enable(workspace, userId) {
         if (!workspace?.id) throw new Error('Invalid workspace');
 
-        const repoPath = this.#getBareRepoPath(workspace);
+        const repoPath = this.#repo(workspace).gitDir;
         const hasRepo = existsSync(repoPath);
 
         if (!hasRepo) {
@@ -151,17 +142,17 @@ class DotfileManager extends EventEmitter {
 
     isEnabled(workspace) {
         if (!workspace?.rootPath) return false;
-        return existsSync(this.#getBareRepoPath(workspace));
+        return existsSync(this.#repo(workspace).gitDir);
     }
 
     async initializeRepository(userId, workspaceIdOrObject, requestingUserId) {
         const workspace = await this.#resolveWorkspace(workspaceIdOrObject, requestingUserId);
         const repo = this.#repo(workspace);
-        const repoPath = repo.barePath;
+        const repoPath = repo.gitDir;
 
         await fsPromises.mkdir(workspace.hooksPath, { recursive: true });
 
-        const { created } = await repo.initBare();
+        const { created } = await repo.init();
         if (!created && await repo.hasCommits()) {
             this.emit('repository.initialized', { userId, workspace: workspace.id, path: repoPath });
             return { success: true, message: 'Repository already initialized', path: repoPath };
@@ -184,7 +175,6 @@ class DotfileManager extends EventEmitter {
             try { await fsPromises.rm(tmpWorkDir, { recursive: true, force: true }); } catch (_) { /* intentionally ignored */ }
         }
 
-        await repo.deploy(DEPLOY_PATHSPECS);
         if (workspace.addBackend) await workspace.addBackend('git', { address: 'internal' });
         this.emit('repository.initialized', { userId, workspace: workspace.id, path: repoPath });
         return { success: true, message: 'Repository initialized successfully', path: repoPath };
@@ -247,22 +237,20 @@ class DotfileManager extends EventEmitter {
 
         if (added.length > 0) {
             await chmodSeedScripts(gitDir);
-            await this.#repo(workspace).commitWorkTree(DEPLOY_PATHSPECS, `Backfill ${added.length} seed example file(s)`);
+            await this.#repo(workspace).commitWorkTree(SEED_PATHSPECS, `Backfill ${added.length} seed example file(s)`);
             logger.debug(`Backfilled ${added.length} seed file(s) into workspace ${workspace.id}`);
         }
         return { success: true, added };
     }
 
-    // Persist webui hook edits back into the internal repo. Hooks are deployed by
-    // checking out `hooks/` from bare HEAD, so an edit only written to the work
-    // tree would be clobbered on the next push/deploy and never reach clients on
-    // clone. No-op when git is not enabled for the workspace.
+    // Commit web UI hook edits so Git clients receive them on clone or pull.
+    // No-op when Git is not enabled for the workspace.
     async commitHooks(workspaceIdOrObject, message = 'Update workspace hooks', requestingUserId) {
         const workspace = await this.#resolveWorkspace(workspaceIdOrObject, requestingUserId);
         return this.#repo(workspace).commitWorkTree('hooks/', message);
     }
 
-    // Same persistence contract for git/scripts (the helpers hooks spawn).
+    // Same persistence contract for Git/internal/scripts (the helpers hooks spawn).
     async commitScripts(workspaceIdOrObject, message = 'Update workspace scripts', requestingUserId) {
         const workspace = await this.#resolveWorkspace(workspaceIdOrObject, requestingUserId);
         return this.#repo(workspace).commitWorkTree('scripts/', message);
@@ -273,21 +261,11 @@ class DotfileManager extends EventEmitter {
         const repo = this.#repo(workspace);
 
         if (!repo.exists()) {
-            return { initialized: false, path: repo.barePath };
+            return { initialized: false, path: repo.gitDir };
         }
 
         const { branches, currentBranch } = await repo.status();
-        return { initialized: true, path: repo.barePath, branches, currentBranch, bare: false };
-    }
-
-    async handleGitHttpBackend(userId, workspaceIdOrObject, requestingUserId, service, request, reply) {
-        const workspace = await this.#resolveWorkspace(workspaceIdOrObject, requestingUserId);
-        const repo = this.#repo(workspace);
-        return repo.serveHttp(service, request, reply, {
-            // Redeploy hooks/scripts after a successful push so the work tree and
-            // running hooks reflect what clients just pushed.
-            onReceivePack: () => repo.deploy(DEPLOY_PATHSPECS),
-        });
+        return { initialized: true, path: repo.gitDir, branches, currentBranch, bare: false };
     }
 }
 

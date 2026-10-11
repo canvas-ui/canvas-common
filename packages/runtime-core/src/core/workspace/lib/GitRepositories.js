@@ -126,37 +126,4 @@ export default class GitRepositories {
         if (!entry) throw Object.assign(new Error('Git file not found'), { statusCode: 404 });
         return this.readBlob(name, entry.oid);
     }
-    async migrateInternal(legacyRoot) {
-        const target = this.repoPath('internal');
-        if (await fs.stat(path.join(target, '.git')).catch(() => null)) return;
-        const legacy = path.join(legacyRoot, 'bare.git');
-        if (!await fs.stat(legacy).catch(() => null)) return;
-        await fs.mkdir(this.root, { recursive: true });
-        const staging = await fs.mkdtemp(path.join(this.root, '.internal-migration-'));
-        try {
-            await fs.cp(legacy, path.join(staging, '.git'), { recursive: true });
-            await git(staging, ['config', 'core.bare', 'false']);
-            await git(staging, ['config', '--unset', 'core.worktree']).catch(() => {});
-            await git(staging, ['config', 'receive.denyCurrentBranch', 'updateInstead']);
-            const hasHead = await git(staging, ['rev-parse', '--verify', 'HEAD']).then(() => true, () => false);
-            if (hasHead) {
-                await git(staging, ['read-tree', 'HEAD']);
-                await git(staging, ['checkout-index', '-a']);
-            }
-            for (const entry of await fs.readdir(legacyRoot, { withFileTypes: true })) {
-                if (['bare.git', 'internal', '.git'].includes(entry.name) || entry.name.startsWith('.internal-')) continue;
-                if (entry.isDirectory() && await fs.stat(path.join(legacyRoot, entry.name, '.git')).catch(() => null)) continue;
-                if (entry.isDirectory() && ['hooks', 'scripts'].includes(entry.name)) await fs.rm(path.join(staging, entry.name), { recursive: true, force: true });
-                await fs.cp(path.join(legacyRoot, entry.name), path.join(staging, entry.name), { recursive: true, force: true });
-            }
-            if (await fs.stat(target).catch(() => null)) {
-                await fs.cp(target, staging, { recursive: true, force: true });
-                await fs.rename(target, staging + '-previous');
-            }
-            await fs.rename(staging, target);
-        } catch (error) {
-            await fs.rm(staging, { recursive: true, force: true });
-            throw error;
-        }
-    }
 }

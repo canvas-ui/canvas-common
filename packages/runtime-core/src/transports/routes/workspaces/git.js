@@ -1,6 +1,5 @@
 'use strict';
 
-import path from 'node:path';
 import GitRepositories from '../../../core/workspace/lib/GitRepositories.js';
 import WorkspaceGitRepo from '../../../core/workspace/lib/WorkspaceGitRepo.js';
 import { parseBasicAuth } from '../../lib/basic-auth.js';
@@ -8,7 +7,7 @@ import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/wo
 
 /**
  * Git HTTP backend for named repositories (Git/<repo>/.git on disk).
- * Mounted at /workspaces/:id/git/:repo/*; the legacy unqualified URL serves internal.
+ * Mounted at /workspaces/:id/git/:repo/*.
  */
 
 async function convertBasicAuthToBearer(request, reply) {
@@ -42,34 +41,20 @@ async function convertBasicAuthToBearer(request, reply) {
   }
 }
 
-function extractRequestInfo(request) {
-  const workspace = request.workspace;
-  const userId = request.user?.id;
-  if (!workspace) throw new Error('Workspace not resolved by middleware');
-  if (!userId) throw new Error('User not authenticated');
-  return { workspace, userId, requestingUserId: userId };
-}
-
 export default async function workspaceGitRoutes(fastify) {
   fastify.addContentTypeParser('application/x-git-receive-pack-request', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
   fastify.addContentTypeParser('application/x-git-upload-pack-request', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
 
   const handle = async (request, reply, service) => {
     try {
-      const { workspace, userId, requestingUserId } = extractRequestInfo(request);
-      if (request.params.repo) {
-        const repositories = new GitRepositories(workspace.gitPath);
-        const gitDir = await repositories.checkedPath(request.params.repo);
-        const repo = new WorkspaceGitRepo({ gitDir, barePath: path.join(gitDir, '.git') });
-        if (service === 'git-receive-pack' || request.query?.service === 'git-receive-pack') {
-          const descriptor = (await repositories.list()).find(r => r.name === request.params.repo);
-          if (descriptor?.type === 'remote') return reply.code(403).send('Push remote repositories to their upstream remote');
-        }
-        return await repo.serveHttp(service, request, reply);
+      const repositories = new GitRepositories(request.workspace.gitPath);
+      const repoPath = await repositories.checkedPath(request.params.repo);
+      const repo = new WorkspaceGitRepo({ repoPath });
+      if (service === 'git-receive-pack' || request.query?.service === 'git-receive-pack') {
+        const descriptor = (await repositories.list()).find(r => r.name === request.params.repo);
+        if (descriptor?.type === 'remote') return reply.code(403).send('Push remote repositories to their upstream remote');
       }
-      await fastify.dotfileManager.handleGitHttpBackend(
-        userId, workspace, requestingUserId, service, request, reply,
-      );
+      return await repo.serveHttp(service, request, reply);
     } catch (error) {
       if (error?.code === 'ENOENT') return reply.code(404).send('Repository not found');
       if (error?.statusCode) return reply.code(error.statusCode).send(error.message);
@@ -85,7 +70,7 @@ export default async function workspaceGitRoutes(fastify) {
     }
   };
 
-  // Named repositories. The old URL remains an alias for internal.
+  // Named repositories.
   fastify.get('/', { onRequest: [fastify.authenticate, requireWorkspaceRead()] }, async (request) => {
     return { status: 'success', payload: await new GitRepositories(request.workspace.gitPath).list() };
   });
@@ -107,55 +92,4 @@ export default async function workspaceGitRoutes(fastify) {
       handler: (request, reply) => handle(request, reply, service),
     });
   }
-
-  // GET /workspaces/:id/git/info/refs
-  fastify.get('/info/refs', {
-    onRequest: [convertBasicAuthToBearer, fastify.authenticate, requireWorkspaceRead()],
-    schema: {
-      params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
-      querystring: { type: 'object', properties: { service: { type: 'string' } } },
-    },
-  }, (request, reply) => handle(request, reply, 'info/refs'));
-
-  // POST /workspaces/:id/git/git-upload-pack
-  fastify.post('/git-upload-pack', {
-    onRequest: [convertBasicAuthToBearer, fastify.authenticate, requireWorkspaceRead()],
-    config: { rawBody: true },
-    bodyLimit: 67108864,
-    schema: { params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } } },
-  }, (request, reply) => handle(request, reply, 'git-upload-pack'));
-
-  // POST /workspaces/:id/git/git-receive-pack
-  fastify.post('/git-receive-pack', {
-    onRequest: [convertBasicAuthToBearer, fastify.authenticate, requireWorkspaceWrite()],
-    config: { rawBody: true },
-    bodyLimit: 67108864,
-    schema: { params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } } },
-  }, (request, reply) => handle(request, reply, 'git-receive-pack'));
-
-  // GET /workspaces/:id/git/*
-  fastify.get('/*', {
-    onRequest: [convertBasicAuthToBearer, fastify.authenticate, requireWorkspaceRead()],
-    schema: {
-      params: {
-        type: 'object',
-        required: ['id'],
-        properties: { id: { type: 'string' }, '*': { type: 'string' } },
-      },
-    },
-  }, (request, reply) => handle(request, reply, request.params['*']));
-
-  // POST /workspaces/:id/git/*
-  fastify.post('/*', {
-    onRequest: [convertBasicAuthToBearer, fastify.authenticate, requireWorkspaceWrite()],
-    config: { rawBody: true },
-    bodyLimit: 67108864,
-    schema: {
-      params: {
-        type: 'object',
-        required: ['id'],
-        properties: { id: { type: 'string' }, '*': { type: 'string' } },
-      },
-    },
-  }, (request, reply) => handle(request, reply, request.params['*']));
 }

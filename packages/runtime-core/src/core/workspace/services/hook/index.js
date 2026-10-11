@@ -67,7 +67,7 @@ class HookService extends EventEmitter {
         if (this.#initialized) return this;
 
         // System hooks have all been moved to seeded, user-editable example
-        // hooks under git/hooks. Nothing to register in-process.
+        // hooks under Git/internal/hooks. Nothing to register in-process.
         this.#initialized = true;
         logger.debug('HookService initialized');
         return this;
