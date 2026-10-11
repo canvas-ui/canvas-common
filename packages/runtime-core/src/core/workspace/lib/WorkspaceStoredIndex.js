@@ -7,7 +7,6 @@ import fs from 'fs/promises';
 import { createReadStream } from 'fs';
 import getFolderSize from 'get-folder-size';
 import Stored from 'canvas-stored';
-import { extract as extractBlobMetadata } from 'canvas-stored/src/extractors/index.js';
 import { parseLocationUrl, deviceFileUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
 import { mimeFromLocations } from './classifier.js';
 import { pickGeo } from './geo.js';
@@ -879,7 +878,7 @@ export class WorkspaceStoredIndex {
                 // Inline metadata extraction at ingest (EXIF/GPS/dimensions/media).
                 // Graceful + optional: no-ops if parser deps are absent. Disable
                 // with CANVAS_EXTRACT_DISABLED=true.
-                extract: process.env.CANVAS_EXTRACT_DISABLED === 'true' ? null : extractBlobMetadata,
+                extract: null, // Deep extraction runs only after filing, in resolveEmbeddingInput.
                 // Displaced-blob retention (docs/durable-workspaces.md): bytes an
                 // overwrite/delete replaces on a path backend stay recoverable
                 // for this many days (0 = off). The primary's only versioning;

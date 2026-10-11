@@ -245,7 +245,7 @@ served over HTTP with basic auth (any non-empty username; the password is a
 `canvas-` API token):
 
 ```bash
-git clone https://canvas@<canvas-server>/rest/v2/workspaces/<workspace-id>/git
+git clone https://canvas@<canvas-server>/rest/v2/workspaces/<workspace-id>/git/internal
 # password: your canvas API token
 ```
 

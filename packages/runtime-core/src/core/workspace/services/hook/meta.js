@@ -136,7 +136,7 @@ export const HOOK_ACTIONS = Object.freeze([
     {
         id: 'script',
         label: 'Run a script',
-        description: 'Spawn a bash script from git/scripts (fire-and-forget)',
+        description: 'Spawn a bash script from Git/internal/scripts (fire-and-forget)',
         needs: ['workspace'],
         imports: [
             "import { spawn } from 'node:child_process';",
@@ -144,7 +144,7 @@ export const HOOK_ACTIONS = Object.freeze([
             "import path from 'node:path';",
         ],
         snippet: [
-            '    // Fire-and-forget a script from git/scripts.',
+            '    // Fire-and-forget a script from Git/internal/scripts.',
             "    const script = path.join(workspace.rootPath, 'git', 'scripts', 'my-script.sh'); // TODO",
             '    if (existsSync(script)) {',
             "        const child = spawn('bash', [script, String(doc.id)], { stdio: 'ignore', detached: true });",

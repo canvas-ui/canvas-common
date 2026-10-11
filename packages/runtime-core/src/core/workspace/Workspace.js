@@ -5,6 +5,8 @@ import { readSendReceipt } from './services/messages/outbox.js';
 
 import { emailRecipients } from './services/messages/email.js';
 import { sendWorkspaceMessage, sourceAccount } from './services/messages/index.js';
+import { Readable } from 'node:stream';
+import GitRepositories, { parseGitLocation, gitTreePath } from './lib/GitRepositories.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import WorkspaceCrypto, { containsSecrets, protectionError, writePrivateJson, redactSecrets } from './lib/WorkspaceCrypto.js';
@@ -115,6 +117,7 @@ class Workspace extends EventEmitter {
     // Managers (injected)
     #configuredInferd = null;
     #inferd = null;            // InferdClient — the inference daemon over its socket (optional)
+    #embedEligibilityPending = new Set();
     #inferdRegistered = false;
     #embedStoreCount = 0;      // storeVectors calls since the last mid-ingest compaction
 
@@ -506,8 +509,10 @@ class Workspace extends EventEmitter {
         return this.#resolveWorkspacePath(this.services.git?.root) ?? this.#resolveDir('git');
     }
 
+    get gitInternalPath() { return path.join(this.gitPath, 'internal'); }
+
     get gitBarePath() {
-        return path.join(this.gitPath, WORKSPACE_GIT_BARE_DIR);
+        return path.join(this.gitInternalPath, WORKSPACE_GIT_BARE_DIR);
     }
 
     // Derived from gitPath, not resolved independently: hooks live INSIDE the
@@ -516,12 +521,12 @@ class Workspace extends EventEmitter {
     get hooksPath() {
         const configured = (this.#configStore.get('internals', {}) || {}).hooks
             ?? (this.#configStore.get('directories', {}) || {}).hooks;
-        return configured ? this.#resolveWorkspacePath(configured) : path.join(this.gitPath, 'hooks');
+        return configured ? this.#resolveWorkspacePath(configured) : path.join(this.gitInternalPath, 'hooks');
     }
 
     /** Git working-dir scripts (rule/hook scripts), sibling of hooks/. */
     get scriptsPath() {
-        return path.join(this.gitPath, 'scripts');
+        return path.join(this.gitInternalPath, 'scripts');
     }
 
     /** Per-workspace service config dir (`config/*.json`). */
@@ -558,6 +563,7 @@ class Workspace extends EventEmitter {
             this.cachePath,
             this.dataPath,
             this.gitPath,
+            path.join(this.rootPath, this.layout === 'home' ? '.workspace/git' : 'git'),
             this.configDir,
             this.varPath,
             this.rolesPath,
@@ -916,6 +922,23 @@ class Workspace extends EventEmitter {
         }
     }
 
+    async #migrateGitLayout() {
+        const services = this.#configStore.get('services', {}) || {};
+        const oldDefault = path.join(this.rootPath, this.layout === 'home' ? '.workspace/git' : 'git');
+        const configured = this.gitPath;
+        const legacyRoot = existsSync(path.join(configured, 'bare.git')) ? configured : oldDefault;
+        const nextRoot = configured === oldDefault ? path.join(path.dirname(oldDefault), 'Git') : configured;
+        await new GitRepositories(nextRoot).migrateInternal(legacyRoot);
+        if (configured !== nextRoot) this.#configStore.set('services', { ...services, git: { ...services.git, root: nextRoot.replace(this.rootPath, '{WORKSPACE_ROOT}') } });
+        // Only remap the old default hook location; custom hook roots stay custom.
+        for (const key of ['internals', 'directories']) {
+            const values = this.#configStore.get(key, {}) || {};
+            if (values.hooks && this.#resolveWorkspacePath(values.hooks) === path.join(legacyRoot, 'hooks')) {
+                this.#configStore.set(key, { ...values, hooks: path.join(nextRoot, 'internal/hooks').replace(this.rootPath, '{WORKSPACE_ROOT}') });
+            }
+        }
+    }
+
     async #doStart({ passphrase, withoutSecrets = false } = {}) {
         this.#logger.debug({ workspaceId: this.id }, 'Starting workspace');
         try {
@@ -928,6 +951,7 @@ class Workspace extends EventEmitter {
             } else if (withoutSecrets) this.#withoutSecrets = true;
             this.#inferd = this.#withoutSecrets ? null : this.#configuredInferd;
             this.#migrateConfigSchema();
+            await this.#migrateGitLayout();
             this.#migrateSecrets();
             this.#assertLayoutSane();
             await Promise.all([
@@ -1031,6 +1055,7 @@ class Workspace extends EventEmitter {
             try { await this.#stopStoredIndex(); } catch { /* continue cleanup */ }
             await this.#stopContactExtraction();
             this.#unregisterInferd();
+            await Promise.allSettled([...this.#embedEligibilityPending]);
             this.#unbindRuntimeEvents();
             try { await this.#db?.shutdown(); } catch { /* continue cleanup */ }
             this.#db = null;
@@ -1051,6 +1076,7 @@ class Workspace extends EventEmitter {
         this.#logger.debug({ workspaceId: this.id }, 'Stopping workspace');
         try {
             this.#unregisterInferd();
+            await Promise.allSettled([...this.#embedEligibilityPending]);
             // Sessions subscribe to db events and hold its bitmaps — drop them
             // before the db goes away, or they keep firing against a dead handle.
             this.#closeSessions();
@@ -1533,7 +1559,10 @@ class Workspace extends EventEmitter {
 
     /** Ledger read: docIds that match `schemas` but have no embedding for `space`. */
     async getUnembeddedDocIds(space = 'text', schemas = null) {
-        return await this.#getActiveDb().getUnembeddedDocIds(space, schemas);
+        const ids = await this.#getActiveDb().getUnembeddedDocIds(space, schemas);
+        const eligible = [];
+        for (const id of ids) if (await this.#isUserFiled(id, { authoredRoot: true })) eligible.push(id);
+        return eligible;
     }
 
     /** Wipe an embedding space (vectors + presence + seen) for a full re-embed. */
@@ -1592,9 +1621,10 @@ class Workspace extends EventEmitter {
         // `${wsId}:${id}`, so the one overlap (putMany emitting both) is a
         // harmless no-op — no path is missed or embedded twice.
         //
-        // `document.updated` also fires for membership-only changes; the
-        // handler drops those on `reason` (see below) — a link changes no
-        // bytes, so there is nothing to re-embed.
+        // Filing makes backend-only documents eligible for the first time.
+        // The handler filters by current placement before adding queue work.
+        this.on('document.linked', this.#onDocEventForEmbed);
+        this.on('document.linked.batch', this.#onDocEventForEmbed);
         this.on('document.inserted', this.#onDocEventForEmbed);
         this.on('document.updated', this.#onDocEventForEmbed);
         this.on('document.inserted.batch', this.#onDocEventForEmbed);
@@ -1604,6 +1634,8 @@ class Workspace extends EventEmitter {
 
     #unregisterInferd() {
         if (!this.#inferd || !this.#inferdRegistered) { return; }
+        this.off('document.linked', this.#onDocEventForEmbed);
+        this.off('document.linked.batch', this.#onDocEventForEmbed);
         this.off('document.inserted', this.#onDocEventForEmbed);
         this.off('document.updated', this.#onDocEventForEmbed);
         this.off('document.inserted.batch', this.#onDocEventForEmbed);
@@ -1616,16 +1648,17 @@ class Workspace extends EventEmitter {
     // enqueueMany routes through the same deduped queue as enqueue.
     #onDocEventForEmbed = (payload) => {
         if (!this.#inferd) { return; }
-        // A membership-only update (link/unlink) did not touch a single byte of
-        // the document — re-embedding it is pure waste, and on a bulk link of a
-        // photo folder it is a CLIP pass over the whole folder for nothing.
-        // This is what the `reason` discriminator is for.
-        if (payload?.reason === 'membership') { return; }
+        // Unfiled sources never enter the expensive work queue. ResolveInput
+        // checks again because a queued document may have been unfiled.
         const ids = Array.isArray(payload?.ids)
             ? payload.ids
             : (payload?.id != null ? [payload.id] : []);
         if (ids.length === 0) { return; }
-        this.#inferd.enqueueMany(this.id, ids);
+        const pending = Promise.all(ids.map(async id => await this.#isUserFiled(id, { authoredRoot: true }) ? id : null))
+            .then(eligible => { if (this.#inferdRegistered) this.#inferd?.enqueueMany(this.id, eligible.filter(id => id != null)); })
+            .catch(error => this.#logger.debug({ error: error.message }, 'Filing check failed; embedding deferred'))
+            .finally(() => this.#embedEligibilityPending.delete(pending));
+        this.#embedEligibilityPending.add(pending);
     };
 
     /**
@@ -1642,6 +1675,8 @@ class Workspace extends EventEmitter {
     async resolveEmbeddingInput(docId) {
         const doc = await this.#getActiveDb().getDocument(parseDocumentId(docId, 'Document ID')).catch(() => null);
         if (!doc) { return null; }
+
+        if (!await this.#isUserFiled(doc.id, { authoredRoot: true })) return null;
 
         const schema = doc.schema;
         const updatedAt = doc.updatedAt || new Date().toISOString();
@@ -1908,6 +1943,15 @@ class Workspace extends EventEmitter {
         for (const loc of candidates) {
             if (!loc?.url) continue;
             try {
+                const source = parseGitLocation(loc.url);
+                if (source) {
+                    const repositories = new GitRepositories(this.gitPath);
+                    const snapshot = doc.metadata?.git;
+                    const buffer = snapshot?.repo === source.repo && snapshot.branch === source.branch && snapshot.path === source.file && snapshot.oid
+                        ? await repositories.readBlob(source.repo, snapshot.oid)
+                        : await repositories.read(source.repo, source.branch, source.file);
+                    return { ...(options.stream ? { stream: Readable.from(buffer) } : { buffer }), url: loc.url };
+                }
                 const res = await this.#storedIndex.resolve(loc.url, options);
                 const data = res?.data;
                 if (data != null) return { ...(options.stream ? { stream: data } : { buffer: data }), url: loc.url, ranged: !!res.ranged };
@@ -3348,7 +3392,7 @@ class Workspace extends EventEmitter {
     async listBackendDocuments(driver, address, { linked = null, limit = null, offset = 0, parse = true } = {}) {
         // Storage backends may mirror deeper than /<driver>/<address> (device
         // segment on fs mounts) — ask the index for the canonical node first.
-        const path = this.#storedIndex?.getBackendTreeRoot(address)
+        const path = (driver === 'git' ? gitTreePath(address) : null) || this.#storedIndex?.getBackendTreeRoot(address)
             || `/${normalizeSegment(driver)}/${normalizeSegment(address)}`;
         return await this.#getActiveDb().listTreeDocuments(Workspace.BACKENDS_TREE_NAME, { path, linked, limit, offset, parse });
     }
@@ -4444,6 +4488,20 @@ class Workspace extends EventEmitter {
             configDir: this.configDir,
             varPath: this.varPath,
             homePath: this.homePath,
+            gitPath: this.gitPath,
+            removeBackendPath: async (treePath) => {
+                const tree = this.getBackendsTree();
+                const docs = await tree.findRecursive(treePath);
+                if (!docs || docs.isEmpty) await tree.removePath(treePath, true, { ignoreLocks: true });
+            },
+            linkDocument: async (id, placement) => {
+                const tree = this.getTree(placement.tree);
+                if (!tree || tree.name === Workspace.BACKENDS_TREE_NAME) throw new Error('Git mapping destination must be a virtual tree');
+                const paths = await this.listDocumentTreeMemberships(id, placement.tree);
+                if (!paths.includes(placement.path)) return this.link(id, tree.type === Workspace.DIRECTORY_TYPE
+                    ? { context: null, directory: placement }
+                    : { context: placement, directory: null });
+            },
             workspaceId: this.id,
             logger: this.#logger,
             put: (record, options = {}) => this.put(record, { ...options, allowBackendsWrite: true }),
@@ -4465,6 +4523,12 @@ class Workspace extends EventEmitter {
             listDocumentIdsUnderBackendPath: (treePath) => this.documentIdsUnderScope(`${Workspace.BACKENDS_TREE_NAME}://${treePath}`),
             getDocumentsByIdArray: (ids) => this.getDocumentsByIdArray(ids),
             reconcileRemovedLocations: async (doc, urls) => {
+                if (doc.metadata?.source === 'git' && await this.#isUserFiled(doc.id)) {
+                    const paths = await this.listDocumentTreeMemberships(doc.id, Workspace.BACKENDS_TREE_NAME);
+                    await this.#getActiveDb().put({ id: doc.id, locations: doc.locations.filter(l => !urls.includes(l.url)), orphanedAt: new Date().toISOString() }, { context: null });
+                    if (paths.length) await this.#getActiveDb().unlink(doc.id, { context: null, directory: { tree: Workspace.BACKENDS_TREE_NAME, path: paths } });
+                    return doc.id;
+                }
                 if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
                 return this.#storedIndex.reconcileRemovedLocations(doc, urls);
             },
@@ -4513,10 +4577,11 @@ class Workspace extends EventEmitter {
     #contacts = null;
 
     /** Filed where a user navigates: not the backends mirror, not the trash, not a context root. */
-    async #isUserFiled(id) {
+    async #isUserFiled(id, { authoredRoot = false } = {}) {
         const placements = await this.listDocumentPlacements(id);
+        const rootIsAuthored = authoredRoot && !placements.some(({ tree, paths }) => paths.length && (tree === Workspace.BACKENDS_TREE_NAME || paths.some(p => p === Workspace.TRASH_PATH || p.startsWith(`${Workspace.TRASH_PATH}/`))));
         return placements.some(({ tree, type, paths }) => tree !== Workspace.BACKENDS_TREE_NAME && paths.some((path) =>
-            !(type === Workspace.CONTEXT_TYPE && path === '/')
+            !(type === Workspace.CONTEXT_TYPE && path === '/' && !rootIsAuthored)
             && !(type === Workspace.DIRECTORY_TYPE && (path === Workspace.TRASH_PATH || path.startsWith(`${Workspace.TRASH_PATH}/`)))));
     }
 

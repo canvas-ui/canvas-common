@@ -1,11 +1,14 @@
 'use strict';
 
+import path from 'node:path';
+import GitRepositories from '../../../core/workspace/lib/GitRepositories.js';
+import WorkspaceGitRepo from '../../../core/workspace/lib/WorkspaceGitRepo.js';
 import { parseBasicAuth } from '../../lib/basic-auth.js';
 import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
 
 /**
- * Git HTTP backend for workspace bare repo (git/bare.git on disk).
- * Mounted at /workspaces/:id/git/* — moved from /dotfiles/git per monorepo layout.
+ * Git HTTP backend for named repositories (Git/<repo>/.git on disk).
+ * Mounted at /workspaces/:id/git/:repo/*; the legacy unqualified URL serves internal.
  */
 
 async function convertBasicAuthToBearer(request, reply) {
@@ -54,10 +57,22 @@ export default async function workspaceGitRoutes(fastify) {
   const handle = async (request, reply, service) => {
     try {
       const { workspace, userId, requestingUserId } = extractRequestInfo(request);
+      if (request.params.repo) {
+        const repositories = new GitRepositories(workspace.gitPath);
+        const gitDir = await repositories.checkedPath(request.params.repo);
+        const repo = new WorkspaceGitRepo({ gitDir, barePath: path.join(gitDir, '.git') });
+        if (service === 'git-receive-pack' || request.query?.service === 'git-receive-pack') {
+          const descriptor = (await repositories.list()).find(r => r.name === request.params.repo);
+          if (descriptor?.type === 'remote') return reply.code(403).send('Push remote repositories to their upstream remote');
+        }
+        return await repo.serveHttp(service, request, reply);
+      }
       await fastify.dotfileManager.handleGitHttpBackend(
         userId, workspace, requestingUserId, service, request, reply,
       );
     } catch (error) {
+      if (error?.code === 'ENOENT') return reply.code(404).send('Repository not found');
+      if (error?.statusCode) return reply.code(error.statusCode).send(error.message);
       if (error?.code === 'EGITNOREPO') {
         // git reads stderr from the transport, so say what to do about it.
         return reply.code(404).send(
@@ -69,6 +84,29 @@ export default async function workspaceGitRoutes(fastify) {
       return reply.code(500).send('Internal server error');
     }
   };
+
+  // Named repositories. The old URL remains an alias for internal.
+  fastify.get('/', { onRequest: [fastify.authenticate, requireWorkspaceRead()] }, async (request) => {
+    return { status: 'success', payload: await new GitRepositories(request.workspace.gitPath).list() };
+  });
+  fastify.post('/', { onRequest: [fastify.authenticate, requireWorkspaceWrite()] }, async (request, reply) => {
+    try {
+      const result = await request.workspace.addBackend('git', request.body || {});
+      return reply.code(201).send({ status: 'success', payload: result });
+    } catch (error) { return reply.code(error.statusCode || 400).send({ message: error.message }); }
+  });
+  fastify.get('/:repo/branches', { onRequest: [fastify.authenticate, requireWorkspaceRead()] }, async (request) => ({
+    status: 'success', payload: await new GitRepositories(request.workspace.gitPath).branches(request.params.repo),
+  }));
+  for (const service of ['info/refs', 'git-upload-pack', 'git-receive-pack']) {
+    fastify.route({
+      method: service === 'info/refs' ? 'GET' : 'POST',
+      url: `/:repo/${service}`,
+      onRequest: [convertBasicAuthToBearer, fastify.authenticate, service === 'git-receive-pack' ? requireWorkspaceWrite() : requireWorkspaceRead()],
+      bodyLimit: 67108864,
+      handler: (request, reply) => handle(request, reply, service),
+    });
+  }
 
   // GET /workspaces/:id/git/info/refs
   fastify.get('/info/refs', {

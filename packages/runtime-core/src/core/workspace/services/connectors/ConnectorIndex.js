@@ -6,6 +6,8 @@ import EventEmitter from 'eventemitter2';
 import path from 'path';
 import fs from 'fs/promises';
 import crypto from 'crypto';
+import GitRepositories, { repoName, gitTreePath, decodeGitSegment } from '../../lib/GitRepositories.js';
+const addressFor = (driver, value) => driver === 'git' ? repoName(value) : normalizeSegment(value);
 import { getBackendFileContext, normalizeSegment } from '../../../../utils/backend-documents.js';
 import {
     getConnectorDriver,
@@ -50,6 +52,10 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     #configDir;
     #varPath;
     #homePath;
+    #gitPath;
+    #linkDocument;
+    #removeBackendPath;
+    #configWrites = Promise.resolve();
     #workspaceId;
     #logger;
 
@@ -73,7 +79,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     #status = new Map();   // name -> { syncing, lastSyncAt, lastError, backoff }
     #timers = new Map();   // name -> timeout handle
 
-    constructor({ onContacts = null, sessionSecrets = null, resolveCredentials = (value) => value, protectConfig = (value) => value, secretsLocked = () => false, rootPath, configDir = path.join(rootPath, 'config'), varPath = path.join(rootPath, 'var'), homePath = path.join(rootPath, 'home'), workspaceId, logger, put, getBackendsTreeSelector, insertBackendPath = null, lockBackendNode = null, unlockBackendNode = null, listDocumentIdsUnderBackendPath = null, getDocumentsByIdArray = null, reconcileRemovedLocations = null, resolveDocumentIdByChecksum = null, inheritThreadMemberships = null }) {
+    constructor({ gitPath = null, linkDocument = null, removeBackendPath = null, onContacts = null, sessionSecrets = null, resolveCredentials = (value) => value, protectConfig = (value) => value, secretsLocked = () => false, rootPath, configDir = path.join(rootPath, 'config'), varPath = path.join(rootPath, 'var'), homePath = path.join(rootPath, 'home'), workspaceId, logger, put, getBackendsTreeSelector, insertBackendPath = null, lockBackendNode = null, unlockBackendNode = null, listDocumentIdsUnderBackendPath = null, getDocumentsByIdArray = null, reconcileRemovedLocations = null, resolveDocumentIdByChecksum = null, inheritThreadMemberships = null }) {
         super({ wildcard: true, delimiter: '.', maxListeners: 100 });
         if (!rootPath) throw new Error('rootPath is required');
         if (!put || !getBackendsTreeSelector) throw new Error('put and getBackendsTreeSelector are required');
@@ -81,6 +87,9 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         this.#configDir = configDir;
         this.#varPath = varPath;
         this.#homePath = homePath;
+        this.#gitPath = gitPath;
+        this.#linkDocument = linkDocument;
+        this.#removeBackendPath = removeBackendPath;
         this.#sessionSecrets = sessionSecrets;
         this.#onContacts = onContacts;
         this.#resolveCredentials = resolveCredentials;
@@ -106,6 +115,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         if (this.#started) return;
         this.#started = true;
         try {
+            await this.#discoverGitRepositories();
             const { backends } = await this.readStoredConfig();
             for (const [name, config] of Object.entries(backends)) {
                 if (config?.enabled === false || (this.#secretsLocked() && (containsSecrets(config) || getConnectorDriver(config.driver)?.requiresAuthentication))) continue;
@@ -121,6 +131,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     }
 
     async stop() {
+        this.#started = false;
         for (const timer of this.#timers.values()) clearTimeout(timer);
         this.#timers.clear();
         for (const name of [...this.#backends.keys()]) await this.#unregister(name);
@@ -136,12 +147,12 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     #register(name, config) {
         if (this.#backends.has(name)) return this.#backends.get(name);
         const Driver = getConnectorDriver(config.driver);
-        const address = normalizeSegment(config.address || name.split(':').slice(1).join(':'));
+        const address = addressFor(config.driver, config.address || name.split(':').slice(1).join(':'));
         const entry = {
             driver: config.driver,
             address,
             config,
-            instance: new Driver(address, this.#resolveCredentials(config), { sessionSecrets: this.#sessionSecrets, logger: this.#logger, rootPath: this.#rootPath, configDir: this.#configDir, varPath: this.#varPath, homePath: this.#homePath,
+            instance: new Driver(address, this.#resolveCredentials(config), { sessionSecrets: this.#sessionSecrets, logger: this.#logger, rootPath: this.#rootPath, configDir: this.#configDir, varPath: this.#varPath, homePath: this.#homePath, gitPath: this.#gitPath,
                 onContacts: (contacts) => this.#onContacts?.(address, contacts),
                 onDocument: (container, document) => this.#ingest(name, this.#backends.get(name), container, document),
                 onContainer: (container) => this.#ensureConversationNode(this.#backends.get(name), container),
@@ -158,6 +169,9 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         if (!entry) return;
         const timer = this.#timers.get(name);
         if (timer) { clearTimeout(timer); this.#timers.delete(name); }
+        const status = this.#status.get(name);
+        if (status) status.stopping = true;
+        await status?.promise;
         await entry.instance.stop?.();
         this.#applyNodeLock(entry, false, name);
         this.#backends.delete(name);
@@ -169,11 +183,11 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     #applyNodeLock(entry, locked, holder) {
         const hook = locked ? this.#lockBackendNode : this.#unlockBackendNode;
         if (!hook) return;
-        const nodePath = `/${normalizeSegment(entry.driver)}/${normalizeSegment(entry.address)}`;
+        const nodePath = (entry.driver === 'git' ? gitTreePath(entry.address) : `/${normalizeSegment(entry.driver)}/${normalizeSegment(entry.address)}`);
         // The mirror node must exist before it can be locked (first enable on a
         // fresh backend races the first synced document otherwise).
         const ensure = (locked && this.#insertBackendPath)
-            ? Promise.resolve(this.#insertBackendPath(nodePath)).catch(() => {})
+            ? Promise.resolve(entry.driver === 'git' ? this.#ensureGitPath(entry, nodePath) : this.#insertBackendPath(nodePath)).catch(() => {})
             : Promise.resolve();
         ensure.then(() => hook(nodePath, holder)).catch((err) =>
             this.#logger.warn({ workspaceId: this.#workspaceId, backend: holder, error: err.message }, 'Connector node lock update failed'));
@@ -187,7 +201,20 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         return [...this.#backends.entries()].map(([name, entry]) => this.#descriptor(name, entry));
     }
 
+    async #discoverGitRepositories() {
+        if (!this.#gitPath) return;
+        const { backends } = await this.readStoredConfig();
+        for (const repo of await new GitRepositories(this.#gitPath).list()) {
+            const name = `git:${repo.name}`;
+            if (backends[name]) continue;
+            const config = { driver: 'git', address: repo.name, enabled: true, pruneRemoved: true, repositoryType: repo.type };
+            await this.patchStoredBackend(name, config);
+            if (this.#started) { this.#register(name, config); this.#kickSync(name); }
+        }
+    }
+
     async listStoredBackends() {
+        if (this.#started) await this.#discoverGitRepositories();
         // Includes disabled entries (not registered) so the settings UI can
         // re-enable them.
         const { backends } = await this.readStoredConfig();
@@ -197,7 +224,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
             const live = this.#backends.get(name);
             out.push(live ? this.#descriptor(name, live) : this.#descriptor(name, {
                 driver: config.driver,
-                address: normalizeSegment(config.address || name.split(':').slice(1).join(':')),
+                address: addressFor(config.driver, config.address || name.split(':').slice(1).join(':')),
                 config,
                 instance: null,
             }));
@@ -216,7 +243,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
             status: status.syncing ? 'syncing' : (status.lastError ? 'error' : (entry.instance ? 'running' : 'stopped')),
             lastSyncAt: status.lastSyncAt || config.lastSyncAt || null,
             lastError: this.#secretsLocked() && (containsSecrets(config) || getConnectorDriver(config.driver)?.requiresAuthentication) ? 'Credentials locked — start with PIN/password' : status.lastError || null,
-            treePath: `/${normalizeSegment(entry.driver)}/${normalizeSegment(entry.address)}`,
+            treePath: (entry.driver === 'git' ? gitTreePath(entry.address) : `/${normalizeSegment(entry.driver)}/${normalizeSegment(entry.address)}`),
             // Declared by the driver class (BaseConnector.capabilities()) —
             // never re-derived here, so a new driver needs no edit in this file.
             capabilities: entry.instance
@@ -252,7 +279,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
      */
     async saveBackend(driver, input = {}) {
         if (!isConnectorDriver(driver)) throw new Error(`Unknown connector driver: ${driver}`);
-        const address = normalizeSegment(input.address || input.name || '');
+        const address = addressFor(driver, input.address || input.name || '');
         if (!address || address === 'unknown') throw new Error(`${driver} backend requires an address (account label)`);
         const name = `${driver}:${address}`;
 
@@ -265,11 +292,18 @@ export class WorkspaceConnectorIndex extends EventEmitter {
                 if (previous[key]) merged[key] = previous[key]; else delete merged[key];
             }
         }
-        merged.cursors = previous.cursors || {};
+        if (driver === 'git') {
+            // Changing a filing rule must revisit unchanged branch tips too.
+            merged.pruneRemoved ??= true;
+            const probe = new (getConnectorDriver(driver))(address, merged, { rootPath: this.#rootPath, gitPath: this.#gitPath });
+            await probe.prepare();
+            merged.cursors = {};
+        } else merged.cursors = previous.cursors || {};
+        // Finish an old poll before publishing the replacement config.
+        await this.#unregister(name);
         await this.patchStoredBackend(name, merged);
 
         // Hot-swap the live instance and kick a sync when enabled.
-        await this.#unregister(name);
         if (merged.enabled !== false && !(this.#secretsLocked() && (containsSecrets(merged) || getConnectorDriver(driver)?.requiresAuthentication))) {
             this.#register(name, merged);
             this.#kickSync(name);
@@ -278,17 +312,18 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     }
 
     async removeBackend(driver, address) {
-        const name = `${driver}:${normalizeSegment(address)}`;
+        const name = `${driver}:${addressFor(driver, address)}`;
         await this.#unregister(name);
         const config = await this.readStoredConfig();
         if (!config.backends[name]) return false;
+        if (driver === 'git') { await this.patchStoredBackend(name, { enabled: false }); return true; }
         delete config.backends[name];
         await this.writeStoredConfig(config);
         return true;
     }
 
     messageAccount(driver, address) {
-        const entry = this.#backends.get(`${driver}:${normalizeSegment(address)}`);
+        const entry = this.#backends.get(`${driver}:${addressFor(driver, address)}`);
         if (!entry?.instance?.prepareMessage || entry.config.enabled === false) throw new Error('Messaging account is unavailable');
         return entry;
     }
@@ -306,14 +341,14 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     }
 
     async testBackend(driver, address) {
-        const entry = this.#backends.get(`${driver}:${normalizeSegment(address)}`);
+        const entry = this.#backends.get(`${driver}:${addressFor(driver, address)}`);
         if (!entry?.instance) throw new Error(`Connector not enabled: ${driver}/${address}`);
         await entry.instance.test();
         return { ok: true };
     }
 
     async listContainers(driver, address) {
-        const entry = this.#backends.get(`${driver}:${normalizeSegment(address)}`);
+        const entry = this.#backends.get(`${driver}:${addressFor(driver, address)}`);
         if (!entry?.instance) throw new Error(`Connector not enabled: ${driver}/${address}`);
         return entry.instance.listContainers();
     }
@@ -379,7 +414,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     // implementations throw ConnectorNotSupportedError, so an unsupported verb
     // is caught here with a clearer message either way.
     #writableEntry(driver, address, verb) {
-        const name = `${driver}:${normalizeSegment(address)}`;
+        const name = `${driver}:${addressFor(driver, address)}`;
         const entry = this.#backends.get(name);
         if (!entry?.instance) throw new Error(`Connector not enabled: ${driver}/${address}`);
         if (!entry.instance.canWrite) throw new Error(`Connector ${driver}/${address} is read-only`);
@@ -440,13 +475,13 @@ export class WorkspaceConnectorIndex extends EventEmitter {
 
     /** Can this backend push the given verb back to its source right now? */
     supportsWrite(driver, address, verb = 'update') {
-        const entry = this.#backends.get(`${driver}:${normalizeSegment(address)}`);
+        const entry = this.#backends.get(`${driver}:${addressFor(driver, address)}`);
         if (!entry?.instance) return false;
         return entry.instance.capabilities()[verb] === true;
     }
 
     async resync(driver, address) {
-        const name = `${driver}:${normalizeSegment(address)}`;
+        const name = `${driver}:${addressFor(driver, address)}`;
         if (!this.#backends.has(name)) throw new Error(`Connector not found: ${driver}/${address}`);
         if (driver === 'whatsapp' && !this.#backends.get(name).config.chats?.length) throw new Error('Select and save WhatsApp conversations before syncing');
         this.#kickSync(name, { immediate: true });
@@ -483,7 +518,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         if (status.syncing) { if (immediate) status.rerun = true; return; }
         status.syncing = true;
 
-        this.#syncBackend(name, entry)
+        status.promise = this.#syncBackend(name, entry)
             .then(() => {
                 status.lastError = null;
                 status.backoff = 0;
@@ -500,7 +535,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
                 status.syncing = false;
                 const rerun = status.rerun;
                 status.rerun = false;
-                this.#schedule(name, rerun ? 0 : (status.backoff || this.#pollInterval(entry)));
+                if (!status.stopping && this.#backends.get(name) === entry) this.#schedule(name, rerun ? 0 : (status.backoff || this.#pollInterval(entry)));
             });
     }
 
@@ -509,11 +544,36 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         for (const container of containers) {
             await this.#syncContainer(name, entry, container);
         }
+        if (entry.driver === 'git' && entry.config.pruneRemoved === true) {
+            const live = new Set(containers.map(c => c.id));
+            for (const id of Object.keys(entry.config.cursors || {})) {
+                // A user filter is not a source deletion.
+                if (live.has(id) || (entry.config.branches?.length && !entry.config.branches.includes(id))) continue;
+                await this.#pruneContainer(name, entry, { id, deleted: true });
+                await this.#removeBackendPath?.(entry.instance.treePath({ id }));
+                entry.gitPaths?.clear();
+                delete entry.config.cursors[id];
+            }
+            await this.patchStoredBackend(name, { cursors: entry.config.cursors || {} });
+        }
+    }
+
+    async #ensureGitPath(entry, treePath) {
+        if (!this.#insertBackendPath) return;
+        const seen = entry.gitPaths || (entry.gitPaths = new Set());
+        const parts = treePath.split('/').filter(Boolean);
+        for (let count = 2; count <= parts.length; count++) {
+            const current = '/' + parts.slice(0, count).join('/');
+            if (seen.has(current)) continue;
+            await this.#insertBackendPath(current, { label: count === 2 ? 'Git' : decodeGitSegment(parts[count - 1]) });
+            seen.add(current);
+        }
     }
 
     async #ensureConversationNode(entry, container) {
-        if (!entry || !['whatsapp', 'slack', 'teams'].includes(entry.driver) || !this.#insertBackendPath) return;
-        const treePath = getBackendFileContext(entry.driver, entry.address, container.id);
+        if (!entry || !['git', 'whatsapp', 'slack', 'teams'].includes(entry.driver) || !this.#insertBackendPath) return;
+        if (entry.driver === 'git') return this.#ensureGitPath(entry, entry.instance.treePath(container));
+        const treePath = entry.instance.treePath?.(container) || getBackendFileContext(entry.driver, entry.address, container.id);
         await this.#insertBackendPath(treePath, { label: container.name || container.id });
         // Path creation and label changes emit their own SynapsD events.
         // Repeated chat notifications and polling do not change the tree.
@@ -574,7 +634,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         if (!Array.isArray(liveUrls)) return;
         const live = new Set(liveUrls.map((url) => WorkspaceConnectorIndex.identityChecksum(url)));
 
-        const rootPath = `/${normalizeSegment(entry.driver)}/${normalizeSegment(entry.address)}`;
+        const rootPath = (entry.driver === 'git' ? gitTreePath(entry.address) : `/${normalizeSegment(entry.driver)}/${normalizeSegment(entry.address)}`);
         const ids = await this.#listDocumentIdsUnderBackendPath(rootPath);
         if (!Array.isArray(ids) || ids.length === 0) return;
         const docs = await this.#getDocumentsByIdArray(ids);
@@ -582,7 +642,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         // Scope to this container (drivers that can attribute provenance) and
         // to genuinely connector-ingested docs.
         const inScope = [];
-        for (const doc of (Array.isArray(docs) ? docs : [])) {
+        for (const doc of (Array.isArray(docs) ? docs : docs?.data || [])) {
             const provenance = (doc?.locations || []).find((l) => l?.metadata?.provenance)?.url;
             if (!provenance) continue;
             // null = the driver cannot attribute a URL to a container; that
@@ -594,7 +654,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
             inScope.push({ doc, provenance });
         }
         if (inScope.length === 0) return;
-        if (live.size === 0) {
+        if (live.size === 0 && entry.driver !== 'git') {
             this.#logger.warn({ workspaceId: this.#workspaceId, backend: name, container: container.id, indexed: inScope.length },
                 'Connector prune refused: source listing came back empty against a non-empty mirror');
             return;
@@ -670,13 +730,26 @@ export class WorkspaceConnectorIndex extends EventEmitter {
             checksumArray: [WorkspaceConnectorIndex.identityChecksum(provenance)],
         };
 
-        const contextSpec = getBackendFileContext(entry.driver, entry.address, containerSegment || container.id);
-        const docId = await this.#put(doc, {
+        const contextSpec = entry.instance.treePath?.(container, spec) || getBackendFileContext(entry.driver, entry.address, containerSegment || container.id);
+        if (entry.driver === 'git') await this.#ensureGitPath(entry, contextSpec);
+        let existingId = null;
+        if (entry.driver === 'git' && this.#resolveDocumentIdByChecksum && this.#getDocumentsByIdArray) {
+            const id = await this.#resolveDocumentIdByChecksum(doc.checksumArray[0]);
+            if (id != null) {
+                const result = await this.#getDocumentsByIdArray([id]);
+                const previous = (Array.isArray(result) ? result : result?.data || [])[0];
+                if (previous?.metadata?.git?.oid === metadata.git?.oid && previous.locations?.some(l => l.url === provenance)) existingId = id;
+            }
+        }
+        const docId = existingId ?? await this.#put(doc, {
             context: null,
             directory: this.#getBackendsTreeSelector(contextSpec),
             emitEvent: true,
             ...(features.length ? { features } : {}),
         });
+        for (const placement of entry.instance.placements?.(spec) || []) {
+            await this.#linkDocument?.(docId, placement);
+        }
         // A reply arriving AFTER its root was filed into a context follows it
         // there (the thread is the unit of work, see docs/connectors.md). The
         // mirror direction — filing the root later — is the Workspace's
@@ -710,10 +783,16 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     }
 
     async patchStoredBackend(name, patch = {}) {
-        const config = await this.readStoredConfig();
-        config.backends[name] = { ...(config.backends[name] || {}), ...patch };
-        await this.writeStoredConfig(config);
-        return config.backends[name];
+        // Multiple repositories poll concurrently; serialize read/modify/write
+        // so one branch cursor cannot overwrite another repository's config.
+        const pending = this.#configWrites.then(async () => {
+            const config = await this.readStoredConfig();
+            config.backends[name] = { ...(config.backends[name] || {}), ...patch };
+            await this.writeStoredConfig(config);
+            return config.backends[name];
+        });
+        this.#configWrites = pending.catch(() => {});
+        return pending;
     }
 }
 

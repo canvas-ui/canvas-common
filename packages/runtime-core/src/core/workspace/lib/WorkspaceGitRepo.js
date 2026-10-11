@@ -26,16 +26,9 @@ function spawnPromise(command, args, options = {}) {
 }
 
 /**
- * WorkspaceGitRepo
- *
- * Wraps the per-workspace git repository living at WORKSPACE_ROOT/git: a bare
- * repo (`bare.git`) plus a work tree checked out alongside it. This is the only
- * place that shells out to git for a workspace; it carries no workspace
- * knowledge beyond the two paths, so callers stay decoupled from git mechanics.
- *
- * Layout:
- *   <gitDir>/            work tree (hooks/, scripts/, dotfiles/, ...)
- *   <barePath>           bare repo clients push to / clone from
+ * Smart HTTP and hook commits for a checked-out workspace repository.
+ * `barePath` is retained as the API name for its Git metadata directory (.git).
+ * Git's updateInstead receive policy updates the work tree only when clean.
  */
 export class WorkspaceGitRepo {
     #barePath;
@@ -68,8 +61,9 @@ export class WorkspaceGitRepo {
 
     async initBare() {
         if (existsSync(this.#barePath)) return { created: false };
-        await fsPromises.mkdir(this.#barePath, { recursive: true });
-        await spawnPromise('git', ['init', '--bare', '--initial-branch=main'], { cwd: this.#barePath });
+        await fsPromises.mkdir(this.#gitDir, { recursive: true });
+        await spawnPromise('git', ['init', '--initial-branch=main'], { cwd: this.#gitDir });
+        await spawnPromise('git', ['config', 'receive.denyCurrentBranch', 'updateInstead'], { cwd: this.#gitDir });
         return { created: true };
     }
 
@@ -90,6 +84,8 @@ export class WorkspaceGitRepo {
     // scripts/) still deploys the others.
     async deploy(pathspecs = ['hooks/', 'scripts/']) {
         if (!existsSync(this.#barePath)) return;
+        // A standard work tree is updated atomically by receive-pack (updateInstead).
+        if (path.basename(this.#barePath) === '.git') return;
         await fsPromises.mkdir(this.#gitDir, { recursive: true });
         for (const pathspec of pathspecs) {
             try {
@@ -129,18 +125,12 @@ export class WorkspaceGitRepo {
     }
 
     async status() {
-        const branches = [];
+        let branches = [];
         let currentBranch = null;
         try {
-            const refsHeadsPath = path.join(this.#barePath, 'refs', 'heads');
-            if (existsSync(refsHeadsPath)) {
-                for (const file of await fsPromises.readdir(refsHeadsPath)) {
-                    if ((await fsPromises.stat(path.join(refsHeadsPath, file))).isFile()) {
-                        branches.push(file);
-                    }
-                }
-                currentBranch = branches.includes('main') ? 'main' : branches[0] || null;
-            }
+            const { stdout } = await spawnPromise('git', [...this.#repoArgs(), 'for-each-ref', '--format=%(refname:short)', 'refs/heads']);
+            branches = stdout.trim().split('\n').filter(Boolean);
+            currentBranch = (await spawnPromise('git', [...this.#repoArgs(), 'symbolic-ref', '--short', 'HEAD'])).stdout.trim();
         } catch { /* no refs yet */ }
         return { branches, currentBranch };
     }

@@ -71,7 +71,7 @@ async function listFilesRecursive(root, base = root) {
 /**
  * DotfileManager
  *
- * Owns the per-workspace git repository as a *service*: what to seed it with,
+ * Owns the internal git repository as a *service*: what to seed it with,
  * when to deploy, and the public surface routes call. All git mechanics live in
  * WorkspaceGitRepo; this class only orchestrates and emits service events.
  */
@@ -92,9 +92,9 @@ class DotfileManager extends EventEmitter {
     }
 
     #getGitDir(workspace) {
-        // Layout-aware (`git/` vs `.workspace/git/`), and honours a remapped
+        // Layout-aware (Git/internal or .workspace/Git/internal), honours a remapped
         // services.git.root.
-        return workspace.gitPath;
+        return workspace.gitInternalPath || path.join(workspace.gitPath, 'internal');
     }
 
     #getBareRepoPath(workspace) {
@@ -185,6 +185,7 @@ class DotfileManager extends EventEmitter {
         }
 
         await repo.deploy(DEPLOY_PATHSPECS);
+        if (workspace.addBackend) await workspace.addBackend('git', { address: 'internal' });
         this.emit('repository.initialized', { userId, workspace: workspace.id, path: repoPath });
         return { success: true, message: 'Repository initialized successfully', path: repoPath };
     }
@@ -252,7 +253,7 @@ class DotfileManager extends EventEmitter {
         return { success: true, added };
     }
 
-    // Persist webui hook edits back into the bare repo. Hooks are deployed by
+    // Persist webui hook edits back into the internal repo. Hooks are deployed by
     // checking out `hooks/` from bare HEAD, so an edit only written to the work
     // tree would be clobbered on the next push/deploy and never reach clients on
     // clone. No-op when git is not enabled for the workspace.
@@ -276,7 +277,7 @@ class DotfileManager extends EventEmitter {
         }
 
         const { branches, currentBranch } = await repo.status();
-        return { initialized: true, path: repo.barePath, branches, currentBranch, bare: true };
+        return { initialized: true, path: repo.barePath, branches, currentBranch, bare: false };
     }
 
     async handleGitHttpBackend(userId, workspaceIdOrObject, requestingUserId, service, request, reply) {

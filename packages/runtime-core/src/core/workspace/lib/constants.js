@@ -66,8 +66,8 @@ const WORKSPACE_DIRECTORIES = {
     // `cache` above). Nested under db/, NOT a hidden `.stored/` — see
     // WorkspaceStoredIndex.start() and its one-time migration off the old path.
     stored: 'db/stored',
-    git: 'git',
-    hooks: 'git/hooks',
+    git: 'Git',
+    hooks: 'Git/internal/hooks',
     roles: 'roles',
     var: 'var', // Unix sockets + runtime state
     varHooks: 'var/hooks', // hook/rule run log (runs.jsonl)
@@ -90,7 +90,7 @@ function workspaceDirectories(layout) {
         : WORKSPACE_DIRECTORIES;
 }
 
-const WORKSPACE_GIT_BARE_DIR = 'bare.git';
+const WORKSPACE_GIT_BARE_DIR = '.git';
 
 // Default sync exclusions for enumerable file backends (workspace:home).
 // Merged with the per-backend `exclude` list from workspace config; applied
@@ -205,7 +205,7 @@ const WORKSPACE_SERVICES = {
     },
     git: {
         enabled: false,
-        root: '{WORKSPACE_ROOT}/git',
+        root: '{WORKSPACE_ROOT}/Git',
     },
     imap: {
         enabled: false,
