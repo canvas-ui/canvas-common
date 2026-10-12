@@ -550,6 +550,7 @@ class ContextManager extends EventEmitter {
         if (!context) return null;
 
         if (updates.name !== undefined) context.name = updates.name || null;
+        if (updates.description !== undefined) context.description = updates.description;
         if (updates.order !== undefined) context.order = updates.order;
         if (updates.metadata !== undefined) context.metadata = updates.metadata;
         if (updates.acl !== undefined) await context.updateACL(updates.acl);

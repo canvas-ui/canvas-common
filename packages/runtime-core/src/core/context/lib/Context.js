@@ -32,6 +32,7 @@ class Context extends EventEmitter {
     // Context properties
     #id;
     #name;
+    #description;
     #scope; // 'workspace' (bound to one workspace) or 'universe' (can cross workspace boundaries)
     #baseUrl;
     #url;
@@ -89,6 +90,7 @@ class Context extends EventEmitter {
         // Context properties
         this.#id = options.id || uuidv4(); // TODO: Use human-typeable 6-char ULID
         this.#name = options.name || null;
+        this.#description = options.description || '';
         this.#scope = options.scope || (options.workspace?.type === 'universe' ? 'universe' : 'workspace');
         this.#url = null;
         this.#baseUrl = options.baseUrl || DEFAULT_BASE_URL;
@@ -228,6 +230,8 @@ class Context extends EventEmitter {
     get id() { return this.#id; }
     get name() { return this.#name; }
     set name(name) { this.#name = name || null; }
+    get description() { return this.#description; }
+    set description(description) { this.#description = description || ''; }
     get scope() { return this.#scope; }
     get isUniverse() { return this.#scope === 'universe'; }
     get userId() { return this.#userId; }
@@ -1412,6 +1416,7 @@ class Context extends EventEmitter {
         return {
             id: this.#id,
             name: this.#name,
+            description: this.#description,
             scope: this.#scope,
             userId: this.#userId,
             url: this.#url,

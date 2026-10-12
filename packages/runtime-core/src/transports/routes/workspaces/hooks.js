@@ -601,8 +601,9 @@ export default async function workspaceHooksRoutes(fastify) {
       const rulePaths = sourcePaths ? (Array.isArray(sourcePaths) ? sourcePaths : [sourcePaths]) : [];
       let docs;
       let nextOffset;
+      let total;
       try {
-        ({ docs, nextOffset } = await discoverBackfillDocuments(request.workspace, { paths: rulePaths, recursive: rule?.when?.pathExact === undefined, schemas, limit, offset }));
+        ({ docs, nextOffset, total } = await discoverBackfillDocuments(request.workspace, { paths: rulePaths, recursive: rule?.when?.pathExact === undefined, schemas, limit, offset }));
       } catch (error) {
         const response = new ResponseObject().serverError(`Document discovery failed (workspace active?): ${error.message}`);
         return reply.code(response.statusCode).send(response.getResponse());
@@ -660,6 +661,7 @@ export default async function workspaceHooksRoutes(fastify) {
         event,
         dryRun,
         processed: docs.length,
+        total,
         nextOffset,
         matched,
         failed,

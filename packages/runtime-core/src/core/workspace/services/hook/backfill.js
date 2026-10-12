@@ -10,22 +10,37 @@ export async function discoverBackfillDocuments(workspace, { paths = [], recursi
     }) : [{}];
     const featureSets = schemas.length ? schemas.map((key) => [key]) : [null];
     const single = selectors.length * featureSets.length === 1;
-    const seen = new Map();
+    const seen = new Set();
     for (const selector of selectors) {
         for (const features of featureSets) {
             const batch = await workspace.list({
                 ...selector, ...(features ? { features } : {}),
                 applyCanvasQuerySpec: false, order: 'asc',
-                limit: single ? limit + 1 : offset + limit + 1,
+                // For a union, count unique IDs before paging. Only hydrate
+                // the selected page, not every document in every source path.
+                idsOnly: !single,
+                limit: single ? limit + 1 : 0,
                 offset: single ? offset : 0,
             });
             if (batch?.error) throw new Error(String(batch.error));
-            for (const doc of (Array.isArray(batch) ? batch : batch?.data || [])) {
-                if (doc?.id != null) seen.set(doc.id, doc);
+            const data = Array.isArray(batch) ? batch : batch?.data || [];
+            if (single) {
+                return {
+                    docs: data.slice(0, limit),
+                    total: batch.totalCount ?? (data.length <= limit ? offset + data.length : undefined),
+                    nextOffset: data.length > limit ? offset + limit : null,
+                };
             }
+            for (const id of data) seen.add(id);
         }
     }
-    const ordered = [...seen.values()].sort((a, b) => a.id - b.id);
-    const page = single ? ordered : ordered.slice(offset);
-    return { docs: page.slice(0, limit), nextOffset: page.length > limit ? offset + limit : null };
+    const ordered = [...seen].sort((a, b) => a - b);
+    const ids = ordered.slice(offset, offset + limit);
+    const batch = ids.length ? await workspace.list({ ids, applyCanvasQuerySpec: false, order: 'asc', limit: ids.length }) : [];
+    if (batch?.error) throw new Error(String(batch.error));
+    return {
+        docs: Array.isArray(batch) ? batch : batch?.data || [],
+        total: ordered.length,
+        nextOffset: offset + limit < ordered.length ? offset + limit : null,
+    };
 }
