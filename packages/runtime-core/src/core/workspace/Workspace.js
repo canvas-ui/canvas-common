@@ -920,7 +920,10 @@ class Workspace extends EventEmitter {
         this.#logger.debug({ workspaceId: this.id }, 'Starting workspace');
         try {
             this.#withoutSecrets = false;
-            if (this.#configStore.get('protection')?.mode && !this.#crypto.protected) throw protectionError('WORKSPACE_KEYS_CORRUPT', 'Workspace keyslot file is missing');
+            const configuredMode = this.#configStore.get('protection')?.mode;
+            if (configuredMode && configuredMode !== 'none' && !this.#crypto.protected) {
+                throw protectionError('WORKSPACE_KEYS_CORRUPT', 'Workspace keyslot file is missing');
+            }
             if (this.#crypto.protected) {
                 const mode = this.#crypto.mode;
                 if (withoutSecrets && mode === 'secrets' && !passphrase) this.#withoutSecrets = true;
