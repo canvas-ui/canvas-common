@@ -32,6 +32,11 @@ function relationPreview(document) {
   return { id: document.id, schema: document.schema, schemaVersion: document.schemaVersion,
     createdAt: document.createdAt, updatedAt: document.updatedAt, data,
     metadata: { contentType: document.metadata?.contentType, filename: document.metadata?.filename },
+    // File names often live on a location, not on the document itself. Keep
+    // the naming fields so previews use the same label as the full document.
+    locations: (document.locations || []).filter(Boolean).map(location => ({
+      url: location.url, metadata: { filename: location.metadata?.filename },
+    })),
   };
 }
 
