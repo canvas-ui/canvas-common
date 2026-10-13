@@ -175,7 +175,7 @@ export const CLASSIFIER_SURFACE = Object.freeze({
         "sentTo('invoice@corp.tld')", "hasAttachment('application/pdf'?)",
         "inPath('/to-sort')", "inPath('backends:/github/owner/repo')",
     ],
-    fields: ['url', 'parsedUrl', 'host', 'from', 'to', 'subject', 'attachments', 'mime', 'paths', 'schema', 'doc'],
+    fields: ['url', 'parsedUrl', 'host', 'from', 'to', 'subject', 'body', 'sender', 'thread', 'channel', 'platform', 'attachments', 'mime', 'paths', 'schema', 'doc'],
 });
 
 // Hook context API — every key available on the `ctx` object a hook receives.

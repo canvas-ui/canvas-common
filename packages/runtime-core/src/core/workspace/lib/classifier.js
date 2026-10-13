@@ -147,6 +147,16 @@ class Classification {
         // invoice@..." must also match mails where the alias is in Cc).
         this.to = [...normalizeAddressList(doc?.data?.to), ...normalizeAddressList(doc?.data?.cc)];
         this.subject = typeof doc?.data?.subject === 'string' ? doc.data.subject : null;
+        // Message rules use stable sender/channel identifiers, not display names.
+        const data = doc?.data || {};
+        const text = (value) => typeof value === 'string' && value.length ? value : null;
+        this.body = text(data.body) || text(data.text) || text(data.content) || text(data.bodyHtml);
+        this.sender = text(data.sender?.id) || text(data.sender?.username) || text(data.sender?.name) || text(data.sender);
+        this.platform = text(data.platform);
+        this.channel = text(data.channel?.id) || text(data.channel);
+        // A Slack/Teams root may have no threadId until the first reply arrives.
+        this.thread = text(data.threadId)
+            || (['slack', 'teams'].includes(this.platform) ? text(doc?.metadata?.remoteId) : null);
         this.attachments = Array.isArray(doc?.data?.attachments) ? doc.data.attachments : [];
         // Paths keyed by tree so inPath can be tree-qualified: context paths
         // under 'context'; directory-type trees under their actual tree name

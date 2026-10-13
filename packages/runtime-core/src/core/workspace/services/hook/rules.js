@@ -20,7 +20,7 @@ import { classifyDocument } from '../../lib/classifier.js';
  *
  * Rule shape:
  *   { id, enabled?, description?, cascade?, approval?, editable?, ttl?,
- *     when: { event, reason?, schema?, path?, url?, from?, to?, subject?,
+ *     when: { event, reason?, schema?, path?, url?, from?, to?, subject?, body?, sender?, thread?, channel?, platform?,
  *     mime?, attachment? }, then: [ { action, ..., approval? } ] }
  *
  * `approval: true` (rule-level: hold the whole `then` block; action-level:
@@ -162,6 +162,11 @@ const WHEN_CHECKS = {
     // Any To/Cc recipient matches (substring or {equals|contains|startsWith|regex}).
     to: (c, matcher) => asArray(matcher).some((m) => c.to.some((addr) => matchText(addr, m))),
     subject: (c, matcher) => asArray(matcher).some((s) => matchText(c.subject, s)),
+    body: (c, matcher) => asArray(matcher).some((m) => matchText(c.body, m)),
+    sender: (c, matcher) => asArray(matcher).some((m) => matchText(c.sender, m)),
+    thread: (c, matcher) => asArray(matcher).some((m) => matchText(c.thread, m)),
+    channel: (c, matcher) => asArray(matcher).some((m) => matchText(c.channel, m)),
+    platform: (c, matcher) => asArray(matcher).some((m) => matchText(c.platform, m)),
     mime: (c, matcher) => asArray(matcher).some((m) => c.mimeMatches(m)),
     // `attachment: true` = has any attachment; string/array = attachment mime
     // pattern(s) (`application/pdf`, `image/*`, `*`); object = { mime?, filename? }.
@@ -216,7 +221,7 @@ export function matchRule(rule, eventName, c) {
     if (!when || typeof when !== 'object') { return false; }
 
     if (!WHEN_CHECKS.event(c, when.event, eventName)) { return false; }
-    for (const key of ['reason', 'schema', 'path', 'pathExact', 'url', 'from', 'to', 'subject', 'mime', 'attachment']) {
+    for (const key of ['reason', 'schema', 'path', 'pathExact', 'url', 'from', 'to', 'subject', 'body', 'sender', 'thread', 'channel', 'platform', 'mime', 'attachment']) {
         if (when[key] !== undefined && !WHEN_CHECKS[key](c, when[key])) { return false; }
     }
 
