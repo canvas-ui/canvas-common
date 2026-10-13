@@ -19,6 +19,9 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - name: Test repository retention policy
+        run: node --test .github/tests/housekeeping.test.mjs
+        working-directory: .
       - uses: oven-sh/setup-bun@v2
       - run: sudo apt-get update && sudo apt-get install -y nginx openssl
         working-directory: .
