@@ -246,6 +246,9 @@ export default async function workspaceBackendRoutes(fastify) {
         onRequest: [fastify.authenticate, requireWorkspaceWrite(), manageMessaging],
     }, async (request, reply) => {
         try {
+            if (drv(request.params.driver) === 'imap' && request.body?.removalPolicy) {
+                return ok(reply, await request.workspace.setMailboxRemovalPolicy(arg(request.params.address), arg(request.params.name), request.body.removalPolicy));
+            }
             const result = await request.workspace.renameBackendFolder(
                 drv(request.params.driver), arg(request.params.address), arg(request.params.name), String(request.body?.name || ''),
             );

@@ -167,6 +167,15 @@ class HookService extends EventEmitter {
             return;
         }
 
+        // A backend rediscovery must not replay automation over a removal decision.
+        if (Array.isArray(payload?.ids)) {
+            payload = { ...payload, ids: payload.ids.filter(id => !workspace.isRemovalHeld?.(id)),
+                ...(Array.isArray(payload.documents) ? { documents: payload.documents.filter(doc => !workspace.isRemovalHeld?.(doc.id)) } : {}) };
+            if (!payload.ids.length) return;
+        }
+        const removalId = payload?.document?.id ?? payload?.id ?? payload?.documentId;
+        if (removalId != null && workspace.isRemovalHeld?.(removalId)) return;
+
         // Directory selectors in event payloads carry the resolved tree ID
         // (selector normalization); the classifier's tree-qualified matching
         // ('backends:/github/x') needs the NAME — resolve once and stamp it.
@@ -530,6 +539,7 @@ class HookService extends EventEmitter {
         const { ids, count, documents: _documents, ...inherited } = batchPayload;
 
         for (const id of ids) {
+            if (workspace.isRemovalHeld?.(id)) continue;
             let document = null;
             try { document = await workspace.get(id); }
             catch (err) { logger.debug(`Batch fan-out: failed to load doc ${id}: ${err.message}`); }

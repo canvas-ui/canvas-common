@@ -29,6 +29,7 @@ export default class ImapBackend extends StorageBackend {
     #pollTimer = null;
     #lastUid = 0;
     #syncing = false;
+    #scanPromise = null;
     // Poll backoff: consecutive scan failures push the next attempt out
     // exponentially (capped) instead of re-running a possibly full initial
     // sync every poll tick.
@@ -241,6 +242,7 @@ export default class ImapBackend extends StorageBackend {
                         key: `${folderKey};UID=${uid}`,
                         raw: Buffer.concat(chunks),
                         uid,
+                        uidValidity: this.config.uidValidity,
                         seqno,
                         flags: attrs.flags || [],
                         folder: this.#folder,
@@ -273,30 +275,46 @@ export default class ImapBackend extends StorageBackend {
      * Incremental sync: search since last UID (or initialSyncDays / ALL), fetch
      * in batches, emit `object:add` per message. Returns { inserted, lastUid }.
      */
-    async scan(options = {}) {
+    scan(options = {}) {
+        if (this.#scanPromise) return this.#scanPromise;
+        this.#scanPromise = this.#scan(options).finally(() => { this.#scanPromise = null; });
+        return this.#scanPromise;
+    }
+
+    async #scan(options = {}) {
         if (typeof options.lastUid === 'number') this.#lastUid = Math.max(this.#lastUid, options.lastUid);
+        const checkpoint = { lastUid: this.#lastUid, uidValidity: this.config.uidValidity };
         try {
-            const result = await this.#withConnection((imap) => new Promise((resolve, reject) => {
-                this.#openBox(imap, this.#folder, true).then(async () => {
-                    await this.onFolder?.({ account: this.#account, folder: this.#folder, delimiter: this.config.folderDelimiter });
-                    imap.search(this.#searchCriteria(), (err, results) => {
-                        if (err) return reject(err);
-                        if (!results || results.length === 0) return resolve({ inserted: 0, lastUid: this.#lastUid });
-                        const batches = this.#fetchBatches(results);
-                        (async () => {
-                            try {
-                                for (const range of batches) await this.#fetchBatch(imap, range);
-                                this.emit('backend:state', { backend: this.name, lastUid: this.#lastUid });
-                                resolve({ inserted: results.length, lastUid: this.#lastUid });
-                            } catch (e) { reject(e); }
-                        })();
-                    });
-                }).catch(reject);
-            }));
+            const result = await this.#withConnection(async imap => {
+                const box = await this.#openBox(imap, this.#folder, true);
+                const uidValidity = String(box.uidvalidity || '');
+                const previousValidity = this.config.uidValidity;
+                const reset = Boolean(previousValidity && uidValidity && String(previousValidity) !== uidValidity);
+                if (reset) this.#lastUid = 0;
+                this.config.uidValidity = uidValidity;
+                await this.onFolder?.({ account: this.#account, folder: this.#folder, delimiter: this.config.folderDelimiter });
+                const search = criteria => new Promise((resolve, reject) => imap.search(criteria, (err, uids) => err ? reject(err) : resolve(uids || [])));
+                // ALL is a UID inventory only; raw messages are still fetched
+                // incrementally. Failed searches/fetches never reconcile absence.
+                const found = await search(this.#searchCriteria());
+                const results = found.filter(uid => Number(uid) > this.#lastUid);
+                for (const range of this.#fetchBatches(results)) await this.#fetchBatch(imap, range);
+                const present = await search(['ALL']);
+                await this.onInventory?.({ backend: this.name, account: this.#account, folder: this.#folder,
+                    uids: present, uidValidity, reset, previousValidity, delimiter: this.config.folderDelimiter });
+                const state = { backend: this.name, lastUid: this.#lastUid, uidValidity };
+                if (this.onState) await this.onState(state);
+                else this.emit('backend:state', state);
+                return { inserted: results.length, lastUid: this.#lastUid, uidValidity };
+            });
             this.#failures = 0;
             this.#nextAttemptAt = 0;
             return result;
         } catch (error) {
+            // Retry the epoch transition after an incomplete inventory. Otherwise
+            // legacy locations without an epoch could match reused UIDs next time.
+            this.#lastUid = checkpoint.lastUid;
+            this.config.uidValidity = checkpoint.uidValidity;
             this.#failures += 1;
             const interval = Number(this.config.pollInterval || DEFAULT_POLL_INTERVAL);
             const backoff = Math.min(interval * 2 ** this.#failures, MAX_BACKOFF_MS);

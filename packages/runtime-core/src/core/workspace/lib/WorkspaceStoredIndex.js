@@ -140,6 +140,9 @@ export class WorkspaceStoredIndex {
     // each successful resync; also used by explicit gcOrphanedDocuments calls.
     #getOrphanRetentionDays;
     #getOrphanPolicy;
+    #onLocationsRemoved;
+    #onRemovalReady;
+    #replicaOwnerGuard;
     // Serialize document mutations across watcher events and explicit scans.
     // In particular, an old unlink must not overwrite a concurrently added
     // location, and succession must migrate curation before deleting its row.
@@ -158,7 +161,7 @@ export class WorkspaceStoredIndex {
     // learns the document id behind the bytes it just landed.
     #inflightUpserts = new Map();
 
-    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, moveBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, getOrphanPolicy = null, onBackendChanged = null }) {
+    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, moveBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, getOrphanPolicy = null, onBackendChanged = null, onLocationsRemoved = null, onRemovalReady = null, replicaOwnerGuard = null }) {
         if (!dataPath || !homePath) throw new Error('dataPath and homePath are required');
         if (!put || !unlink || !getBackendsTreeSelector || !getDb) throw new Error('put, unlink, getBackendsTreeSelector, getDb are required');
 
@@ -191,6 +194,9 @@ export class WorkspaceStoredIndex {
         this.#persistBackendConfig = persistBackendConfig;
         this.#getOrphanRetentionDays = getOrphanRetentionDays;
         this.#getOrphanPolicy = getOrphanPolicy;
+        this.#onLocationsRemoved = onLocationsRemoved;
+        this.#onRemovalReady = onRemovalReady;
+        this.#replicaOwnerGuard = replicaOwnerGuard;
         this.#onBackendChanged = typeof onBackendChanged === 'function' ? onBackendChanged : null;
     }
 
@@ -875,6 +881,7 @@ export class WorkspaceStoredIndex {
                 cache: { path: this.#cachePath },
                 checksums: ['sha256'],
                 primaryChecksum: 'sha256',
+                replication: { ownerGuard: this.#replicaOwnerGuard },
                 // Inline metadata extraction at ingest (EXIF/GPS/dimensions/media).
                 // Graceful + optional: no-ops if parser deps are absent. Disable
                 // with CANVAS_EXTRACT_DISABLED=true.
@@ -1305,6 +1312,8 @@ export class WorkspaceStoredIndex {
     async applyBackendConfig(name, fullConfig = {}, patch = {}) {
         if (!this.#stored) return;
         this.#dataBackends = { ...this.#dataBackends, [name]: fullConfig };
+        const configured = this.#stored.getBackend(name);
+        if (configured && 'removalPolicy' in patch) configured.config.removalPolicy = fullConfig.removalPolicy;
 
         const isLocal = STORED_DRIVERS.has(fullConfig.driver) && fullConfig.supported !== false;
 
@@ -1661,7 +1670,7 @@ export class WorkspaceStoredIndex {
             }
 
             const removedUrls = ownedLocations.map((l) => l.url);
-            await this.#reconcileRemovedLocations(doc, removedUrls);
+            await this.#reconcileRemovedLocations(doc, removedUrls, { suppressPolicy: Boolean(successorFile) });
             reconciled += 1;
         }
         if (reconciled > 0) {
@@ -1853,7 +1862,7 @@ export class WorkspaceStoredIndex {
                 const removed = [`stored://${storedFile.backend}/${storedFile.key}`];
                 const twin = this.#deviceFileLocationUrl(storedFile.backend, storedFile.key);
                 if (twin) removed.push(twin);
-                await this.#reconcileRemovedLocationsNow(predecessor, removed);
+                await this.#reconcileRemovedLocationsNow(predecessor, removed, { suppressPolicy: true });
             }
         }
         return docId;
@@ -1896,7 +1905,7 @@ export class WorkspaceStoredIndex {
         if (locations.length === 0) {
             // Nothing left to point at — hand over to the orphan path so the
             // orphanedAt stamp and retention semantics stay in one place.
-            return this.#reconcileRemovedLocationsNow(doc, (doc.locations || []).map((l) => l.url));
+            return this.#reconcileRemovedLocationsNow(doc, (doc.locations || []).map((l) => l.url), { notify: !String(payload.origin || '').startsWith('trash:') });
         }
         await this.#put({ id: doc.id, locations }, { context: null });
         return doc.id;
@@ -1924,7 +1933,7 @@ export class WorkspaceStoredIndex {
         const removedUrls = [`stored://${storedFile.backend}/${storedFile.key}`];
         const twin = this.#deviceFileLocationUrl(storedFile.backend, storedFile.key);
         if (twin) removedUrls.push(twin);
-        return this.#reconcileRemovedLocationsNow(existingDocument, removedUrls);
+        return this.#reconcileRemovedLocationsNow(existingDocument, removedUrls, { suppressPolicy: Boolean(storedFile.origin), notify: !/^(trash:|replica:|workspace-directory:)/.test(storedFile.origin || '') });
     }
 
     /**
@@ -1932,22 +1941,23 @@ export class WorkspaceStoredIndex {
      * given location URLs from a document, with the configured last-location
      * semantics of #reconcileRemovedLocations below.
      */
-    async reconcileRemovedLocations(doc, removedUrls = []) {
-        return this.#reconcileRemovedLocations(doc, removedUrls);
+    async reconcileRemovedLocations(doc, removedUrls = [], options = {}) {
+        return this.#reconcileRemovedLocations(doc, removedUrls, options);
     }
 
     /**
      * A backing blob vanished from one or more locations. Drop those locations;
      * the doc keeps its survivors and unticks only the backends-tree path(s) the
      * dead locations backed. With no survivors, remove the index row by default.
-     * orphanPolicy:'keep' instead retains curation and marks an orphan for
-     * optional retention GC. Never infer absence from an incomplete scan.
+     * With onLocationsRemoved, durable Workspace Trash owns source-loss
+     * lifecycle and no orphan is automatically purged. The legacy standalone
+     * orphanPolicy remains supported. Never infer absence from an incomplete scan.
      */
-    async #reconcileRemovedLocations(doc, removedUrls = []) {
-        return this.#mutateDocuments(() => this.#reconcileRemovedLocationsNow(doc, removedUrls));
+    async #reconcileRemovedLocations(doc, removedUrls = [], options = {}) {
+        return this.#mutateDocuments(() => this.#reconcileRemovedLocationsNow(doc, removedUrls, options));
     }
 
-    async #reconcileRemovedLocationsNow(doc, removedUrls = []) {
+    async #reconcileRemovedLocationsNow(doc, removedUrls = [], options = {}) {
         const db = this.#getDb();
         // Scan snapshots and connector events may carry an older location set.
         if (typeof db.getDocument === 'function') {
@@ -1959,8 +1969,13 @@ export class WorkspaceStoredIndex {
         if (remaining.length === (doc.locations || []).length) return doc.id;
         const currentBackendPaths = await db.listDocumentTreePaths(doc.id, BACKENDS_TREE_NAME).catch(() => []);
 
+        const operations = options.notify === false ? [] : await this.#onLocationsRemoved?.({
+            document: doc, removedLocations: doc.locations.filter(l => removed.has(l.url)),
+            remainingLocations: remaining, ...options,
+        }) || [];
+        const ready = async () => { await this.#onRemovalReady?.(operations); return doc.id; };
         if (remaining.length === 0) {
-            const policy = this.#getOrphanPolicy?.() ?? 'remove';
+            const policy = this.#onLocationsRemoved ? 'keep' : this.#getOrphanPolicy?.() ?? 'remove';
             if (policy === 'remove') {
                 await db.delete(doc.id);
                 await this.purgeThumbnails([doc]).catch(() => {});
@@ -1976,7 +1991,7 @@ export class WorkspaceStoredIndex {
             // placements in every other tree stay untouched. Thumbnails stay too
             // (checksum-keyed) — the GC purges them with the doc.
             await this.#removeStalePaths(doc.id, currentBackendPaths, []);
-            return doc.id;
+            return ready();
         }
 
         const survivors = remaining
@@ -1985,8 +2000,11 @@ export class WorkspaceStoredIndex {
             .map((p) => ({ backend: p.backend, key: p.key }));
 
         await this.#put({ id: doc.id, locations: remaining }, { context: null });
-        await this.#removeStalePaths(doc.id, currentBackendPaths, this.#buildBackendPaths(survivors));
-        return doc.id;
+        const affectedRoots = [...new Set(doc.locations.filter(l => removed.has(l.url))
+            .map(l => this.#getBackendRootPath(l.metadata?.backend || parseLocationUrl(l.url)?.backend)).filter(Boolean))];
+        const preserved = currentBackendPaths.filter(p => !affectedRoots.some(root => p === root || p.startsWith(`${root}/`)));
+        await this.#removeStalePaths(doc.id, currentBackendPaths, [...preserved, ...this.#buildBackendPaths(survivors)]);
+        return ready();
     }
 
     /**
@@ -2000,6 +2018,8 @@ export class WorkspaceStoredIndex {
     }
 
     async #gcOrphanedDocumentsNow({ retentionDays } = {}) {
+        // Source-loss Trash is manually purged; legacy orphan GC cannot bypass it.
+        if (this.#onLocationsRemoved) return { purged: 0 };
         const db = this.#getDb();
         const days = Number.isFinite(retentionDays)
             ? retentionDays
@@ -2433,9 +2453,9 @@ export class WorkspaceStoredIndex {
 
         if (kept.length === 0 && doc?.id != null) {
             if (options.keepDocument === true) {
-        // Caller chose to keep the index entry with no retrievable bytes
-        // (locations: []) — metadata/checksums stay searchable. orphanedAt
-        // is the GC lifecycle and what ticks feature/orphaned.
+                // Caller chose to keep the index entry with no retrievable bytes
+                // (locations: []) — metadata/checksums stay searchable. orphanedAt
+                // is the GC lifecycle and what ticks feature/orphaned.
                 doc.orphanedAt = doc.orphanedAt || new Date().toISOString();
                 await this.#put(doc, { context: null });
             } else {

@@ -8,6 +8,7 @@ import fs from 'fs/promises';
 import crypto from 'crypto';
 import { simpleParser } from 'mailparser';
 import ImapBackend from './ImapBackend.js';
+import { normalizeRemovalPolicy } from '../../lib/backend-removal-policy.js';
 import { normalizeSmtp, emailAddresses } from '../messages/email.js';
 import Email from 'canvas-synapsd/src/schemas/core/Email.js';
 import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
@@ -86,12 +87,13 @@ export class WorkspaceMailIndex extends EventEmitter {
     #unlockBackendNode;
     // Threading: copy the parent's context placements onto a new reply.
     #inheritThreadMemberships;
+    #reconcileRemovedLocations;
 
     #started = false;
     #backends = new Map(); // name -> ImapBackend
     #backendStatus = new Map();
 
-    constructor({ resolveCredentials = (value) => value, protectConfig = (value) => value, secretsLocked = () => false, rootPath, configDir = path.join(rootPath, 'config'), workspaceId, logger, put, putMany = null, link = null, linkMany = null, assertRelation = null, getBackendsTreeSelector, insertBackendPath = null, getDb, persistBlob, lockBackendNode = null, unlockBackendNode = null, inheritThreadMemberships = null }) {
+    constructor({ resolveCredentials = (value) => value, protectConfig = (value) => value, secretsLocked = () => false, rootPath, configDir = path.join(rootPath, 'config'), workspaceId, logger, put, putMany = null, link = null, linkMany = null, assertRelation = null, getBackendsTreeSelector, insertBackendPath = null, getDb, persistBlob, lockBackendNode = null, unlockBackendNode = null, inheritThreadMemberships = null, reconcileRemovedLocations = null }) {
         super({ wildcard: true, delimiter: '.', maxListeners: 100 });
         if (!rootPath) throw new Error('rootPath is required');
         if (!put || !getBackendsTreeSelector || !getDb || !persistBlob) {
@@ -115,6 +117,7 @@ export class WorkspaceMailIndex extends EventEmitter {
         this.#lockBackendNode = lockBackendNode;
         this.#unlockBackendNode = unlockBackendNode;
         this.#inheritThreadMemberships = inheritThreadMemberships;
+        this.#reconcileRemovedLocations = reconcileRemovedLocations;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -180,6 +183,35 @@ export class WorkspaceMailIndex extends EventEmitter {
     // error directly to this service.
     // ─────────────────────────────────────────────────────────────────────────
 
+    async reconcileInventory(inventory, config = {}) {
+        if (!this.#reconcileRemovedLocations) return;
+        const db = this.#getDb();
+        const treePath = getBackendEmailContext('imap', inventory.account, inventory.folder, inventory.delimiter === undefined ? '/' : inventory.delimiter);
+        const { documents = [] } = await db.listTreeDocuments('backends', { path: treePath, limit: null });
+        const present = new Set(inventory.uids.map(Number));
+        for (const doc of documents) {
+            if (!String(doc.schema).startsWith('data/schema/email')) continue;
+            const prefix = `imap://${this.#safeAccount(inventory.account)}/${this.#encodeFolder(inventory.folder)};UID=`;
+            const removed = (doc.locations || []).filter(l => {
+                if (!l.url.startsWith(prefix)) return false;
+                const uid = Number(l.url.slice(prefix.length));
+                const epoch = l.metadata?.uidValidity;
+                return (inventory.reset && String(epoch || '') !== inventory.uidValidity)
+                    || (epoch && String(epoch) !== inventory.uidValidity) || !present.has(uid);
+            });
+            if (!removed.length) continue;
+            const removedUrls = new Set(removed.map(l => l.url));
+            const survives = (doc.locations || []).some(l => !removedUrls.has(l.url) && l.url.startsWith(`imap://${this.#safeAccount(inventory.account)}/`));
+            await this.#reconcileRemovedLocations(doc, [...removedUrls], {
+                source: { backend: inventory.backend, driver: 'imap', account: inventory.account, folder: inventory.folder,
+                    policy: config.removalPolicy, survives },
+            });
+            // The blob store has no mailbox path. Remove only the vanished
+            // mailbox membership; surviving folders and curated trees remain.
+            await db.unlink(doc.id, { context: null, directory: this.#getBackendsTreeSelector(treePath), emitEvent: false });
+        }
+    }
+
     #registerBackend(name, config) {
         let backend = this.#backends.get(name);
         if (backend) return backend;
@@ -198,7 +230,8 @@ export class WorkspaceMailIndex extends EventEmitter {
         };
         backend.onMessage = (payload) => this.#onObject(payload);
         backend.onBatch = (payloads) => this.ingestBatch(payloads);
-        backend.on('backend:state', (payload) => this.#persistBackendState(payload));
+        backend.onState = payload => this.#persistBackendState(payload);
+        backend.onInventory = inventory => this.reconcileInventory(inventory, config);
         backend.on('error', (error) => {
             this.#setBackendError(name, error);
             this.emit('error', { source: name, error: error?.message || String(error) });
@@ -249,6 +282,7 @@ export class WorkspaceMailIndex extends EventEmitter {
         if (!payload.backend) return;
         await this.patchStoredBackend(payload.backend, {
             lastUid: payload.lastUid,
+            uidValidity: payload.uidValidity,
             lastSyncAt: new Date().toISOString(),
         }).catch((error) => this.#logger.warn({ workspaceId: this.#workspaceId, backend: payload.backend, error: error.message }, 'Failed to persist backend state'));
         this.emit('source:state', { source: payload.backend, lastUid: payload.lastUid });
@@ -262,7 +296,7 @@ export class WorkspaceMailIndex extends EventEmitter {
 
         const parsed = await simpleParser(raw);
         const { emailDoc, attachmentDocs } = await this.#buildEmailDocument(parsed, raw, {
-            uid, seqno, flags,
+            uid, seqno, flags, uidValidity: payload.uidValidity,
             provider: 'imap',
             accountId: account,
             folderName: folder,
@@ -410,6 +444,7 @@ export class WorkspaceMailIndex extends EventEmitter {
                     }
                 }
                 docIds.push(...ids.filter((id) => id != null));
+                if (ids.some(id => id == null)) throw new Error('IMAP batch ingestion was incomplete; absence reconciliation is paused', { cause: error });
                 continue;
             }
             docIds.push(...ids);
@@ -572,7 +607,7 @@ export class WorkspaceMailIndex extends EventEmitter {
         const provenanceUrl = `imap://${account}/${folder}${uid ? `;UID=${uid}` : ''}`;
         emailDoc.locations = [
             { url: raw.url, metadata: { size: rawBuffer.length, synced: true } },
-            { url: provenanceUrl, metadata: { provenance: true } },
+            { url: provenanceUrl, metadata: { provenance: true, uidValidity: imapMetadata.uidValidity || null } },
         ];
         // Primary = raw bytes (content identity); the rest are thread alias
         // keys (class comment). Consumers only ever read [0] as a hash.
@@ -772,6 +807,25 @@ export class WorkspaceMailIndex extends EventEmitter {
         return { url, scheme: 'imap', backend: p?.backend, kind: 'imap', deletable };
     }
 
+    async verifyRemovalSource(operation) {
+        const backend = this.#backends.get(operation.source.backend);
+        if (!backend) throw new Error('Source mailbox is unavailable; deletion is paused');
+        // Refresh every subscribed mailbox first, so a move to another folder
+        // is ingested before deciding whether the account lost the message.
+        for (const peer of this.#backends.values()) {
+            if (peer !== backend && peer.config.user === backend.config.user) await peer.scan();
+        }
+        const doc = await this.#getDb().getDocument(operation.documentId);
+        if ((doc?.locations || []).some(l => l.url.startsWith(`imap://${this.#safeAccount(operation.source.account)}/`))) {
+            throw new Error('The message is present in another mailbox; review the current item');
+        }
+        for (const location of operation.removedLocations) {
+            const parsed = parseLocationUrl(location.url);
+            const raw = await backend.get(parsed.key);
+            if (raw && this.#createChecksum(raw) === operation.checksum) throw new Error('The message is present at the source again; review the current item');
+        }
+    }
+
     // EXPUNGE the message behind an imap:// url. Returns { ok } — ok:false means
     // no credentials wired or readOnly mailbox (caller reference-drops only).
     async destroyImapLocation(url) {
@@ -860,6 +914,7 @@ export class WorkspaceMailIndex extends EventEmitter {
         const result = await backend.scan();
         await this.patchStoredBackend(name, {
             lastUid: result.lastUid,
+            uidValidity: result.uidValidity,
             lastSyncAt: new Date().toISOString(),
             lastError: null,
         });
@@ -911,6 +966,8 @@ export class WorkspaceMailIndex extends EventEmitter {
             // readOnly: never delete on the server (Destroy degrades to a
             // reference drop) even though the imap driver supports EXPUNGE.
             readOnly: input.readOnly === true,
+            removalPolicy: normalizeRemovalPolicy(input.removalPolicy),
+            uidValidity: input.uidValidity || null,
             smtp: normalizeSmtp(input.smtp),
             pollInterval, initialSyncDays,
             lastUid: Math.max(0, Number(input.lastUid || 0)),
@@ -929,6 +986,7 @@ export class WorkspaceMailIndex extends EventEmitter {
             host: config.host, port: config.port, tls: config.tls, allowSelfSigned: config.allowSelfSigned,
             user: config.user, folder: config.folder, mode: config.mode || 'poll',
             readOnly: config.readOnly === true,
+            removalPolicy: normalizeRemovalPolicy(config.removalPolicy),
             pollInterval: config.pollInterval, initialSyncDays: config.initialSyncDays,
             lastUid: config.lastUid || 0, lastSyncAt: config.lastSyncAt || null, lastError: this.#secretsLocked() && containsSecrets(config) ? 'Credentials locked — start with PIN/password' : config.lastError || null,
             passwordConfigured: Boolean(config.password),

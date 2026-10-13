@@ -1,3 +1,5 @@
+import WorkspaceTrashOperations from './services/trash/index.js';
+import { backendIdentity, normalizeRemovalPolicy } from './lib/backend-removal-policy.js';
 'use strict';
 
 import { readMessageThread } from './services/messages/thread.js';
@@ -102,6 +104,10 @@ class Workspace extends EventEmitter {
 
     #db = null;
     #storedIndex = null;
+    #trashOperations = null;
+    get trashOperations() { return this.#trashOperations ??= new WorkspaceTrashOperations({ workspace: this, state: this.#getActiveDb().internalStore }); }
+    isRemovalHeld(id) { return this.trashOperations.held(id); }
+    get storageOperations() { return this.#storedIndex?.stored?.replicas; }
     #mailIndex = null;
     #mailRuntimeBinding = null;
     #connectorIndex = null;
@@ -601,6 +607,7 @@ class Workspace extends EventEmitter {
     static #ALWAYS_ON_BACKENDS = new Set([WorkspaceStoredIndex.DATA_BLOB_BACKEND]);
 
     async setDataBackendConfig(backendName, patch) {
+        if (patch && 'removalPolicy' in patch) patch = { ...patch, removalPolicy: normalizeRemovalPolicy(patch.removalPolicy) };
         if (Workspace.#ALWAYS_ON_BACKENDS.has(backendName)) {
             if (patch?.enabled === false) {
                 throw new Error(`Data backend "${backendName}" is structural and cannot be disabled`);
@@ -1185,7 +1192,7 @@ class Workspace extends EventEmitter {
         });
         // A re-put of identical content resolves to the SAME document by
         // checksum, so this is also the path a copy-then-delete move takes.
-        await this.#untrashOnLink(result).catch(() => {});
+        if (!allowBackendsWrite && (context != null || directory != null)) await this.#untrashOnLink(result).catch(() => {});
         return result;
     }
 
@@ -1197,7 +1204,7 @@ class Workspace extends EventEmitter {
             emitEvent,
             ...(provenance ? { provenance } : {}),
         });
-        await this.#untrashOnLink(id).catch(() => {});
+        if (!allowBackendsWrite && (context != null || directory != null)) await this.#untrashOnLink(id).catch(() => {});
         await this.#cascadeThreadContext('link', [id], context, emitEvent);
         return result;
     }
@@ -1274,6 +1281,7 @@ class Workspace extends EventEmitter {
      * copied — the connector already filed the reply under its channel.
      */
     async inheritThreadMemberships(replyId, rootId) {
+        if (this.isRemovalHeld(replyId)) return;
         const reply = parseDocumentId(replyId, 'Reply document ID');
         const root = parseDocumentId(rootId, 'Root document ID');
         if (reply === root) return 0;
@@ -1326,6 +1334,7 @@ class Workspace extends EventEmitter {
         const { managedBlobs, checksums } = await this.#collectDeletionArtifacts([docId]);
         const result = await this.#getActiveDb().delete(docId, options);
         if (result) {
+            await this.trashOperations.release(docId);
             await this.#cascadeManagedBlobDeletion(managedBlobs);
             await this.#purgeDeletedDocThumbnails(checksums);
         }
@@ -1833,6 +1842,7 @@ class Workspace extends EventEmitter {
         const { managedBlobs, checksums } = await this.#collectDeletionArtifacts(docIds);
         const result = await this.#getActiveDb().deleteMany(docIds, options);
         const deletedIds = new Set((result?.successful ?? []).map((entry) => entry?.id ?? entry));
+        for (const id of deletedIds) await this.trashOperations.release(id);
         await this.#cascadeManagedBlobDeletion(managedBlobs, deletedIds);
         await this.#purgeDeletedDocThumbnails(checksums, deletedIds);
         return result;
@@ -2080,6 +2090,97 @@ class Workspace extends EventEmitter {
         return this.getDirectoryTreeSelector(Workspace.TRASH_PATH, Workspace.DIRECTORY_TREE_NAME);
     }
 
+    async observeSourceRemoval({ document, removedLocations, remainingLocations, source, suppressPolicy = false }) {
+        const groups = new Map();
+        for (const location of removedLocations) {
+            const parsed = parseLocationUrl(location.url);
+            const backend = source?.backend || location.metadata?.backend || parsed?.backend;
+            if (!backend) continue;
+            if (!groups.has(backend)) groups.set(backend, []);
+            groups.get(backend).push(location);
+        }
+        const ids = [];
+        for (const [backend, locations] of groups) {
+            const config = this.dataBackends[backend] || {};
+            const survives = remainingLocations.some(l => (l.metadata?.backend || parseLocationUrl(l.url)?.backend) === backend);
+            ids.push(await this.trashOperations.observe({ document, removedLocations: locations, remainingLocations, suppressPolicy,
+                source: { ...(source || { backend, driver: config.driver || 'unknown', policy: config.removalPolicy, survives }), backendIdentity: backendIdentity(config) } }));
+        }
+        return ids;
+    }
+
+    async finishRemovalObservation(operation, document) {
+        await this.#storedIndex.reconcileRemovedLocations(document, operation.removedLocations.map(l => l.url), { notify: false });
+    }
+
+    async trashFromSourceLoss(id, placements, operationId) {
+        const db = this.#getActiveDb();
+        const old = db.internalStore.get(this.#trashProvenanceKey(id));
+        // Persist restore provenance before unfiling; replay never replaces it
+        // with the partially-unlinked placement set.
+        if (!old) await db.internalStore.put(this.#trashProvenanceKey(id), {
+            trashedAt: new Date().toISOString(), reason: 'source-missing', operationId, placements,
+        });
+        for (const placement of placements) for (const path of [...placement.paths].sort((a, b) => b.length - a.length)) {
+            const spec = placement.type === 'context'
+                ? { context: { tree: placement.treeId, path } }
+                : { context: null, directory: { tree: placement.treeId, path } };
+            await db.unlink(id, { ...Workspace.#buildWriteSpec(spec.context, spec.directory), emitEvent: false });
+        }
+        await db.link(id, { context: null, directory: this.getTrashSelector(), emitEvent: false });
+        this.#trashedIds?.add(id);
+        this.emit('trash.changed', { documentId: id });
+    }
+
+    async removeTrackedCopy(operation, target) {
+        const stored = this.#storedIndex?.stored;
+        const config = this.dataBackends[target.backend];
+        if (target.backendIdentity !== backendIdentity(config)) throw new Error('Destination backend configuration changed; review the current copy');
+        if (!config || config.enabled === false || config.readOnly || !normalizeRemovalPolicy(config.removalPolicy).acceptPropagatedDeletions) {
+            throw new Error(`Backend ${target.backend} does not accept propagated deletions`);
+        }
+        if (!stored?.removeToTrash) throw new Error('Recoverable removal requires the updated canvas-stored runtime');
+        const ownerName = `workspace-document:${operation.documentId}`;
+        if (stored.replicas.owners().some(owner => owner.owner !== ownerName && owner.replicas.some(r => r.backend === target.backend && r.key === target.key))) {
+            throw new Error('Another storage policy owner still needs this copy');
+        }
+        const result = await stored.removeToTrash(target.backend, target.key, {
+            operationId: JSON.stringify([operation.id, target.backend, target.key]), sha256: operation.checksum,
+        });
+        if (!result.ok) throw new Error(result.reason || 'Copy removal failed');
+        return result;
+    }
+
+    async verifyRemovalSource(operation) {
+        if (operation.source.backendIdentity !== backendIdentity(this.dataBackends[operation.source.backend] || {})) {
+            throw new Error('Source backend configuration changed; deletion is paused');
+        }
+        if (operation.source.driver === 'imap') return this.#mailIndex.verifyRemovalSource(operation);
+        const stored = this.#storedIndex?.stored;
+        for (const endpoint of this.#storedIndex.locationEndpoints({ locations: operation.removedLocations })) {
+            const backend = stored.getBackend(endpoint.backend);
+            // Removing a backend configuration is not proof that its bytes
+            // disappeared. Leave that operation for review until it is reachable.
+            if (!backend) throw new Error('Source backend is unavailable; deletion is paused');
+            if (typeof backend.verifyRoot === 'function' && !(await backend.verifyRoot()).ok) throw new Error('Source backend is unreachable; deletion is paused');
+            if (await backend.stat(endpoint.key)) throw new Error('The source path exists again; review the current item');
+        }
+    }
+
+    async actOnRemovalCopy(target, action) {
+        const stored = this.#storedIndex?.stored;
+        if (!stored) throw new Error('Storage is not running');
+        return action === 'restore' ? stored.restoreTrash(target.backend, target.trashId, { origin: 'trash:restore' })
+            : stored.discardTrash(target.backend, target.trashId);
+    }
+
+    async setMailboxRemovalPolicy(address, folder, policy) {
+        const mailbox = (await this.listImapMailboxes()).find(m => normalizeSegment(m.user || m.account) === normalizeSegment(address) && m.folder === folder);
+        if (!mailbox) throw Object.assign(new Error('Mailbox not found'), { statusCode: 404 });
+        await this.saveImapMailbox({ id: mailbox.id, removalPolicy: normalizeRemovalPolicy(policy) });
+        return this.getBackend('imap', address);
+    }
+
     #trashProvenanceKey(docId) { return `workspace/trash/${docId}`; }
 
     // File an orphaned document into the trash path. `placementsBefore` is the
@@ -2139,6 +2240,7 @@ class Workspace extends EventEmitter {
         if (raw === undefined || raw === null) { return false; }
         const docId = parseDocumentId(raw, 'Document ID');
 
+        await this.trashOperations.release(docId);
         const trashed = await this.#loadTrashedIds();
         if (!trashed.has(docId)) { return false; }
 
@@ -2214,20 +2316,39 @@ class Workspace extends EventEmitter {
      */
     async emptyTrash({ documentIds = null } = {}) {
         const db = this.#getActiveDb();
-        const ids = documentIds
-            ? parseDocumentIdArray(documentIds, 'Document ID array')
-            : (await db.listTreeDocuments(Workspace.DIRECTORY_TREE_NAME, {
-                path: Workspace.TRASH_PATH, idsOnly: true,
-            })).ids;
+        const trashed = new Set((await db.listTreeDocuments(Workspace.DIRECTORY_TREE_NAME, {
+            path: Workspace.TRASH_PATH, idsOnly: true,
+        })).ids);
+        const ids = documentIds ? parseDocumentIdArray(documentIds, 'Document ID array') : [...trashed];
+        if (ids.some(id => !trashed.has(id))) throw Object.assign(new Error('Only items already in Trash can be purged'), { statusCode: 409 });
         if (!ids.length) { return { destroyed: [], failed: [], count: 0 }; }
 
-        const result = await this.deleteMany(ids);
+        // An extant backend copy remains indexed in the backend mirror. Purging
+        // a managed-tree placement does not grant permission to delete that
+        // copy, or hide it until the next scan resurrects it.
+        const preserved = [];
+        const purgeIds = [];
+        for (const id of ids) {
+            const doc = await this.get(id);
+            const provenance = db.internalStore.get(this.#trashProvenanceKey(id));
+            if (provenance?.reason === 'source-missing' && doc?.locations?.length) {
+                await db.unlink(id, { context: null, directory: this.getTrashSelector(), emitEvent: false });
+                await db.internalStore.remove(this.#trashProvenanceKey(id));
+                this.#trashedIds?.delete(id);
+                preserved.push(id);
+            } else {
+                if (!doc?.locations?.length) await this.storageOperations?.retireOwner?.(`workspace-document:${id}`);
+                purgeIds.push(id);
+            }
+        }
+        const result = purgeIds.length ? await this.deleteMany(purgeIds) : { successful: [], failed: [] };
         const destroyed = (result?.successful ?? []).map((entry) => entry?.id ?? entry);
         for (const docId of destroyed) {
             await db.internalStore.remove(this.#trashProvenanceKey(docId));
             this.#trashedIds?.delete(docId);
+            await this.trashOperations.release(docId);
         }
-        return { destroyed, failed: result?.failed ?? [], count: ids.length };
+        return { destroyed, preserved, failed: result?.failed ?? [], count: ids.length };
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3234,6 +3355,8 @@ class Workspace extends EventEmitter {
                 label: status.label || null,
                 // Authoring device snapshot for device-scoped mounts.
                 device: status.device || null,
+                removalPolicy: normalizeRemovalPolicy(status.removalPolicy),
+                propagatedRemovalSupported: ['file', 'cacache'].includes(driver),
                 readOnly: status.readOnly === true,
                 managed: status.managed === true,
                 supported: status.supported !== false,
@@ -3297,6 +3420,7 @@ class Workspace extends EventEmitter {
                 readOnly: mailboxes.every((m) => m.readOnly),
             },
             containers: mailboxes.map((m) => ({
+                removalPolicy: normalizeRemovalPolicy(m.removalPolicy),
                 name: m.folder || 'INBOX',
                 mailboxId: m.id,
                 enabled: m.enabled !== false,
@@ -3499,6 +3623,7 @@ class Workspace extends EventEmitter {
     // marker (`true`) or omits them — the same write-only contract connectors use.
     #gdriveConfigPatch(input = {}, previous = {}) {
         const patch = {};
+        if ('removalPolicy' in input) patch.removalPolicy = normalizeRemovalPolicy(input.removalPolicy);
         for (const key of ['clientId', 'folderId', 'label', 'account']) {
             if (key in input) patch[key] = String(input[key] ?? '').trim();
         }
@@ -4357,6 +4482,9 @@ class Workspace extends EventEmitter {
                 dataBackends[name] = { ...dataBackends[name], ...patch };
                 this.#writeStoredBackends(dataBackends);
             },
+            onLocationsRemoved: input => this.observeSourceRemoval(input),
+            onRemovalReady: ids => this.trashOperations.ready(ids),
+            replicaOwnerGuard: owner => !owner.startsWith('workspace-document:') || !this.isRemovalHeld(Number(owner.slice('workspace-document:'.length))),
             // Orphan-GC retention (Settings > Database), -1 = keep forever.
             getOrphanRetentionDays: () => Number(this.databaseSettings.orphanRetentionDays ?? -1),
             getOrphanPolicy: () => this.databaseSettings.orphanPolicy,
@@ -4370,14 +4498,17 @@ class Workspace extends EventEmitter {
         await this.#storedIndex.start();
         await this.#startMailIndex();
         await this.#startConnectorIndex();
+        this.trashOperations.schedule();
     }
 
     async #stopStoredIndex() {
+        await this.#trashOperations?.stop();
         await this.#stopConnectorIndex();
         await this.#stopMailIndex();
         if (!this.#storedIndex) return;
         await this.#storedIndex.stop();
         this.#storedIndex = null;
+        this.#trashOperations = null;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -4414,6 +4545,7 @@ class Workspace extends EventEmitter {
             unlockBackendNode: (path, holder) => this.unlockBackendTreeNode(path, holder),
             // Threading: a reply lands where its parent is filed.
             inheritThreadMemberships: (replyId, parentId) => this.inheritThreadMemberships(replyId, parentId),
+            reconcileRemovedLocations: (doc, urls, options) => this.#storedIndex.reconcileRemovedLocations(doc, urls, options),
         });
     }
 
