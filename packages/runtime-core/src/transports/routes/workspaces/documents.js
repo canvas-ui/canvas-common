@@ -1275,6 +1275,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
             minItems: 1,
           },
           to: { type: 'array', items: { type: 'string' }, minItems: 1 },
+          deleteFrom: { type: 'object', additionalProperties: false, required: ['backend', 'folder'], properties: { backend: { type: 'string', minLength: 1 }, folder: { type: 'string', maxLength: 1024 } } },
           mode: { type: 'string', enum: ['copy', 'move', 'delete'], default: 'copy' },
           keepDocument: { type: 'boolean', default: false },
           // copy/move onto path-keyed backends: where and under what name.
@@ -1290,7 +1291,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       const workspace = await getWorkspaceInstance(request, reply);
       if (!workspace) return reply;
 
-      const { documentIds: rawIds, to, mode = 'copy', keepDocument = false, folder = '', filename = '', onConflict = 'rename' } = request.body;
+      const { documentIds: rawIds, to, mode = 'copy', keepDocument = false, folder = '', filename = '', onConflict = 'rename', deleteFrom = null } = request.body;
       let documentIds;
       try {
         documentIds = parseDocumentIdArray(rawIds, 'Document ID array');
@@ -1301,7 +1302,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
       let results;
       try {
-        results = await workspace.transferDocumentsToBackends(documentIds, { to, mode, keepDocument, folder, filename, onConflict });
+        results = await workspace.transferDocumentsToBackends(documentIds, { to, mode, keepDocument, folder, filename, onConflict, deleteFrom });
       } catch (e) {
         // Request-level refusals (unknown/read-only backend, multi-target move)
         // are the caller's mistake, not a server fault.

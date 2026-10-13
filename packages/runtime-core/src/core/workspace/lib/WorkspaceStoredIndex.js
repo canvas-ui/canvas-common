@@ -276,6 +276,17 @@ export class WorkspaceStoredIndex {
         return (doc?.locations || []).map((l) => this.#locationEndpoint(l)).filter(Boolean);
     }
 
+    async readableLocationEndpoints(doc) {
+        const readable = [];
+        for (const endpoint of this.locationEndpoints(doc)) {
+            const backend = this.#stored?.getBackend(endpoint.backend);
+            if (!backend?.canRead) continue;
+            const entry = await this.#stored.stat(`${endpoint.backend}:${endpoint.key}`);
+            if (entry?.locations?.some(l => l.backend === endpoint.backend && l.key === endpoint.key && l.synced)) readable.push(endpoint);
+        }
+        return readable;
+    }
+
     /**
      * Copy or move one document's bytes onto `to`. The source is whichever of
      * its locations is not already on the target (or `from`, when the caller
@@ -305,6 +316,40 @@ export class WorkspaceStoredIndex {
         return (doc?.locations || [])
             .filter((l) => { const e = this.#locationEndpoint(l); return e && wanted.has(e.backend); })
             .map((l) => l.url);
+    }
+
+    /** Explicit backend deletion is location-scoped. Do not unfile a document
+     * from a storage policy (which would remove its other replicas too), or
+     * rewrite a stale full-document snapshot while inference is updating it.
+     */
+    async deleteLocations(doc, { backends, deleteFrom = null, keepDocument = false } = {}) {
+        const endpoints = this.locationEndpoints(doc).filter(e => backends.includes(e.backend)
+            && (!deleteFrom || e.backend !== deleteFrom.backend || path.posix.dirname(e.key) === (deleteFrom.folder || '.')));
+        if (!endpoints.length) throw objectsError('No location in the selected backend folder', 'LOCATION_NOT_FOUND', 404);
+        const checksum = doc.checksumArray?.find(c => c.startsWith('sha256/'))?.slice(7);
+        if (!checksum) throw objectsError('Cannot delete without a content identity; rescan this backend first', 'CONTENT_IDENTITY_REQUIRED', 409);
+        const deleted = [], failures = [], visited = new Set();
+        for (const endpoint of endpoints) {
+            const address = JSON.stringify([endpoint.backend, endpoint.key]);
+            if (visited.has(address)) continue;
+            visited.add(address);
+            try {
+                const config = this.#dataBackends[endpoint.backend];
+                const backend = this.#stored.getBackend(endpoint.backend);
+                if (!config || !backend) throw objectsError(`Backend "${endpoint.backend}" is not enabled`, 'BACKEND_DISABLED', 409);
+                if (config.readOnly || !backend.canDelete) throw objectsError(`Backend "${endpoint.backend}" is read-only`, 'BACKEND_READ_ONLY', 403);
+                const result = await this.withKeyLock(endpoint.backend, endpoint.key, () => this.#stored.removeObject(endpoint.backend, endpoint.key, {
+                    ifMatch: checksum, origin: `backend-delete:${keepDocument ? 'keep:' : ''}${randomUUID()}`,
+                }));
+                if (!result.ok) throw objectsError(`Cannot delete ${endpoint.key}: ${result.reason}`, result.reason, 409);
+                deleted.push(endpoint.url);
+            } catch (error) { failures.push({ url: endpoint.url, reason: error.message, code: error.code }); }
+        }
+        // The unlink event owns the serialized, partial location update. Never
+        // submit the document snapshot read before the physical operation.
+        await this.#documentMutations;
+        await this.reconcileRemovedLocations(doc, deleted, { suppressPolicy: true, manualRemoval: true, keepDocument });
+        return { deleted, failed: failures, droppedRefs: [], docDeleted: false };
     }
 
     /**
@@ -960,11 +1005,11 @@ export class WorkspaceStoredIndex {
         const backend = this.#mutableFileBackend(backendName);
         const root = this.#objectsBackend(backendName, { write: true }).root;
         const normalized = this.#objectKey(backend, root, key);
-        if (typeof this.#stored.trashDirectory !== 'function') throw objectsError('Upgrade canvas-stored for recoverable folder deletion', 'NOT_IMPLEMENTED', 501);
+        if (this.#stored.supportsScopedFolderDeletion !== true) throw objectsError('Upgrade canvas-stored to 1.12.1 or newer for deletion limited to this backend folder', 'STORED_TOO_OLD', 501);
         return this.withKeyLock(backendName, normalized, async () => {
             const release = await this.#acquireBackendNamespace(backendName);
             try {
-                const result = await this.#stored.trashDirectory(backendName, normalized);
+                const result = await this.#stored.trashDirectory(backendName, normalized, { origin: `backend-delete:${randomUUID()}` });
                 await this.#documentMutations;
                 return result;
             } finally { release(); }
@@ -1933,7 +1978,7 @@ export class WorkspaceStoredIndex {
         const removedUrls = [`stored://${storedFile.backend}/${storedFile.key}`];
         const twin = this.#deviceFileLocationUrl(storedFile.backend, storedFile.key);
         if (twin) removedUrls.push(twin);
-        return this.#reconcileRemovedLocationsNow(existingDocument, removedUrls, { suppressPolicy: Boolean(storedFile.origin), notify: !/^(trash:|replica:|workspace-directory:)/.test(storedFile.origin || '') });
+        return this.#reconcileRemovedLocationsNow(existingDocument, removedUrls, { suppressPolicy: Boolean(storedFile.origin), manualRemoval: String(storedFile.origin || '').startsWith('backend-delete:'), keepDocument: String(storedFile.origin || '').startsWith('backend-delete:keep:'), notify: !/^(trash:|replica:|workspace-directory:)/.test(storedFile.origin || '') });
     }
 
     /**
@@ -1975,7 +2020,7 @@ export class WorkspaceStoredIndex {
         }) || [];
         const ready = async () => { await this.#onRemovalReady?.(operations); return doc.id; };
         if (remaining.length === 0) {
-            const policy = this.#onLocationsRemoved ? 'keep' : this.#getOrphanPolicy?.() ?? 'remove';
+            const policy = options.keepDocument === true || this.#onLocationsRemoved ? 'keep' : this.#getOrphanPolicy?.() ?? 'remove';
             if (policy === 'remove') {
                 await db.delete(doc.id);
                 await this.purgeThumbnails([doc]).catch(() => {});
@@ -1986,7 +2031,7 @@ export class WorkspaceStoredIndex {
                 locations: [],
                 orphanedAt: doc.orphanedAt || new Date().toISOString(),
                 metadata: { ...(doc.metadata || {}) },
-            }, { context: null });
+            }, { context: null, emitEvent: false });
             // Backend-mirror paths untick (the file is no longer there); curated
             // placements in every other tree stay untouched. Thumbnails stay too
             // (checksum-keyed) — the GC purges them with the doc.
@@ -1994,14 +2039,12 @@ export class WorkspaceStoredIndex {
             return ready();
         }
 
-        const survivors = remaining
-            .map((l) => parseLocationUrl(l.url))
-            .filter(Boolean)
-            .map((p) => ({ backend: p.backend, key: p.key }));
-
-        await this.#put({ id: doc.id, locations: remaining }, { context: null });
+        const survivors = remaining.map(l => this.#locationEndpoint(l)).filter(Boolean);
+        // Capture the old roots before put: a DB adapter can update the same
+        // document instance in place, replacing its locations array.
         const affectedRoots = [...new Set(doc.locations.filter(l => removed.has(l.url))
             .map(l => this.#getBackendRootPath(l.metadata?.backend || parseLocationUrl(l.url)?.backend)).filter(Boolean))];
+        await this.#put({ id: doc.id, locations: remaining }, { context: null, emitEvent: false });
         const preserved = currentBackendPaths.filter(p => !affectedRoots.some(root => p === root || p.startsWith(`${root}/`)));
         await this.#removeStalePaths(doc.id, currentBackendPaths, [...preserved, ...this.#buildBackendPaths(survivors)]);
         return ready();

@@ -43,7 +43,7 @@ import { classifyDocument } from '../../lib/classifier.js';
  * document's BYTES between backends (with template renaming) and delete them
  * from named backends; everything else operates on the index. `store` takes
  * `folder` (destination directory on the target backend), `recursive: true`
- * (append the sub-path below the matched `when.path`, like link) and `key`
+ * (append the sub-path of a directory source; context sources must use a fixed folder) and `key`
  * (file-name template) — composed as folder/{{match.rel}}/key.
  */
 
@@ -485,7 +485,8 @@ const ACTIONS = {
      *   { "action": "store", "to": "workspace:home", "folder": "Projects/Canvas/UI",
      *     "recursive": true }
      *
-     * filed under /projects/canvas/UI/mobile → home:Projects/Canvas/UI/mobile/<name>.
+     * filed under dir:/projects/canvas/UI/mobile → home:Projects/Canvas/UI/mobile/<name>.
+     * Context memberships cannot be mapped recursively onto filesystem paths.
      * The three parts are joined with `..`/leading-slash segments dropped.
      *
      * `from` (backend name or array) is the guard that makes this idempotent:
@@ -494,13 +495,26 @@ const ACTIONS = {
      */
     async store(action, { workspace, doc, scope, logger, placement = false, sourceOverride = null }) {
         if (!doc?.id) return { status: 'skipped', error: 'No document' };
+        if (action.autoLink === true && !scope.match) return { status: 'skipped', error: 'No explicit virtual placement' };
+        if (action.recursive === true) {
+            const matches = scope.match?.all || (scope.match ? [scope.match] : []);
+            const isDirectory = match => ['directory', 'backends'].includes(match.tree)
+                || workspace.getTree?.(match.tree)?.type === 'directory';
+            if (!matches.length || matches.some(match => !isDirectory(match))) {
+                throw new Error('Recursive storage requires a directory source. Context paths can store files in a fixed backend folder with recursive:false.');
+            }
+        }
         if (action.autoLink === true && !placement) {
-            if (!scope.match) return { status: 'skipped', error: 'No explicit virtual placement' };
             if (!workspace.backendKeepsPaths(action.to)) throw new Error('Auto-Link requires a backend that preserves folder paths');
             const initial = await workspace.get(doc.id);
-            const endpoints = await workspace.documentByteEndpoints(initial);
-            const original = endpoints.find(endpoint => endpoint.backend !== action.to) || endpoints[0];
-            if (!original) return { status: 'skipped', error: 'No transferable file content' };
+            const endpoints = await workspace.documentByteEndpoints(initial, { readable: true });
+            const sources = asArray(action.from || []).filter(Boolean).map(String);
+            const candidates = sources.length ? endpoints.filter(e => sources.includes(e.backend)) : endpoints;
+            const original = candidates.find(endpoint => endpoint.backend !== action.to) || candidates[0];
+            if (!original) {
+                if (!(await workspace.documentByteEndpoints(initial)).length) return { status: 'skipped', error: 'No transferable file content' };
+                throw new Error('No readable source copy is available on the selected backends; a copy may still be syncing');
+            }
             for (const [index, match] of scope.match.all.entries()) {
                 // Re-read locations between placements and queued events.
                 const current = await workspace.get(doc.id);
@@ -521,9 +535,13 @@ const ACTIONS = {
         }
 
         const sources = asArray(action.from || []).filter(Boolean).map(String);
+        const available = await workspace.documentByteEndpoints(doc, { readable: true });
         const source = sourceOverride || (sources.length
-            ? endpoints.find((e) => sources.includes(e.backend))
-            : endpoints.find((e) => e.backend !== to) || (action.autoLink === true ? endpoints[0] : null));
+            ? available.find((e) => sources.includes(e.backend))
+            : available.find((e) => e.backend !== to) || (action.autoLink === true ? available[0] : null));
+        if (!source && endpoints.some(e => sources.length ? sources.includes(e.backend) : e.backend !== to)) {
+            throw new Error('No readable source copy is available on the selected backends; a copy may still be syncing');
+        }
         if (!source) {
             // Already where the rule wants it (or never on the source backend).
             logger.debug(`rule store: ${doc.id} has nothing on ${sources.join(', ') || `a backend other than ${to}`}, skipping`);

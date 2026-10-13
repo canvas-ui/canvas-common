@@ -39,7 +39,7 @@ export default class WorkspaceTrashOperations {
         rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
         return { operations: rows.slice(offset, offset + limit), total: rows.length };
     }
-    async observe({ document, removedLocations, remainingLocations, source, suppressPolicy = false }) {
+    async observe({ document, removedLocations, remainingLocations, source, suppressPolicy = false, manualRemoval = false, keepDocument = false }) {
         const policy = normalizeRemovalPolicy(source.policy);
         // A same-backend move is only a location update; it is not loss of the source.
         const sourceStillPresent = source.survives === true;
@@ -48,7 +48,7 @@ export default class WorkspaceTrashOperations {
             .map(p => ({ ...p, paths: p.paths.filter(path => path !== '/.trash' && !(p.type === 'context' && path === '/')) }))
             .filter(p => p.paths.length);
         const orphan = remainingLocations.length === 0;
-        const membership = orphan ? 'trash' : suppressPolicy || sourceStillPresent || !placements.length ? 'keep' : policy.membership;
+        const membership = orphan && !keepDocument ? 'trash' : suppressPolicy || sourceStillPresent || !placements.length ? 'keep' : policy.membership;
         const owner = this.#ws.storageOperations?.owner(`workspace-document:${document.id}`);
         const endpoints = await this.#ws.documentByteEndpoints({ ...document, locations: remainingLocations });
         const targets = endpoints.filter(e => e.backend !== source.backend && (policy.targets === 'all' || policy.targets.includes(e.backend)))
@@ -69,7 +69,7 @@ export default class WorkspaceTrashOperations {
         op.updatedAt = op.createdAt;
         this.#state.transactionSync(() => {
             this.#state.putSync(`${PREFIX}${op.id}`, op);
-            if (membership !== 'keep' || op.targets.length || (owner && !suppressPolicy && !sourceStillPresent)) {
+            if (membership !== 'keep' || op.targets.length || (owner && (manualRemoval || (!suppressPolicy && !sourceStillPresent)))) {
                 this.#state.putSync(`${BLOCK}${document.id}`, { operationId: op.id, identity: op.identity });
             }
         });

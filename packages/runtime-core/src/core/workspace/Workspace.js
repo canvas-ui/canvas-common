@@ -373,7 +373,7 @@ class Workspace extends EventEmitter {
             id: docId,
             metadata: { summary: text },
             updatedAt: new Date().toISOString(),
-        }, { context: null });
+        }, { context: null, provenance: { origin: 'inferd', depth: 1 } });
     }
 
     get db() {
@@ -2090,7 +2090,7 @@ class Workspace extends EventEmitter {
         return this.getDirectoryTreeSelector(Workspace.TRASH_PATH, Workspace.DIRECTORY_TREE_NAME);
     }
 
-    async observeSourceRemoval({ document, removedLocations, remainingLocations, source, suppressPolicy = false }) {
+    async observeSourceRemoval({ document, removedLocations, remainingLocations, source, suppressPolicy = false, manualRemoval = false, keepDocument = false }) {
         const groups = new Map();
         for (const location of removedLocations) {
             const parsed = parseLocationUrl(location.url);
@@ -2103,7 +2103,7 @@ class Workspace extends EventEmitter {
         for (const [backend, locations] of groups) {
             const config = this.dataBackends[backend] || {};
             const survives = remainingLocations.some(l => (l.metadata?.backend || parseLocationUrl(l.url)?.backend) === backend);
-            ids.push(await this.trashOperations.observe({ document, removedLocations: locations, remainingLocations, suppressPolicy,
+            ids.push(await this.trashOperations.observe({ document, removedLocations: locations, remainingLocations, suppressPolicy, manualRemoval, keepDocument,
                 source: { ...(source || { backend, driver: config.driver || 'unknown', policy: config.removalPolicy, survives }), backendIdentity: backendIdentity(config) } }));
         }
         return ids;
@@ -3919,9 +3919,9 @@ class Workspace extends EventEmitter {
      * rules use it to pick a source backend and to derive a destination
      * filename from the current one.
      */
-    async documentByteEndpoints(doc) {
+    async documentByteEndpoints(doc, { readable = false } = {}) {
         if (!this.#storedIndex?.isRunning) await this.#startStoredIndex();
-        return this.#storedIndex.locationEndpoints(doc);
+        return readable ? this.#storedIndex.readableLocationEndpoints(doc) : this.#storedIndex.locationEndpoints(doc);
     }
 
     /**
@@ -3951,7 +3951,8 @@ class Workspace extends EventEmitter {
         const res = await this.#storedIndex.transferDocument(doc, { to, mode, key, onConflict, from });
         if (!res?.ok) {
             const detail = res?.detail ? ` (${res.detail})` : '';
-            throw new Error(`${mode} failed: ${res?.reason || 'unknown error'}${detail}`);
+            const source = res?.source || (from ? `stored://${from.backend}/${from.key}` : null);
+            throw new Error(`${mode} failed: ${res?.reason || 'unknown error'}${source ? ` (source: ${source}, target: ${to}/${key || ''})` : ''}${detail}`);
         }
         return res;
     }
@@ -3986,7 +3987,7 @@ class Workspace extends EventEmitter {
      * @param {string[]} options.to Target backend addresses
      * @param {'copy'|'move'|'delete'} [options.mode='copy']
      * @param {boolean} [options.keepDocument=false] delete mode: keep the index
-     *   entry when its last location goes (otherwise the doc is cascaded)
+     *   entry when its last location goes (otherwise it moves to workspace Trash)
      * @param {string} [options.folder] copy/move: backend-relative folder the
      *   bytes land in on path-keyed backends (ignored by the blob store)
      * @param {string} [options.filename] copy/move, single document only: name
@@ -3995,7 +3996,7 @@ class Workspace extends EventEmitter {
      *   to do when other content already holds the destination key
      * @returns {Promise<{successful: object[], failed: object[]}>}
      */
-    async transferDocumentsToBackends(documentIds = [], { to = [], mode = 'copy', keepDocument = false, folder = '', filename = '', onConflict = 'rename' } = {}) {
+    async transferDocumentsToBackends(documentIds = [], { to = [], mode = 'copy', keepDocument = false, folder = '', filename = '', onConflict = 'rename', deleteFrom = null } = {}) {
         if (!['copy', 'move', 'delete'].includes(mode)) throw new Error(`Unknown transfer mode: ${mode}`);
         if (!['error', 'rename', 'overwrite'].includes(onConflict)) throw new Error(`Unknown conflict policy: ${onConflict}`);
         // A destination folder is a backend-relative key prefix; `..` and
@@ -4025,10 +4026,9 @@ class Workspace extends EventEmitter {
                 if (!doc) { results.failed.push({ id, reason: 'not found' }); continue; }
 
                 if (mode === 'delete') {
-                    const urls = this.#storedIndex.locationUrlsOnBackends(doc, targets);
-                    if (urls.length === 0) { results.failed.push({ id, reason: 'no location on the selected backend(s)' }); continue; }
-                    const res = await this.#storedIndex.destroy(doc, { urls, keepDocument });
-                    results.successful.push({ id, mode, ...res });
+                    const res = await this.#storedIndex.deleteLocations(doc, { backends: targets, deleteFrom, keepDocument });
+                    if (res.failed.length) results.failed.push({ id, code: res.failed[0].code, reason: res.failed.map(f => f.reason).join('; '), deleted: res.deleted });
+                    else results.successful.push({ id, mode, ...res });
                     continue;
                 }
 

@@ -44,13 +44,13 @@ document keeps its id, its tags and every folder it is filed in. Only
 ```
 
 The friendlier spelling separates *where* from *what* — this is what the web
-rule builder writes. "Every image filed under `/projects/canvas/UI` lands in
+rule builder writes. "Every image filed under `dir:/projects/canvas/UI` lands in
 `workspace:home/Projects/Canvas/UI`, sub-folders kept":
 
 ```json
 {
   "id": "canvas-ui-images",
-  "when": { "event": ["document.inserted", "document.linked"], "schema": "file", "mime": "image/*", "path": "/projects/canvas/UI" },
+  "when": { "event": ["document.inserted", "document.linked"], "schema": "file", "mime": "image/*", "path": "dir:/projects/canvas/UI" },
   "then": [ { "action": "store", "to": "workspace:home", "folder": "Projects/Canvas/UI", "recursive": true } ]
 }
 ```
@@ -61,12 +61,16 @@ rule builder writes. "Every image filed under `/projects/canvas/UI` lands in
 | `from` | Only act when the bytes are on this backend (name or array). This is what makes the rule idempotent — after the move nothing matches, so re-runs are no-ops. Omitted: any backend other than `to` |
 | `mode` | `move` (default) or `copy` |
 | `folder` | Directory on the target backend (template tokens allowed) |
-| `recursive` | `true`: append the document's sub-path below the matched `when.path` prefix — `/projects/canvas/UI/mobile/x` → `Projects/Canvas/UI/mobile/…` (same semantics as `link`'s `recursive`) |
+| `recursive` | `true`: append the sub-path below the matched directory prefix — `dir:/projects/canvas/UI/mobile` → `Projects/Canvas/UI/mobile/…`. Requires a directory source; context sources cannot use recursive storage |
 | `key` | File-name template. With `folder`/`recursive` it defaults to `{{basename}}{{ext}}` (original name; extension derived from the mime type when the blob key has none). Alone, it is the full destination key (legacy form); omit everything to keep the current key |
 | `onConflict` | `rename` (default: `name-1.ext`), `error`, `overwrite` |
 
 The destination is `folder / {{match.rel}} / key` joined with empty, `.`, `..`
 and leading-slash segments dropped, so a rule can never escape the backend root.
+Missing destination directories are created automatically. Context memberships
+can overlap and have no unique filesystem path: use a fixed `folder` without
+`recursive` for context sources. Recursive backend-to-context `link` actions
+remain supported.
 
 **Key tokens.** `{{YYYY}} {{YY}} {{MM}} {{DD}} {{HH}} {{mm}} {{ss}}` come from the
 content's own date: **EXIF capture time first**, then the content timeline, then
