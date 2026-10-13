@@ -489,13 +489,29 @@ const ACTIONS = {
      * Context memberships cannot be mapped recursively onto filesystem paths.
      * The three parts are joined with `..`/leading-slash segments dropped.
      *
-     * `from` (backend name or array) is the guard that makes this idempotent:
-     * once the bytes have moved, no source matches and re-runs are no-ops, so
-     * the rule can safely fire on both document.inserted and document.linked.
+     * Copy is the default. A move requires one explicit `from` backend and
+     * exactly one location there. Once that copy has moved, re-runs cannot
+     * select another backend's copy just because its checksum matches.
      */
     async store(action, { workspace, doc, scope, logger, placement = false, sourceOverride = null }) {
         if (!doc?.id) return { status: 'skipped', error: 'No document' };
         if (action.autoLink === true && !scope.match) return { status: 'skipped', error: 'No explicit virtual placement' };
+        const mode = action.mode === 'move' ? 'move' : 'copy';
+        if (mode === 'move' && (typeof action.from !== 'string' || !action.from.trim())) {
+            throw new Error('Move requires one explicit source backend (from). Use copy to preserve existing locations.');
+        }
+        const sources = asArray(action.from || []).filter(Boolean).map(value => String(value).trim());
+        const selectSource = (endpoints, readable) => {
+            const matches = endpoints.filter(e => sources.length ? sources.includes(e.backend) : e.backend !== action.to || action.autoLink === true);
+            const unique = [...new Map(matches.map(e => [JSON.stringify([e.backend, e.key]), e])).values()];
+            if (mode === 'move' && unique.length > 1) {
+                throw new Error(`Move source is ambiguous: ${unique.length} locations on ${sources[0]}. Use copy instead.`);
+            }
+            const candidates = readable.filter(e => sources.length ? sources.includes(e.backend) : e.backend !== action.to || action.autoLink === true);
+            const source = sources.length ? candidates[0] : candidates.find(e => e.backend !== action.to) || candidates[0];
+            if (!source && matches.length) throw new Error('No readable source copy is available on the selected backends; a copy may still be syncing');
+            return source;
+        };
         if (action.recursive === true) {
             const matches = scope.match?.all || (scope.match ? [scope.match] : []);
             const isDirectory = match => ['directory', 'backends'].includes(match.tree)
@@ -507,26 +523,20 @@ const ACTIONS = {
         if (action.autoLink === true && !placement) {
             if (!workspace.backendKeepsPaths(action.to)) throw new Error('Auto-Link requires a backend that preserves folder paths');
             const initial = await workspace.get(doc.id);
-            const endpoints = await workspace.documentByteEndpoints(initial, { readable: true });
-            const sources = asArray(action.from || []).filter(Boolean).map(String);
-            const candidates = sources.length ? endpoints.filter(e => sources.includes(e.backend)) : endpoints;
-            const original = candidates.find(endpoint => endpoint.backend !== action.to) || candidates[0];
-            if (!original) {
-                if (!(await workspace.documentByteEndpoints(initial)).length) return { status: 'skipped', error: 'No transferable file content' };
-                throw new Error('No readable source copy is available on the selected backends; a copy may still be syncing');
-            }
+            const endpoints = await workspace.documentByteEndpoints(initial);
+            const original = selectSource(endpoints, await workspace.documentByteEndpoints(initial, { readable: true }));
+            if (!original) return { status: 'skipped', error: sources.length ? 'No copy on the selected source backend' : 'No transferable file content' };
             for (const [index, match] of scope.match.all.entries()) {
                 // Re-read locations between placements and queued events.
                 const current = await workspace.get(doc.id);
                 // Copy every placement before releasing the original on the last.
-                const mode = index === scope.match.all.length - 1 ? action.mode : 'copy';
-                await ACTIONS.store({ ...action, mode }, { workspace, doc: current, scope: { ...scope, match }, logger, placement: true, sourceOverride: original });
+                const placementMode = index === scope.match.all.length - 1 ? mode : 'copy';
+                await ACTIONS.store({ ...action, mode: placementMode }, { workspace, doc: current, scope: { ...scope, match }, logger, placement: true, sourceOverride: original });
             }
             return;
         }
         const to = String(action.to || '').trim();
         if (!to) { logger.warn('rule store: "to" (target backend) is required'); return; }
-        const mode = action.mode === 'copy' || (action.autoLink === true && action.mode !== 'move') ? 'copy' : 'move';
 
         const endpoints = await workspace.documentByteEndpoints(doc);
         if (!endpoints.length) {
@@ -534,14 +544,8 @@ const ACTIONS = {
             return;
         }
 
-        const sources = asArray(action.from || []).filter(Boolean).map(String);
         const available = await workspace.documentByteEndpoints(doc, { readable: true });
-        const source = sourceOverride || (sources.length
-            ? available.find((e) => sources.includes(e.backend))
-            : available.find((e) => e.backend !== to) || (action.autoLink === true ? available[0] : null));
-        if (!source && endpoints.some(e => sources.length ? sources.includes(e.backend) : e.backend !== to)) {
-            throw new Error('No readable source copy is available on the selected backends; a copy may still be syncing');
-        }
+        const source = sourceOverride || selectSource(endpoints, available);
         if (!source) {
             // Already where the rule wants it (or never on the source backend).
             logger.debug(`rule store: ${doc.id} has nothing on ${sources.join(', ') || `a backend other than ${to}`}, skipping`);

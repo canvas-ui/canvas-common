@@ -58,8 +58,8 @@ rule builder writes. "Every image filed under `dir:/projects/canvas/UI` lands in
 | Field | Meaning |
 |-------|---------|
 | `to` | Target backend address (required) |
-| `from` | Only act when the bytes are on this backend (name or array). This is what makes the rule idempotent — after the move nothing matches, so re-runs are no-ops. Omitted: any backend other than `to` |
-| `mode` | `move` (default) or `copy` |
+| `from` | Source backend. Required as a single name for moves; no copy there means no move, without fallback. Multiple locations on that backend are ambiguous and refused. Copies may omit it or use an array of backend names |
+| `mode` | `copy` (default) or `move`. Moves require one explicit `from` backend |
 | `folder` | Directory on the target backend (template tokens allowed) |
 | `recursive` | `true`: append the sub-path below the matched directory prefix — `dir:/projects/canvas/UI/mobile` → `Projects/Canvas/UI/mobile/…`. Requires a directory source; context sources cannot use recursive storage |
 | `key` | File-name template. With `folder`/`recursive` it defaults to `{{basename}}{{ext}}` (original name; extension derived from the mime type when the blob key has none). Alone, it is the full destination key (legacy form); omit everything to keep the current key |
@@ -71,6 +71,11 @@ Missing destination directories are created automatically. Context memberships
 can overlap and have no unique filesystem path: use a fixed `folder` without
 `recursive` for context sources. Recursive backend-to-context `link` actions
 remain supported.
+
+Context membership does not imply that bytes exist in `workspace:data`. Choose
+`from: "workspace:data"` explicitly to move only that blob-store copy while
+leaving filesystem and remote copies intact. Source retirement is a move event,
+not a source-loss deletion to propagate to other backends.
 
 **Key tokens.** `{{YYYY}} {{YY}} {{MM}} {{DD}} {{HH}} {{mm}} {{ss}}` come from the
 content's own date: **EXIF capture time first**, then the content timeline, then
