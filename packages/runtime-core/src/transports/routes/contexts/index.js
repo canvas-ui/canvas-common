@@ -1,4 +1,4 @@
-import { workspaceErrorResponse } from '../../../core/workspace/lib/errors.js';
+import { workspaceErrorResponse } from '../../../core/workspace/runtime/errors.js';
 'use strict';
 
 import lifecycleRoutes from './lifecycle.js';

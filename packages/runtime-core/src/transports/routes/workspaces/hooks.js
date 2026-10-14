@@ -10,7 +10,7 @@ import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/wo
 import { HOOK_EVENTS, HOOK_ACTIONS, CLASSIFIER_SURFACE, HOOK_CONTEXT_API, generateHookSkeleton } from '../../../core/workspace/services/hook/meta.js';
 import { resolveRuleFiles, loadRuleFile, explainRule } from '../../../core/workspace/services/hook/rules.js';
 import { resolveHookFiles } from '../../../core/workspace/services/hook/files.js';
-import { classifyDocument, normalizeSchemaId } from '../../../core/workspace/lib/classifier.js';
+import { classifyDocument, normalizeSchemaId } from '../../../core/workspace/documents/classifier.js';
 
 // Hard ceiling on one backfill request; the webui's "Batch size" knob goes up to this.
 const BACKFILL_MAX_LIMIT = 10000;

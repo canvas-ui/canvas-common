@@ -14,8 +14,8 @@ import {
   importWorkspaceFromRemote,
   saveUploadedArchive,
   resolveRemoteToken,
-} from '../../../core/workspace/lib/portability.js';
-import { importJobs } from '../../../core/workspace/lib/import-jobs.js';
+} from '../../../core/workspace/portability/archive.js';
+import { importJobs } from '../../../core/workspace/portability/import-jobs.js';
 
 /**
  * Workspace export/import.

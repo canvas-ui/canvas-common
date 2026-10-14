@@ -1188,7 +1188,7 @@ class WorkspaceManager extends EventEmitter {
         try {
             // Prefer the immutable treeId; treeName is volatile (tree renames).
             tree = workspace.getTree(share.treeId || share.treeName);
-        } catch (_) {
+        } catch {
             // Legacy/remnant shares may point at trees that no longer exist.
         }
         if (tree) {
@@ -1650,17 +1650,9 @@ class WorkspaceManager extends EventEmitter {
         const parsed = parseWorkspaceReference(workspaceRef);
         if (!parsed) return null;
 
-        // This implies strict reference matching or we reconstruct the key
-        // If the reference is stored in #referenceIndex, use it
         if (this.#referenceIndex.has(workspaceRef)) {
             return this.#referenceIndex.get(workspaceRef);
         }
-
-        // Fallback: try to reconstruct name key if we can resolve user identifier
-        // But here we might need async user resolution if the ref uses email/name
-        // The old code did synchronous lookup if possible or async elsewhere.
-        // Here we stick to synchronous lookups on the index.
-        // If reference contains ID, we might need to handle that.
 
         return null;
     }
@@ -1675,7 +1667,6 @@ class WorkspaceManager extends EventEmitter {
         return this.resolveWorkspaceId(userId, parsed.workspaceIdentifier);
     }
 
-    // Static helpers exposed as instance methods if needed
     parseWorkspaceReference(ref) { return parseWorkspaceReference(ref); }
     constructWorkspaceReference(user, slug, host, path) { return constructWorkspaceReference(user, slug, host, path); }
 
@@ -1982,14 +1973,14 @@ class WorkspaceManager extends EventEmitter {
             try {
                 const layer = tree.getLayerForPath(share.path);
                 if (layer) return layer;
-            } catch (_) {
+            } catch {
                 // fall through
             }
         }
         if (typeof tree.getLayerById === 'function') {
             try {
                 return tree.getLayerById(share.layerId);
-            } catch (_) {
+            } catch {
                 return null;
             }
         }

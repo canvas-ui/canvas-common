@@ -5,7 +5,7 @@ import { pipeline } from 'stream/promises';
 import path from 'path';
 import crypto from 'crypto';
 import { createLogger } from '../../utils/log.js';
-import { internalPathMatcher } from '../../core/workspace/lib/internal-paths.js';
+import { internalPathMatcher } from '../../core/workspace/configuration/internal-paths.js';
 import TreeFS from './TreeFS.js';
 import { entryIdentity, isClientAbort, matchesEtag, parseRange, streamTo } from './dav-http.js';
 import { collectionIdentity, isClientDropping, norm } from './vfs-shared.js';

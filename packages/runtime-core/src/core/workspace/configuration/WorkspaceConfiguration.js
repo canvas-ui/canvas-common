@@ -6,8 +6,6 @@ import { WorkspaceStoredIndex } from '../storage/WorkspaceStoredIndex.js';
 import { normalizeRemovalPolicy } from '../storage/removal-policy.js';
 import { WORKSPACE_INTERNAL_DIRNAME, WORKSPACE_LAYOUTS, normalizeWorkspaceLayout, workspaceDirectories, workspaceInternals, workspaceStoredDefault, workspaceServices } from './constants.js';
 
-// Workspace delegates this domain to a collaborator. Runtime dependencies stay
-// private to the local host; the public Workspace API is the transport boundary.
 export default class WorkspaceConfiguration {
     #workspace;
     #runtime;
@@ -209,7 +207,7 @@ export default class WorkspaceConfiguration {
                     if (rule) { spaces[sp] = { provider: rule.provider, model: rule.model, dim: rule.dim }; }
                 }
                 stats.inferd = { queue: await this.#runtime.state.inferd.workspaceStatus(this.#workspace.id), routing, spaces };
-            } catch (_) { /* best effort */ }
+            } catch { /* best effort */ }
         }
         return stats;
     }
@@ -542,29 +540,6 @@ export default class WorkspaceConfiguration {
             this.#runtime.state.logger.warn({ workspaceId: this.#workspace.id, error: err.message }, 'workspace.json schema migration skipped');
         }
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Token Management (delegated to WorkspaceTokens)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    createToken(options = {}) { return this.#runtime.state.tokens.create(options); }
-    listTokens() { return this.#runtime.state.tokens.list(); }
-    deleteToken(hash) { return this.#runtime.state.tokens.delete(hash); }
-    verifyToken(tokenValue) { return this.#runtime.state.tokens.verify(tokenValue); }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Members — e-mail / group grants (delegated to WorkspaceMembers)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /** The user's private home ("universe") workspace is never shareable. */
-    get isUniverse() { return this.#workspace.type === 'universe'; }
-    listMembers() { return this.#runtime.state.members.list(); }
-    getMember(type, principal) { return this.#runtime.state.members.get(type, principal); }
-    grantMember(type, principal, options = {}) {
-        if (this.#workspace.isUniverse) throw new Error('The universe workspace cannot be shared');
-        return this.#runtime.state.members.grant(type, principal, options);
-    }
-    revokeMember(type, principal) { return this.#runtime.state.members.revoke(type, principal); }
 
     static #mergeConfigMap(defaults, overrides) {
         const out = {};

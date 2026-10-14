@@ -1,4 +1,4 @@
-import { workspaceStopped, workspaceErrorResponse } from '../../../core/workspace/lib/errors.js';
+import { workspaceStopped, workspaceErrorResponse } from '../../../core/workspace/runtime/errors.js';
 import { allowsStoppedWorkspace } from '../../middleware/workspace-acl.js';
 'use strict';
 
@@ -7,7 +7,7 @@ import { requireWorkspaceRead, requireWorkspaceWrite as _requireWorkspaceWrite, 
 import { enforceAgentBinding } from '../../middleware/agent-acl.js';
 import { validateUser } from '../../auth/strategies.js';
 import { resolveWorkspaceAddress } from '../../middleware/address-resolver.js';
-import { permissionForMethod } from '../../../core/workspace/lib/access.js';
+import { permissionForMethod } from '../../../core/workspace/security/access.js';
 
 /**
  * Main workspace routes handler for the API

@@ -1,8 +1,6 @@
 import { joinKey, transferFilename } from '../services/hook/key-utils.js';
 import { isConnectorDriver } from '../services/connectors/index.js';
 
-// Workspace delegates this domain to a collaborator. Runtime dependencies stay
-// private to the local host; the public Workspace API is the transport boundary.
 export default class WorkspaceTransfers {
     #workspace;
     #runtime;

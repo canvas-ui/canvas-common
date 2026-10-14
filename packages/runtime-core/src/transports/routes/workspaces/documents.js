@@ -1,12 +1,12 @@
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
-import { copyDocumentOnce } from '../../../core/workspace/lib/copy-document.js';
+import { copyDocumentOnce } from '../../../core/workspace/documents/copy.js';
 import { parseDocumentId, parseDocumentIdArray } from '../../../utils/documentId.js';
 import { stripDeviceFeatureTags } from '../../../utils/device-features.js';
 import { parseByteRange } from '../../lib/http-range.js';
 import { resolveContentType } from '../../lib/mime.js';
-import { normalizeSchemaId } from '../../../core/workspace/lib/classifier.js';
+import { normalizeSchemaId } from '../../../core/workspace/documents/classifier.js';
 import { PREDICATES } from 'canvas-synapsd/src/indexes/edges/predicates.js';
 import { localDocumentIds, PLACEMENT_BUDGET, stampPlacement, treeOf } from '../../lib/placement.js';
 

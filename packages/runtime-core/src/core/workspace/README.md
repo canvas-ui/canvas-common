@@ -19,9 +19,8 @@ when child-process hosting is introduced. Hosting still runs in-process here.
 - `runtime/`: local state, lifecycle helpers, pending-operation diagnostics and
   remote workspace proxies.
 
-The old `lib/` entry points are compatibility reexports. New code imports from
-the functional directories. `canvas-common/packages/runtime-core` carries the
-same workspace implementation for standalone hosts.
+Import directly from the functional directories. `canvas-common/packages/runtime-core`
+carries the same workspace implementation for standalone hosts.
 
 ## Serialization and cancellation
 

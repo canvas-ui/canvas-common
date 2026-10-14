@@ -25,7 +25,7 @@ import registerAgent from '../transports/websocket/channels/agent.js';
 import registerContext from '../transports/websocket/channels/context.js';
 import { enforceAgentBinding } from '../transports/middleware/agent-acl.js';
 import { enforceWorkspaceTokenScope } from '../transports/middleware/workspace-acl.js';
-import { resolveAclAccess } from '../core/workspace/lib/access.js';
+import { resolveAclAccess } from '../core/workspace/security/access.js';
 
 const envelope = payload => ({ status: 'success', statusCode: 200, payload });
 function privateJson(file, value) {

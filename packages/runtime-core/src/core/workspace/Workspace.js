@@ -543,15 +543,20 @@ class Workspace extends EventEmitter {
     deleteBitmap(...args) { return this.#runtime.operations.run('indexes.deleteBitmap', () => this.#runtime.indexes.deleteBitmap(...args)); }
     getBitmapRawBuffer(...args) { return this.#runtime.operations.run('indexes.getBitmapRawBuffer', () => this.#runtime.indexes.getBitmapRawBuffer(...args)); }
     clearDatabaseSync(...args) { return this.#runtime.operations.run('indexes.clearDatabaseSync', () => this.#runtime.indexes.clearDatabaseSync(...args)); }
-    createToken(...args) { return this.#runtime.operations.run('config.createToken', () => this.#runtime.config.createToken(...args)); }
-    listTokens(...args) { return this.#runtime.operations.run('config.listTokens', () => this.#runtime.config.listTokens(...args)); }
-    deleteToken(...args) { return this.#runtime.operations.run('config.deleteToken', () => this.#runtime.config.deleteToken(...args)); }
-    verifyToken(...args) { return this.#runtime.operations.run('config.verifyToken', () => this.#runtime.config.verifyToken(...args)); }
-    get isUniverse() { return this.#runtime.config.isUniverse; }
-    listMembers(...args) { return this.#runtime.operations.run('config.listMembers', () => this.#runtime.config.listMembers(...args)); }
-    getMember(...args) { return this.#runtime.operations.run('config.getMember', () => this.#runtime.config.getMember(...args)); }
-    grantMember(...args) { return this.#runtime.operations.run('config.grantMember', () => this.#runtime.config.grantMember(...args)); }
-    revokeMember(...args) { return this.#runtime.operations.run('config.revokeMember', () => this.#runtime.config.revokeMember(...args)); }
+    createToken(...args) { return this.#runtime.operations.run('tokens.create', () => this.#runtime.state.tokens.create(...args)); }
+    listTokens(...args) { return this.#runtime.operations.run('tokens.list', () => this.#runtime.state.tokens.list(...args)); }
+    deleteToken(...args) { return this.#runtime.operations.run('tokens.delete', () => this.#runtime.state.tokens.delete(...args)); }
+    verifyToken(...args) { return this.#runtime.operations.run('tokens.verify', () => this.#runtime.state.tokens.verify(...args)); }
+    get isUniverse() { return this.type === 'universe'; }
+    listMembers(...args) { return this.#runtime.operations.run('members.list', () => this.#runtime.state.members.list(...args)); }
+    getMember(...args) { return this.#runtime.operations.run('members.get', () => this.#runtime.state.members.get(...args)); }
+    grantMember(...args) {
+        return this.#runtime.operations.run('members.grant', () => {
+            if (this.isUniverse) throw new Error('The universe workspace cannot be shared');
+            return this.#runtime.state.members.grant(...args);
+        });
+    }
+    revokeMember(...args) { return this.#runtime.operations.run('members.revoke', () => this.#runtime.state.members.revoke(...args)); }
     startHomeService(...args) { return this.#runtime.operations.run('backends.startHomeService', () => this.#runtime.backends.startHomeService(...args)); }
     stopHomeService(...args) { return this.#runtime.operations.run('backends.stopHomeService', () => this.#runtime.backends.stopHomeService(...args)); }
     messagingAccounts(...args) { return this.#runtime.operations.run('messages.messagingAccounts', () => this.#runtime.messages.messagingAccounts(...args)); }

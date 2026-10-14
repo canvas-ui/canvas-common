@@ -2,7 +2,7 @@
 
 import ResponseObject from '../../ResponseObject.js';
 import { requireWorkspaceRead, requireWorkspaceAdmin } from '../../middleware/workspace-acl.js';
-import { WORKSPACE_PERMISSIONS } from '../../../core/workspace/lib/access.js';
+import { WORKSPACE_PERMISSIONS } from '../../../core/workspace/security/access.js';
 
 /**
  * Workspace members — e-mail and group grants (team workspaces).

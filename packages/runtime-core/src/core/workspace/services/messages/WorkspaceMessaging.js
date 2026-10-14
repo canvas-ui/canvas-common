@@ -3,8 +3,6 @@ import { emailRecipients } from './email.js';
 import { sendWorkspaceMessage, sourceAccount } from './index.js';
 import path from 'path';
 
-// Workspace delegates this domain to a collaborator. Runtime dependencies stay
-// private to the local host; the public Workspace API is the transport boundary.
 export default class WorkspaceMessaging {
     #workspace;
     #runtime;

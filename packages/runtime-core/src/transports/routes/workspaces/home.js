@@ -5,7 +5,7 @@ import { pipeline } from 'stream/promises';
 import path from 'path';
 import ResponseObject from '../../ResponseObject.js';
 import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
-import { internalPathMatcher } from '../../../core/workspace/lib/internal-paths.js';
+import { internalPathMatcher } from '../../../core/workspace/configuration/internal-paths.js';
 
 const MIME = {
   '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',

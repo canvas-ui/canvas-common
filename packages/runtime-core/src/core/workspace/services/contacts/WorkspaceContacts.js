@@ -2,8 +2,6 @@ import { ContactExtractor } from './index.js';
 import Identity from 'canvas-synapsd/src/schemas/core/Identity.js';
 import Workspace from '../../Workspace.js';
 
-// Workspace delegates this domain to a collaborator. Runtime dependencies stay
-// private to the local host; the public Workspace API is the transport boundary.
 export default class WorkspaceContacts {
     #workspace;
     #runtime;

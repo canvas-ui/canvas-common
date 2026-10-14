@@ -3,8 +3,6 @@ import { classifyDocument } from '../documents/classifier.js';
 import { extract as extractBlobMetadata } from 'canvas-stored/src/extractors/index.js';
 import { pickGeo } from '../documents/geo.js';
 
-// Workspace delegates this domain to a collaborator. Runtime dependencies stay
-// private to the local host; the public Workspace API is the transport boundary.
 export default class WorkspaceInference {
     #workspace;
     #runtime;

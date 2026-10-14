@@ -1,4 +1,4 @@
-import { workspaceStopped, workspaceErrorResponse } from '../../core/workspace/lib/errors.js';
+import { workspaceStopped, workspaceErrorResponse } from '../../core/workspace/runtime/errors.js';
 'use strict';
 
 import crypto from 'crypto';

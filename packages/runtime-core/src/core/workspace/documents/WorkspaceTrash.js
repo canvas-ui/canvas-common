@@ -5,8 +5,6 @@ import { backendIdentity, normalizeRemovalPolicy } from '../storage/removal-poli
 import Workspace from '../Workspace.js';
 import WorkspaceDocuments from './WorkspaceDocuments.js';
 
-// Workspace delegates this domain to a collaborator. Runtime dependencies stay
-// private to the local host; the public Workspace API is the transport boundary.
 export default class WorkspaceTrash {
     #workspace;
     #runtime;
@@ -253,11 +251,8 @@ export default class WorkspaceTrash {
     }
 
     /**
-     * Empty the trash: the ONE place a filesystem-side delete is allowed to
-     * destroy. Purges the index and cascades to canvas-owned (`stored://`)
-     * blobs; foreign locations (imap, a mounted NAS) are never touched — see
-     * "Storage policies" in TODO.md for the policy layer that will replace this
-     * blanket rule.
+     * Purge documents already in Trash through the normal deletion safeguards.
+     * Preserve surviving backend copies when the original source went missing.
      */
     async emptyTrash({ documentIds = null } = {}) {
         const db = this.#runtime.getActiveDb();

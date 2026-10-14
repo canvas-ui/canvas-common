@@ -6,7 +6,7 @@ import { localDocumentIds, PLACEMENT_BUDGET, stampPlacement, treeOf } from '../.
 import { parseDocumentId } from '../../../utils/documentId.js';
 import { validateUser } from '../../auth/strategies.js';
 import { stripDeviceFeatureTags } from '../../../utils/device-features.js';
-import { normalizeSchemaId } from '../../../core/workspace/lib/classifier.js';
+import { normalizeSchemaId } from '../../../core/workspace/documents/classifier.js';
 
 export default async function documentRoutes(fastify, _options) {
   function buildAttributes(query) {

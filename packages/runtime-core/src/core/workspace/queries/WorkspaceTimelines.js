@@ -1,7 +1,5 @@
 import { parseDocumentId } from '../../../utils/documentId.js';
 
-// Workspace delegates this domain to a collaborator. Runtime dependencies stay
-// private to the local host; the public Workspace API is the transport boundary.
 export default class WorkspaceTimelines {
     #runtime;
     constructor(_workspace, runtime) { this.#runtime = runtime; }

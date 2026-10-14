@@ -5,8 +5,6 @@ import StoragePolicyService from '../services/storage-policies/service.js';
 import { getServerDevice } from '../../device/ServerDevice.js';
 import Workspace from '../Workspace.js';
 
-// Workspace delegates this domain to a collaborator. Runtime dependencies stay
-// private to the local host; the public Workspace API is the transport boundary.
 export default class WorkspaceServices {
     #workspace;
     #runtime;
