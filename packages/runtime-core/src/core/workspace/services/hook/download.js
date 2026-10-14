@@ -3,7 +3,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { WORKSPACE_DIRECTORIES } from '../../lib/constants.js';
+import { WORKSPACE_DIRECTORIES } from '../../configuration/constants.js';
 import { sanitizeSegment, joinKey, mimeForFilename } from './key-utils.js';
 import { resolveKind, getFetcher } from '../fetchers/index.js';
 import { listFiles } from '../fetchers/lib.js';

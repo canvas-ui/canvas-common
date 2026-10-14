@@ -5,10 +5,10 @@ import path from 'path';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
 import { isDisabledFile } from './naming.js';
-import { WORKSPACE_DIRECTORIES } from '../../lib/constants.js';
+import { WORKSPACE_DIRECTORIES } from '../../configuration/constants.js';
 import { sanitizeSegment, joinKey, MIME_EXTENSIONS } from './key-utils.js';
 import { download } from './download.js';
-import { classifyDocument } from '../../lib/classifier.js';
+import { classifyDocument } from '../../documents/classifier.js';
 
 /**
  * Declarative hook rules (canvas.hook-rules/v1).
@@ -168,6 +168,8 @@ const WHEN_CHECKS = {
     channel: (c, matcher) => asArray(matcher).some((m) => matchText(c.channel, m)),
     platform: (c, matcher) => asArray(matcher).some((m) => matchText(c.platform, m)),
     mime: (c, matcher) => asArray(matcher).some((m) => c.mimeMatches(m)),
+    // File name (document/location filename) — substring or {equals|contains|startsWith|regex}.
+    filename: (c, matcher) => asArray(matcher).some((m) => matchText(c.filename, m)),
     // `attachment: true` = has any attachment; string/array = attachment mime
     // pattern(s) (`application/pdf`, `image/*`, `*`); object = { mime?, filename? }.
     attachment: (c, matcher) => {
@@ -221,7 +223,7 @@ export function matchRule(rule, eventName, c) {
     if (!when || typeof when !== 'object') { return false; }
 
     if (!WHEN_CHECKS.event(c, when.event, eventName)) { return false; }
-    for (const key of ['reason', 'schema', 'path', 'pathExact', 'url', 'from', 'to', 'subject', 'body', 'sender', 'thread', 'channel', 'platform', 'mime', 'attachment']) {
+    for (const key of ['reason', 'schema', 'path', 'pathExact', 'url', 'from', 'to', 'subject', 'body', 'sender', 'thread', 'channel', 'platform', 'mime', 'filename', 'attachment']) {
         if (when[key] !== undefined && !WHEN_CHECKS[key](c, when[key])) { return false; }
     }
 
@@ -384,6 +386,13 @@ function titleOf(doc) {
 function filenameOf(doc, sourceKey) {
     const own = String(doc?.metadata?.filename || doc?.data?.filename || '').trim();
     if (own) { return own; }
+    // Uploads carry the original name on the location, not on the document.
+    const key = String(sourceKey || '');
+    const fromLocation = (doc?.locations || [])
+        .filter((l) => !key || String(l?.url || '').endsWith(key))
+        .map((l) => String(l?.metadata?.filename || '').trim()).find(Boolean)
+        || (doc?.locations || []).map((l) => String(l?.metadata?.filename || '').trim()).find(Boolean);
+    if (fromLocation) { return fromLocation; }
     return path.posix.basename(String(sourceKey || '').split(path.sep).join('/'));
 }
 
@@ -429,6 +438,8 @@ export function expandKeyTemplate(template, { doc, sourceKey } = {}) {
 // target `dir:/bar` files `.../foo/a/b` into `dir:/bar/a/b` — one placement
 // per matched path. Without a matched prefix (no `path` condition, or the
 // document sits exactly at the prefix) the targets are used as written.
+
+
 function resolveTargetPaths(action, scope) {
     const raw = asArray(action.paths || action.path || []).filter(Boolean).map((p) => interpolate(String(p), scope));
     if (action.recursive !== true) { return raw; }
@@ -538,6 +549,10 @@ const ACTIONS = {
         const to = String(action.to || '').trim();
         if (!to) { logger.warn('rule store: "to" (target backend) is required'); return; }
 
+        // The event payload's document predates earlier actions of the same
+        // rule (a previous target's copy): re-read so locations are current.
+        if (!placement && typeof workspace.get === 'function') { doc = await workspace.get(doc.id); }
+        if (!doc) return { status: 'skipped', error: 'Document no longer exists' };
         const endpoints = await workspace.documentByteEndpoints(doc);
         if (!endpoints.length) {
             logger.debug(`rule store: ${doc.id} has no transferable byte location, skipping`);
@@ -572,7 +587,12 @@ const ACTIONS = {
             }
         }
 
-        if (action.autoLink === true && endpoints.some(endpoint => endpoint.backend === to && endpoint.key === key)) return;
+        // Already at the destination: a re-run (second event, backfill, a
+        // policy applied twice) must be a no-op, not a `name-1.ext` twin.
+        if (key && endpoints.some(endpoint => endpoint.backend === to && endpoint.key === key)) {
+            logger.debug(`rule store: ${doc.id} already at ${to}:${key}, skipping`);
+            return;
+        }
 
         const res = await workspace.transferDocumentBytes(doc, {
             to,
@@ -613,6 +633,10 @@ const ACTIONS = {
         const from = asArray(action.from || action.backends || []).filter(Boolean).map(String);
         if (!from.length) { logger.warn('rule unstore: "from" (backend to delete from) is required'); return; }
 
+        // Same rule may have just stored the bytes elsewhere: judge `ifOn`
+        // against the document as it is now, not as the event carried it.
+        if (typeof workspace.get === 'function') doc = await workspace.get(doc.id);
+        if (!doc) return { status: 'skipped', error: 'Document no longer exists' };
         const endpoints = await workspace.documentByteEndpoints(doc);
         const targeted = endpoints.filter((e) => from.includes(e.backend));
         if (!targeted.length) {
@@ -646,7 +670,22 @@ const ACTIONS = {
         logger.debug(`rule unstore: ${doc.id} deleted from ${from.join(', ')} (${outcome.deleted?.length || 0} location(s), ${survivors.length} kept)`);
     },
 
-    // Tag the document in place (on the paths it already landed in).
+    /**
+     * Storage-policy inverse of `store`: the document LEFT a mirrored virtual
+     * path, so drop its mirrored copies on the policy's targets (through the
+     * backend's recoverable Trash). Compiled by services/storage-policies —
+     * `action.policy` carries { path, recursive, targets, blob }.
+     *
+     * The paths left come from `payload.changed` (document.unlinked), not from
+     * the classifier, which only sees where the document still is. When the
+     * removal would take the document's last byte location while it is still
+     * filed elsewhere, the bytes are staged back to the blob store first: a
+     * move out of a mirror must not silently destroy the document.
+     */
+    async unmirror() {
+        throw new Error('Legacy unmirror actions are disabled; use workspace storage policies');
+    },
+
     async tag(action, { workspace, doc, payload, logger, provenance }) {
         if (!doc?.id) { return; }
         const tags = asArray(action.tags || []).filter(Boolean);

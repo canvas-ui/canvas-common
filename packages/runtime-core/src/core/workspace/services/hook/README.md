@@ -206,3 +206,14 @@ Text-field regex conditions serialize as `{ "regex": "pattern" }`. Repeated
 conditions for the same text field are OR alternatives, including mixed literal
 and regex conditions. URL `regex` accepts a string or an array of patterns (OR);
 URL host, contains, and regex constraints together are AND conditions.
+
+## Storage policies
+
+Storage policies are workspace configuration, stored at
+`workspace.configDir/storage-policies.json`. They are interpreted by the workspace
+storage-policy service; they do not compile into hook rules. Physical execution,
+verification, recovery and cache release belong to `canvas-stored`.
+
+See [the storage-policy contract](../storage-policies/README.md) for configuration,
+operation status, supported backends and failure behavior. Legacy `policy:*` hook
+identifiers remain reserved; the old `unmirror` action is disabled.

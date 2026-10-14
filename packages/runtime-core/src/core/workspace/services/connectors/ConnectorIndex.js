@@ -1,12 +1,12 @@
 import { readStoredConfig } from '../stored-config.js';
-import { containsSecrets, writePrivateJson } from '../../lib/WorkspaceCrypto.js';
+import { containsSecrets, writePrivateJson } from '../../security/WorkspaceCrypto.js';
 'use strict';
 
 import EventEmitter from 'eventemitter2';
 import path from 'path';
 import fs from 'fs/promises';
 import crypto from 'crypto';
-import GitRepositories, { repoName, gitTreePath, decodeGitSegment } from '../../lib/GitRepositories.js';
+import GitRepositories, { repoName, gitTreePath, decodeGitSegment } from '../git/GitRepositories.js';
 const addressFor = (driver, value) => driver === 'git' ? repoName(value) : normalizeSegment(value);
 import { getBackendFileContext, normalizeSegment } from '../../../../utils/backend-documents.js';
 import {
@@ -583,15 +583,23 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         await this.#ensureConversationNode(entry, container);
         const cursors = entry.config.cursors || (entry.config.cursors = {});
         let cursor = cursors[container.id] ?? null;
+        const firstSync = cursor == null;
+        const summary = { ingested: 0, fetched: 0, skipped: 0, endpoint: null };
 
         // Page until the driver reports done; persist the cursor only after
         // every document of the page landed.
         for (let page = 0; page < 100; page++) {
-            const { documents = [], nextCursor = cursor, done = true } =
+            const { documents = [], nextCursor = cursor, done = true, stats = null } =
                 await entry.instance.fetchChanges(container, cursor);
 
             for (const spec of documents) {
                 await this.#ingest(name, entry, container, spec);
+            }
+            summary.ingested += documents.length;
+            if (stats) {
+                summary.fetched += stats.fetched || 0;
+                summary.skipped += stats.skipped || 0;
+                summary.endpoint = stats.endpoint || summary.endpoint;
             }
 
             if (nextCursor !== cursor) {
@@ -600,6 +608,15 @@ export class WorkspaceConnectorIndex extends EventEmitter {
                 await this.patchStoredBackend(name, { cursors, lastSyncAt: new Date().toISOString() });
             }
             if (done) break;
+        }
+
+        // A sync that lands nothing is otherwise silent — no error, no docs.
+        // Say what came back, loudest when a first sync finds nothing at all.
+        const fields = { workspaceId: this.#workspaceId, backend: name, container: container.id, firstSync, ...summary };
+        if (firstSync && summary.ingested === 0) {
+            this.#logger.warn(fields, 'Connector first sync found nothing to ingest');
+        } else if (summary.ingested > 0) {
+            this.#logger.info(fields, 'Connector sync ingested documents');
         }
 
         // Deletion-sync (opt-in): after a clean incremental sync, mirror

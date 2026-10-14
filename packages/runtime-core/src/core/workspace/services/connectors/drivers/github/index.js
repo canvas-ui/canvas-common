@@ -33,14 +33,34 @@ const API = 'https://api.github.com';
 const PER_PAGE = 100;
 
 /** Normalise a user-entered GHE URL to its REST root; null = github.com. */
+//   GitHub Enterprise Cloud with data residency (`<sub>.ghe.com`) serves REST
+//   from a separate host, `api.<sub>.ghe.com` (no /api/v3); GitHub Enterprise
+//   Server serves it under `/api/v3` on the same host. A pasted page URL
+//   (`…/org/repo/issues`) is not an API path, so only `/api/…` paths count.
 function resolveApi(baseUrl) {
     const raw = String(baseUrl || '').trim().replace(/\/+$/, '');
     if (!raw) return { api: API, host: null };
     const url = new URL(/^[a-z]+:\/\//i.test(raw) ? raw : `https://${raw}`);
     const hostname = url.hostname.toLowerCase();
     if (hostname === 'github.com' || hostname === 'api.github.com') return { api: API, host: null };
+    if (hostname.endsWith('.ghe.com')) {
+        const web = hostname.replace(/^api\./, '');
+        return { api: `${url.protocol}//api.${web}`, host: web };
+    }
     const path = url.pathname.replace(/\/+$/, '');
-    return { api: `${url.origin}${path || '/api/v3'}`, host: url.host.toLowerCase() };
+    return { api: `${url.origin}${path.startsWith('/api/') ? path : '/api/v3'}`, host: url.host.toLowerCase() };
+}
+
+/** `owner/repo` from `owner/repo`, `/owner/repo`, or a pasted repo/issues URL. */
+function repoSlug(value) {
+    let text = String(value || '').trim();
+    if (/^[a-z]+:\/\//i.test(text)) {
+        try { text = new URL(text).pathname; } catch { return null; }
+    }
+    const [owner, repo] = text.replace(/^\/+/, '').split('/');
+    if (!owner || !repo) return null;
+    const name = repo.replace(/\.git$/i, '');
+    return /^[^\s/]+$/.test(owner) && /^[^\s/]+$/.test(name) ? `${owner}/${name}` : null;
 }
 
 export default class GithubConnector extends BaseConnector {
@@ -54,10 +74,10 @@ export default class GithubConnector extends BaseConnector {
     static configFields = [
         { key: 'address', label: 'Account label', placeholder: 'my-org', required: true },
         { key: 'baseUrl', label: 'GitHub Enterprise URL', placeholder: 'https://ghe.example.com',
-          hint: 'Leave blank for github.com. /api/v3 is appended when no path is given.' },
+          hint: 'Leave blank for github.com. GitHub Enterprise Server (ghe.example.com) or GHE.com (yourco.ghe.com): the web address is enough.' },
         { key: 'token', label: 'Personal access token', secret: true,
           hint: 'Optional for public repos (60 req/h); required for write-back and @me filters.' },
-        { key: 'repos', label: 'Repositories (one per line)', placeholder: 'owner/repo', list: true, required: true },
+        { key: 'repos', label: 'Repositories (one per line)', placeholder: 'owner/repo or repo URL', list: true, required: true },
         { key: 'assignee', label: 'Only issues assigned to', placeholder: '@me, a login, * or none' },
         { key: 'creator', label: 'Only issues opened by', placeholder: '@me or a login' },
         { key: 'mentioned', label: 'Only issues mentioning', placeholder: '@me or a login' },
@@ -148,7 +168,7 @@ export default class GithubConnector extends BaseConnector {
         const res = await fetch(url, { headers: this.#headers() });
         if (!res.ok) {
             const body = await res.text().catch(() => '');
-            throw new Error(`GitHub ${res.status} ${pathname}: ${body.slice(0, 200)}`);
+            throw new Error(`GitHub ${res.status} GET ${url}: ${body.slice(0, 200)}`);
         }
         return res.json();
     }
@@ -161,9 +181,7 @@ export default class GithubConnector extends BaseConnector {
     }
 
     #repos() {
-        return (Array.isArray(this.config.repos) ? this.config.repos : [])
-            .map((r) => String(r).trim().replace(/^\/+|\/+$/g, ''))
-            .filter((r) => /^[^/\s]+\/[^/\s]+$/.test(r));
+        return (Array.isArray(this.config.repos) ? this.config.repos : []).map(repoSlug).filter(Boolean);
     }
 
     async listContainers() {
@@ -188,8 +206,9 @@ export default class GithubConnector extends BaseConnector {
 
         const documents = [];
         let maxUpdated = since || null;
+        let pullRequests = 0;
         for (const issue of issues) {
-            if (issue.pull_request) continue; // issues API returns PRs too
+            if (issue.pull_request) { pullRequests++; continue; } // issues API returns PRs too
             documents.push(this.#toDocument(repo, issue));
             if (!maxUpdated || issue.updated_at > maxUpdated) maxUpdated = issue.updated_at;
         }
@@ -197,7 +216,9 @@ export default class GithubConnector extends BaseConnector {
         // `since` is inclusive: a full page means more may follow; a page that
         // only re-returns the cursor boundary is done.
         const done = issues.length < PER_PAGE || maxUpdated === since;
-        return { documents, nextCursor: this.#writeCursor(maxUpdated), done };
+        // `stats` feeds the per-repo sync summary log — an empty sync must be
+        // distinguishable from "only pull requests came back" (skipped here).
+        return { documents, nextCursor: this.#writeCursor(maxUpdated), done, stats: { fetched: issues.length, skipped: pullRequests, endpoint: `${this.#api()}/repos/${repo}/issues` } };
     }
 
     /**
@@ -231,7 +252,7 @@ export default class GithubConnector extends BaseConnector {
         });
         const json = await res.json().catch(() => null);
         if (!res.ok) {
-            throw new Error(`GitHub ${res.status} ${method} ${pathname}: ${json?.message || ''}`);
+            throw new Error(`GitHub ${res.status} ${method} ${this.#api()}${pathname}: ${json?.message || ''}`);
         }
         return json;
     }

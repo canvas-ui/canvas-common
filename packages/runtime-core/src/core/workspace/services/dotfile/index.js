@@ -7,7 +7,7 @@ import { existsSync } from 'fs';
 import * as fsPromises from 'fs/promises';
 import EventEmitter from 'eventemitter2';
 import { createLogger } from '../../../../utils/log.js';
-import WorkspaceGitRepo from '../../lib/WorkspaceGitRepo.js';
+import WorkspaceGitRepo from '../git/WorkspaceGitRepo.js';
 import { enabledName } from '../hook/naming.js';
 
 const logger = createLogger('dotfile-manager');

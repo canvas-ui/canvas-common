@@ -1,5 +1,5 @@
 import { readStoredConfig } from '../stored-config.js';
-import { containsSecrets, writePrivateJson } from '../../lib/WorkspaceCrypto.js';
+import { containsSecrets, writePrivateJson } from '../../security/WorkspaceCrypto.js';
 'use strict';
 
 import EventEmitter from 'eventemitter2';
@@ -8,7 +8,7 @@ import fs from 'fs/promises';
 import crypto from 'crypto';
 import { simpleParser } from 'mailparser';
 import ImapBackend from './ImapBackend.js';
-import { normalizeRemovalPolicy } from '../../lib/backend-removal-policy.js';
+import { normalizeRemovalPolicy } from '../../storage/removal-policy.js';
 import { normalizeSmtp, emailAddresses } from '../messages/email.js';
 import Email from 'canvas-synapsd/src/schemas/core/Email.js';
 import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';

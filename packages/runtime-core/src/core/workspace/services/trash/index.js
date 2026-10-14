@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { backendIdentity, normalizeRemovalPolicy } from '../../lib/backend-removal-policy.js';
+import { backendIdentity, normalizeRemovalPolicy } from '../../storage/removal-policy.js';
 
 const PREFIX = 'workspace/removals/v1/';
 const BLOCK = 'workspace/removal-hold/';

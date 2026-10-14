@@ -3,15 +3,16 @@
 import EventEmitter from 'eventemitter2';
 import fs from 'fs';
 import path from 'path';
-import { WORKSPACE_DIRECTORIES } from '../../lib/constants.js';
+import { WORKSPACE_DIRECTORIES } from '../../configuration/constants.js';
 import { pathToFileURL } from 'url';
 import { createLogger } from '../../../../utils/log.js';
-import { classifyDocument } from '../../lib/classifier.js';
+import { classifyDocument } from '../../documents/classifier.js';
 import { resolveRuleFiles, loadRuleFile, matchRule, executeRuleActions } from './rules.js';
 import { buildHookAgentPrompt } from './agent-prompt.js';
 import { resolveHookFiles, statFile } from './files.js';
 import HookRunLog, { buildReplayEnvelope, createRunTrace } from './run-log.js';
 import PendingActionStore, { applyAmendments } from './pending-actions.js';
+import { isPolicyRuleId } from '../storage-policies/index.js';
 
 const logger = createLogger('hook-service');
 
@@ -319,6 +320,9 @@ class HookService extends EventEmitter {
 
     // Locate one rule by id across rules.json + rules/*.json (enabled files).
     findRule(workspace, ruleId) {
+        if (isPolicyRuleId(ruleId)) {
+            return null;
+        }
         const hooksRoot = workspace.hooksPath || path.join(workspace.rootPath, 'hooks');
         for (const filePath of resolveRuleFiles(hooksRoot)) {
             for (const rule of loadRuleFile(filePath, this.#ruleFileCache, logger)) {
@@ -653,7 +657,6 @@ class HookService extends EventEmitter {
         const hooksRoot = workspace.hooksPath || path.join(workspace.rootPath, 'hooks');
         const ruleFiles = resolveRuleFiles(hooksRoot);
         if (ruleFiles.length === 0) { return; }
-
         const rulesByFile = ruleFiles.map((filePath) => [filePath, loadRuleFile(filePath, this.#ruleFileCache, logger)]);
         // A `path` condition asks where the document IS FILED, which is a
         // property of the document — but only events that carry a context /
