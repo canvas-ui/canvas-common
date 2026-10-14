@@ -1,3 +1,4 @@
+import { emailListPreview } from '../../../core/workspace/services/mail/content.js';
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
@@ -696,7 +697,7 @@ export default async function workspaceTreeRoutes(fastify) {
         const responseObject = new ResponseObject().serverError('Failed to list layer documents');
         return reply.code(responseObject.statusCode).send(responseObject.getResponse());
       }
-      const responseObject = new ResponseObject().found(documents, 'Layer documents retrieved successfully', 200, documents.count, documents.totalCount);
+      const responseObject = new ResponseObject().found(documents.map(emailListPreview), 'Layer documents retrieved successfully', 200, documents.count, documents.totalCount);
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     } catch (error) {
       fastify.log.error(`Get layer documents error for workspace ${request.params.id}: ${error.message}`);

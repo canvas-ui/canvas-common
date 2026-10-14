@@ -1,3 +1,4 @@
+import { emailListPreview } from '../../../core/workspace/services/mail/content.js';
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
@@ -141,7 +142,7 @@ export default async function documentRoutes(fastify, _options) {
           context.path || '/',
         ));
 
-      const response = new ResponseObject().success(payload, searchQuery ? 'Search results retrieved successfully' : 'Documents retrieved successfully', 200, dbResult.count, dbResult.totalCount);
+      const response = new ResponseObject().success(payload.map(emailListPreview), searchQuery ? 'Search results retrieved successfully' : 'Documents retrieved successfully', 200, dbResult.count, dbResult.totalCount);
       return reply.code(response.statusCode).send(response.getResponse());
     } catch (error) {
       fastify.log.error(error);

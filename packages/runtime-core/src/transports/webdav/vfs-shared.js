@@ -602,6 +602,9 @@ export function renderDoc(doc) {
  */
 function renderEmail(doc) {
     const data = doc?.data ?? {};
+    if (typeof data.body !== 'string' && typeof data.bodyHtml !== 'string') {
+        throw httpError(404, 'Email source is unavailable');
+    }
     const party = (value) => {
         if (!value) { return ''; }
         if (Array.isArray(value)) { return value.map(party).filter(Boolean).join(', '); }
@@ -627,7 +630,7 @@ function renderEmail(doc) {
         // A header value must not carry the line breaks that would end it.
         .map(([key, value]) => `${key}: ${String(value).replace(/[\r\n]+/g, ' ').trim()}`)
         .join('\r\n');
-    const body = String(data.body || data.bodyHtml || data.bodyPreview || '');
+    const body = String(data.body || data.bodyHtml || '');
     return Buffer.from(`${head}\r\n\r\n${body.replace(/\r?\n/g, '\r\n')}\r\n`, 'utf-8');
 }
 

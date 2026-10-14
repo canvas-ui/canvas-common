@@ -123,3 +123,38 @@ From `canvas-server`, use `node --import ./scripts/local-runtime-sources.mjs
 `npm run dev:runtime` uses the same opt-in resolver for a development server.
 Normal `npm run dev` uses installed dependencies: editing a sibling checkout
 alone does not update those installed copies or their Git lockfile revisions.
+
+## Email content and mailbox reads
+
+Mailbox list/search/session responses contain email metadata and a bounded
+`data.bodyPreview`. They read the local index; browsing never waits for IMAP.
+The web client paints a cached page immediately, revalidates it against the
+index, and receives subsequent sync changes through workspace events.
+
+New IMAP and sent-mail records retain the original `.eml` and attachment blobs
+in the workspace blob store. `data.body` and `data.bodyHtml` are omitted from
+LMDB after those writes succeed. Existing inline records are not bulk-rewritten
+or deleted; their full content remains readable, but is omitted from lists.
+
+`GET /workspaces/:id/documents/:docId/content?format=email` returns the selected
+message's parsed `{ body, bodyHtml }`; the public-share content route supports
+the same format after its visibility check. Without the format parameter the
+content route still returns the original bytes. MIME attachment streams are
+drained rather than embedded into the body response; CID references use their
+existing attachment URLs. Viewers, quoted replies/forwards, and full-document
+agent reads load body content only when requested. Missing sources must not be
+exported as preview-only `.eml` files.
+
+Inference resolves full plaintext from the saved message, including HTML-only
+mail, and adds subject, sender, recipients, date and preview to the embedding
+input. This transient text is not written back to `data`. Existing filing
+eligibility for inference is unchanged. Searchable index fields include the
+subject, preview, parties and any generated summary; new emails no longer
+store the entire body in the keyword index. Body rules use the preview when
+no inline body exists.
+
+Deploy the server/shared runtime, Synapsd 3.23.7 (optional Email body fields),
+and the web client together. Refresh the server's locked Synapsd dependency
+when installing the release. Mail and connector checkpoints now share one
+serialized config update path, preventing parallel syncs from losing another
+mailbox's saved UID cursor.

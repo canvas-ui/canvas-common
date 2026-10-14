@@ -1,10 +1,9 @@
-import { readStoredConfig } from '../stored-config.js';
-import { containsSecrets, writePrivateJson } from '../../security/WorkspaceCrypto.js';
+import { readStoredConfig, updateStoredConfig } from '../stored-config.js';
+import { containsSecrets } from '../../security/WorkspaceCrypto.js';
 'use strict';
 
 import EventEmitter from 'eventemitter2';
 import path from 'path';
-import fs from 'fs/promises';
 import crypto from 'crypto';
 import GitRepositories, { repoName, gitTreePath, decodeGitSegment } from '../git/GitRepositories.js';
 const addressFor = (driver, value) => driver === 'git' ? repoName(value) : normalizeSegment(value);
@@ -55,7 +54,6 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     #gitPath;
     #linkDocument;
     #removeBackendPath;
-    #configWrites = Promise.resolve();
     #workspaceId;
     #logger;
 
@@ -314,12 +312,12 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     async removeBackend(driver, address) {
         const name = `${driver}:${addressFor(driver, address)}`;
         await this.#unregister(name);
-        const config = await this.readStoredConfig();
-        if (!config.backends[name]) return false;
-        if (driver === 'git') { await this.patchStoredBackend(name, { enabled: false }); return true; }
-        delete config.backends[name];
-        await this.writeStoredConfig(config);
-        return true;
+        return updateStoredConfig(this.#configDir, config => {
+            if (!config.backends[name]) return false;
+            if (driver === 'git') config.backends[name].enabled = false;
+            else delete config.backends[name];
+            return true;
+        }, this.#protectConfig);
     }
 
     messageAccount(driver, address) {
@@ -784,32 +782,16 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     // config/stored.json — shared with the storage + imap backends
     // ─────────────────────────────────────────────────────────────────────────
 
-    #storedConfigPath() {
-        return path.join(this.#configDir, 'stored.json');
-    }
-
     async readStoredConfig() {
         const parsed = await readStoredConfig(this.#configDir);
         return { ...parsed, backends: parsed.backends || {} };
     }
 
-    async writeStoredConfig(config) {
-        const target = this.#storedConfigPath();
-        await fs.mkdir(path.dirname(target), { recursive: true });
-        writePrivateJson(target, this.#protectConfig({ ...config, backends: config.backends || {} }));
-    }
-
     async patchStoredBackend(name, patch = {}) {
-        // Multiple repositories poll concurrently; serialize read/modify/write
-        // so one branch cursor cannot overwrite another repository's config.
-        const pending = this.#configWrites.then(async () => {
-            const config = await this.readStoredConfig();
+        return updateStoredConfig(this.#configDir, config => {
             config.backends[name] = { ...(config.backends[name] || {}), ...patch };
-            await this.writeStoredConfig(config);
             return config.backends[name];
-        });
-        this.#configWrites = pending.catch(() => {});
-        return pending;
+        }, this.#protectConfig);
     }
 }
 

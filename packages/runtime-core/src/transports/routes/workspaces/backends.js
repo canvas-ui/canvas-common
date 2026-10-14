@@ -1,3 +1,4 @@
+import { emailListPreview } from '../../../core/workspace/services/mail/content.js';
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
@@ -169,7 +170,7 @@ export default async function workspaceBackendRoutes(fastify) {
                 drv(request.params.driver), arg(request.params.address),
                 { linked, limit, offset },
             );
-            const response = new ResponseObject().found(result.documents, 'OK', 200, result.count, result.totalCount);
+            const response = new ResponseObject().found(result.documents.map(emailListPreview), 'OK', 200, result.count, result.totalCount);
             return reply.code(response.statusCode).send(response.getResponse());
         } catch (error) { return fail(request, reply, error); }
     });

@@ -2,6 +2,7 @@ import { parseDocumentId } from '../../../utils/documentId.js';
 import { classifyDocument } from '../documents/classifier.js';
 import { extract as extractBlobMetadata } from 'canvas-stored/src/extractors/index.js';
 import { pickGeo } from '../documents/geo.js';
+import { isEmail, resolveEmailBody, emailInferenceText } from '../services/mail/content.js';
 
 export default class WorkspaceInference {
     #workspace;
@@ -318,6 +319,14 @@ export default class WorkspaceInference {
             const textAt = await this.#enrichTextDocMetadata(doc, resolved.buffer, contentType)
                 .catch((e) => { this.#runtime.state.logger.warn({ workspaceId: this.#workspace.id, docId: doc.id, error: e.message }, 'embed: text metadata enrichment failed'); return null; });
             return { modality, schema, updatedAt: textAt || updatedAt, text: resolved.buffer.toString('utf8'), contentType, chunkOpts, comment, summary };
+        }
+
+        if (isEmail(doc)) {
+            // Resolve only the document being processed. A missing blob must
+            // fail/retry, not mark a preview-only vector as the complete email.
+            const body = await resolveEmailBody(doc, this.#workspace.resolveDocument.bind(this.#workspace));
+            return { modality: 'text', schema, updatedAt, text: emailInferenceText(doc, body),
+                contentType: 'text/plain', chunkOpts, comment, summary };
         }
 
         // JSON abstraction (note, etc.) → the text the doc exposes for embedding.

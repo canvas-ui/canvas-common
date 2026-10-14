@@ -5,6 +5,7 @@ import ResponseObject from '../../ResponseObject.js';
 import { parseDocumentId } from '../../../utils/documentId.js';
 import { parseByteRange } from '../../lib/http-range.js';
 import { resolveContentType } from '../../lib/mime.js';
+import { emailListPreview, resolveEmailBody } from '../../../core/workspace/services/mail/content.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DEFAULT_PUBLIC_CANVAS_LIMIT = 5000;
@@ -62,7 +63,7 @@ function serializeLayer(layer, tree, share) {
 function serializeDocuments(documents) {
   const data = Array.isArray(documents) ? documents : (documents?.data || []);
   return {
-    data,
+    data: data.map(emailListPreview),
     count: documents?.count ?? data.length,
     totalCount: documents?.totalCount ?? documents?.count ?? data.length,
     error: documents?.error || null,
@@ -127,9 +128,8 @@ async function resolvePublicCanvasContext(fastify, code, query = {}) {
 }
 
 async function isDocumentVisibleOnPublicCanvas(workspace, listSpec, documentId) {
-  const documents = await workspace.list({ ...listSpec, limit: MAX_PUBLIC_PAGE_SIZE });
-  const data = Array.isArray(documents?.data) ? documents.data : (Array.isArray(documents) ? documents : []);
-  return data.some((doc) => doc.id === documentId);
+  const ids = await workspace.list({ ...listSpec, ids: [documentId], idsOnly: true, limit: 1, offset: 0, page: undefined });
+  return ids.includes(documentId);
 }
 
 async function resolveWorkspaceId(fastify, userId, identifier) {
@@ -354,6 +354,7 @@ export default async function pubCanvasRoutes(fastify) {
           // Target a specific location/attachment URL of the document
           // (mirrors the workspace content route incl. its allowlist).
           url: { type: 'string' },
+          format: { type: 'string', enum: ['email'] },
         },
       },
     },
@@ -394,6 +395,13 @@ export default async function pubCanvasRoutes(fastify) {
         }
       }
 
+      if (request.query.format === 'email') {
+        if (request.query.url) return reply.code(400).send({ error: 'Email bodies cannot select an attachment URL' });
+        return reply.header('Cache-Control', 'private, no-cache').send(
+          await resolveEmailBody(doc, ctx.workspace.resolveDocument.bind(ctx.workspace)),
+        );
+      }
+
       const size = attachment ? attachment.size : doc.metadata?.size;
       const total = Number.isFinite(size) ? Number(size) : null;
 
@@ -430,7 +438,8 @@ export default async function pubCanvasRoutes(fastify) {
       fastify.log.error({ err: error }, 'Failed to read public canvas document content');
       const response = error.statusCode === 404
         ? new ResponseObject().notFound(error.message)
-        : new ResponseObject().serverError('Failed to read public canvas document content');
+        : error.statusCode === 400 ? new ResponseObject().badRequest(error.message)
+          : new ResponseObject().serverError('Failed to read public canvas document content');
       return reply.code(response.statusCode).send(response.getResponse());
     }
   });

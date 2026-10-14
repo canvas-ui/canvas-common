@@ -1,3 +1,4 @@
+import { emailListPreview } from '../../../core/workspace/services/mail/content.js';
 'use strict';
 
 import crypto from 'crypto';
@@ -223,7 +224,7 @@ export default function registerSessionWebSocket(fastify, socket) {
       // `page` is an array carrying count/totalCount/error — spread it into a
       // plain payload so the ack survives JSON serialization intact.
       if (page?.error) { return fail(ack, page.error, 'SESSION_RANK_ERROR'); }
-      const documents = [...(page || [])];
+      const documents = [...(page || [])].map(emailListPreview);
       ok(ack, {
         documents,
         ids: documents.map((doc) => doc?.id).filter((id) => id != null),

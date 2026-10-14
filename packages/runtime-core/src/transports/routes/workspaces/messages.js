@@ -1,4 +1,5 @@
 import { requireWorkspaceRead, requireWorkspaceWrite, requireWorkspaceAdmin } from '../../middleware/workspace-acl.js';
+import { emailListPreview } from '../../../core/workspace/services/mail/content.js';
 
 export default async function messageRoutes(app) {
     const fail = (reply, error) => reply.code(error.statusCode || 400).send({ status: 'error', message: error.message });
@@ -9,9 +10,10 @@ export default async function messageRoutes(app) {
         try {
             const binding = request.resourceToken;
             if (binding && binding.type !== 'agent') return reply.code(403).send({ status: 'error', message: 'Share tokens cannot browse message threads' });
-            return { status: 'success', payload: await request.workspace.messageThread(request.params.docId, {
+            const thread = await request.workspace.messageThread(request.params.docId, {
                 contextPath: binding?.type === 'agent' && binding.basePath && binding.basePath !== '/' ? binding.basePath : null,
-            }) };
+            });
+            return { status: 'success', payload: { ...thread, documents: thread.documents.map(emailListPreview) } };
         } catch (error) { return fail(reply, error); }
     });
     app.get('/reply-target/:docId', { onRequest: [app.authenticate, requireWorkspaceRead()] }, async (request, reply) => {

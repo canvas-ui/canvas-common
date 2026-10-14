@@ -9,6 +9,7 @@ import { resolveContentType } from '../../lib/mime.js';
 import { normalizeSchemaId } from '../../../core/workspace/documents/classifier.js';
 import { PREDICATES } from 'canvas-synapsd/src/indexes/edges/predicates.js';
 import { localDocumentIds, PLACEMENT_BUDGET, stampPlacement, treeOf } from '../../lib/placement.js';
+import { emailListPreview, resolveEmailBody } from '../../../core/workspace/services/mail/content.js';
 
 // Human filename for a location URL: basename of the key after scheme://backend/.
 function locationFilename(url) {
@@ -513,7 +514,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
           ctxSelector.path,
         ));
 
-      const responseObject = new ResponseObject().found(payload, isSearch ? 'Search results retrieved successfully' : 'Documents retrieved successfully', 200, documents.count, documents.totalCount);
+      const responseObject = new ResponseObject().found(payload.map(emailListPreview), isSearch ? 'Search results retrieved successfully' : 'Documents retrieved successfully', 200, documents.count, documents.totalCount);
       // Arrays lose non-index props in JSON — lift the calibration debug across.
       if (documents.debug) { responseObject.debug = documents.debug; }
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
@@ -617,7 +618,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
         return reply.code(responseObject.statusCode).send(responseObject.getResponse());
       }
 
-      const responseObject = new ResponseObject().found(documents, 'Search results retrieved successfully', 200, documents.count, documents.totalCount);
+      const responseObject = new ResponseObject().found(documents.map(emailListPreview), 'Search results retrieved successfully', 200, documents.count, documents.totalCount);
       // Arrays lose non-index props in JSON — lift per-line counts across.
       if (documents.lines) { responseObject.lines = documents.lines; }
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
@@ -1479,7 +1480,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     onRequest: [authenticateContent],
     schema: {
       params: { type: 'object', required: ['id', 'docId'], properties: { id: { type: 'string' }, docId: { type: 'string' } } },
-      querystring: { type: 'object', properties: { download: { type: 'string' }, url: { type: 'string' } } },
+      querystring: { type: 'object', properties: { download: { type: 'string' }, url: { type: 'string' }, format: { type: 'string', enum: ['email'] } } },
     },
   }, async (request, reply) => {
     try {
@@ -1505,6 +1506,12 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
           const r = new ResponseObject().forbidden('URL does not belong to this document');
           return reply.code(r.statusCode).send(r.getResponse());
         }
+      }
+
+      if (request.query.format === 'email') {
+        if (request.query.url) return reply.code(400).send({ error: 'Email bodies cannot select an attachment URL' });
+        const body = await resolveEmailBody(doc, workspace.resolveDocument.bind(workspace));
+        return reply.header('Cache-Control', 'private, no-cache').send(body);
       }
 
       // Attachment bytes carry their own contentType/size/filename — the doc's
@@ -1561,7 +1568,9 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       return reply.send(resolved.stream || resolved.buffer);
     } catch (error) {
       fastify.log.error(error);
-      const r = new ResponseObject().serverError('Failed to read document content');
+      const r = error.statusCode === 404 ? new ResponseObject().notFound(error.message)
+        : error.statusCode === 400 ? new ResponseObject().badRequest(error.message)
+          : new ResponseObject().serverError('Failed to read document content');
       return reply.code(r.statusCode).send(r.getResponse());
     }
   });

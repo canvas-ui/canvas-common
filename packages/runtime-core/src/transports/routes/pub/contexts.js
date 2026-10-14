@@ -1,3 +1,4 @@
+import { emailListPreview } from '../../../core/workspace/services/mail/content.js';
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
@@ -209,7 +210,7 @@ export default async function pubContextRoutes(fastify, _options) {
       }
 
       const response = new ResponseObject().found(
-        dbResult,
+        dbResult.map(emailListPreview),
         'Documents retrieved successfully from context',
         200,
         dbResult.count,

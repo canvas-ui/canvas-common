@@ -465,27 +465,6 @@ partial listing must never masquerade as complete). Contract + guard rails:
 - [ ] teams: Graph delta queries carry `@removed` tombstones — same inline
       option as gcal; full listing via `/messages` pagination otherwise.
 
-## IMAP inbound deletion-sync
-
-Outbound EXPUNGE exists (Canvas → server delete). Inbound — user deletes mail
-in their mail client, Canvas mirrors it — does not; the poll loop only
-fetches new UIDs above `lastUid`. Wanted (2026-08-17): opt-in per account,
-same UI shape as connectors' "Remove items deleted at the source" tickbox.
-
-- [ ] Reconcile per folder: `UID SEARCH ALL` (or ESEARCH) against the
-      folder's indexed UIDs; missing UIDs → drop that `imap://` location via
-      `WorkspaceStoredIndex.reconcileRemovedLocations` (never hard-delete —
-      same orphan semantics as the connector prune). Only after a SUCCESSFUL
-      full search on an authenticated session; skip on any error.
-- [ ] Careful with UIDVALIDITY changes: a changed validity invalidates every
-      stored UID for the folder — treat as "cannot traverse", never as
-      "everything was deleted".
-- [ ] UI: per-account tickbox in `imap-mailboxes-panel.tsx` (accounts are in
-      `canvas-web` ≥ 2.7.16; panel already collapses per account).
-- [ ] Reference: connector prune implementation in
-      `canvas-server/src/core/workspace/services/connectors/index.js`
-      (`#pruneContainer` — guard rails to mirror).
-
 ## Integration leftovers
 
 - [ ] Extend session-driven lists to layer and unfiled views where useful.

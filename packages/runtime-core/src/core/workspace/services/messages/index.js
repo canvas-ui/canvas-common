@@ -4,6 +4,7 @@ import path from 'node:path';
 import { normalizeSegment } from '../../../../utils/backend-documents.js';
 import { prepareEmail, deliverEmail } from './email.js';
 import { sendOnce, messageError } from './outbox.js';
+import { resolveEmailBody } from '../mail/content.js';
 
 export function sourceAccount(doc) {
     if (!doc) return null;
@@ -50,7 +51,9 @@ export async function sendWorkspaceMessage(workspace, mail, connectors, input, p
     // has left Canvas yet, so validation failures can be corrected normally.
     const instance = driver === 'imap' ? null : connectors.messageAccount(driver, address).instance;
     const loadAttachment = async (a) => (await workspace.resolveDocument(parent, { url: a.url }))?.buffer || null;
-    const prepared = driver === 'imap' ? await prepareEmail(config, input, parent, { loadAttachment }) : await instance.prepareMessage(input, parent);
+    const quotedParent = driver === 'imap' && parent && (input.quote === true || input.forward === true)
+        ? { ...parent, data: { ...parent.data, ...await resolveEmailBody(parent, (doc, options) => workspace.resolveDocument(doc, options)) } } : parent;
+    const prepared = driver === 'imap' ? await prepareEmail(config, input, quotedParent, { loadAttachment }) : await instance.prepareMessage(input, parent);
     const normalized = {
         driver, address, text: input.text, target: input.target || null,
         replyToDocumentId: parent?.id || null, to: input.to || [], cc: input.cc || [], bcc: input.bcc || [],

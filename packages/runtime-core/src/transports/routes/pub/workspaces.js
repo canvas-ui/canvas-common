@@ -1,3 +1,4 @@
+import { emailListPreview } from '../../../core/workspace/services/mail/content.js';
 import { workspaceErrorResponse } from '../../../core/workspace/runtime/errors.js';
 'use strict';
 
@@ -287,7 +288,7 @@ export default async function pubWorkspaceRoutes(fastify, _options) {
       }
 
       const response = new ResponseObject().found(
-        dbResult,
+        dbResult.map(emailListPreview),
         'Documents retrieved successfully from workspace',
         200,
         dbResult.count,

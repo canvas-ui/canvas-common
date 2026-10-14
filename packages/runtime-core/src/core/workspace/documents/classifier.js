@@ -150,7 +150,7 @@ class Classification {
         // Message rules use stable sender/channel identifiers, not display names.
         const data = doc?.data || {};
         const text = (value) => typeof value === 'string' && value.length ? value : null;
-        this.body = text(data.body) || text(data.text) || text(data.content) || text(data.bodyHtml);
+        this.body = text(data.body) || text(data.text) || text(data.content) || text(data.bodyHtml) || text(data.bodyPreview);
         this.sender = text(data.sender?.id) || text(data.sender?.username) || text(data.sender?.name) || text(data.sender);
         this.platform = text(data.platform);
         this.channel = text(data.channel?.id) || text(data.channel);

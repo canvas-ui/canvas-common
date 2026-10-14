@@ -268,9 +268,14 @@ export function createCanvasTools(env) {
         async execute(toolCallId, params, signal) {
             try {
                 const result = await client.get(`${documentsBase(resolveWorkspace(params))}/by-id/${params.docId}`, { signal });
-                const document = result.payload ?? null;
+                let document = result.payload ?? null;
                 if (!document) return toolResult(`Document #${params.docId} not found in your scope.`);
                 if (params.raw) return toolResult(document);
+                if (document.schema === 'data/schema/message/email'
+                    && typeof document.data?.body !== 'string' && typeof document.data?.bodyHtml !== 'string') {
+                    const body = await client.get(`${documentsBase(resolveWorkspace(params))}/${params.docId}/content`, { signal, query: { format: 'email' } });
+                    document = { ...document, data: { ...document.data, ...body } };
+                }
                 const maxChars = Number.isFinite(Number(params.maxChars)) && Number(params.maxChars) > 0
                     ? Math.floor(Number(params.maxChars))
                     : DEFAULT_GET_MAX_CHARS;

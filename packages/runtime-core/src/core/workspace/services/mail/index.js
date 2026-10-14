@@ -1,10 +1,9 @@
-import { readStoredConfig } from '../stored-config.js';
-import { containsSecrets, writePrivateJson } from '../../security/WorkspaceCrypto.js';
+import { readStoredConfig, updateStoredConfig } from '../stored-config.js';
+import { containsSecrets } from '../../security/WorkspaceCrypto.js';
 'use strict';
 
 import EventEmitter from 'eventemitter2';
 import path from 'path';
-import fs from 'fs/promises';
 import crypto from 'crypto';
 import { simpleParser } from 'mailparser';
 import ImapBackend from './ImapBackend.js';
@@ -14,13 +13,14 @@ import Email from 'canvas-synapsd/src/schemas/core/Email.js';
 import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
 import { getBackendEmailContext, normalizeSegment } from '../../../../utils/backend-documents.js';
 import { timeSpan } from '../../../../utils/perf-monitor.js';
+import { emailBodyChecksum, emailText, isEmail } from './content.js';
 
 /*
  * WorkspaceMailIndex (ImapService)
  *
  * Per-workspace IMAP connector: manages mailbox accounts (config/stored.json),
  * runs incremental sync + poll, and ingests messages as Email documents (raw
- * .eml + attachment blobs persisted under data/email/, indexed into the
+ * .eml + attachment blobs persisted in the workspace blob store, indexed into the
  * backends tree's /imap/<account>/<folder> subtree).
  *
  * Fully self-owned: it instantiates and owns its ImapBackend instances directly
@@ -190,7 +190,7 @@ export class WorkspaceMailIndex extends EventEmitter {
         const { documents = [] } = await db.listTreeDocuments('backends', { path: treePath, limit: null });
         const present = new Set(inventory.uids.map(Number));
         for (const doc of documents) {
-            if (!String(doc.schema).startsWith('data/schema/email')) continue;
+            if (!isEmail(doc)) continue;
             const prefix = `imap://${this.#safeAccount(inventory.account)}/${this.#encodeFolder(inventory.folder)};UID=`;
             const removed = (doc.locations || []).filter(l => {
                 if (!l.url.startsWith(prefix)) return false;
@@ -230,7 +230,7 @@ export class WorkspaceMailIndex extends EventEmitter {
         };
         backend.onMessage = (payload) => this.#onObject(payload);
         backend.onBatch = (payloads) => this.ingestBatch(payloads);
-        backend.onState = payload => this.#persistBackendState(payload);
+        backend.onState = payload => this.#persistBackendState(payload, backend);
         backend.onInventory = inventory => this.reconcileInventory(inventory, config);
         backend.on('error', (error) => {
             this.#setBackendError(name, error);
@@ -278,13 +278,15 @@ export class WorkspaceMailIndex extends EventEmitter {
     // Email indexing
     // ─────────────────────────────────────────────────────────────────────────
 
-    async #persistBackendState(payload = {}) {
+    async #persistBackendState(payload = {}, backend) {
         if (!payload.backend) return;
-        await this.patchStoredBackend(payload.backend, {
-            lastUid: payload.lastUid,
-            uidValidity: payload.uidValidity,
-            lastSyncAt: new Date().toISOString(),
-        }).catch((error) => this.#logger.warn({ workspaceId: this.#workspaceId, backend: payload.backend, error: error.message }, 'Failed to persist backend state'));
+        await updateStoredConfig(this.#configDir, config => {
+            // An obsolete scan may finish after an account was removed/replaced.
+            const current = config.backends[payload.backend];
+            if (!current || this.#backends.get(payload.backend) !== backend) return;
+            Object.assign(current, { lastUid: payload.lastUid, uidValidity: payload.uidValidity,
+                lastSyncAt: new Date().toISOString(), lastError: null });
+        }, this.#protectConfig);
         this.emit('source:state', { source: payload.backend, lastUid: payload.lastUid });
     }
 
@@ -294,7 +296,8 @@ export class WorkspaceMailIndex extends EventEmitter {
         const { raw, uid, seqno, flags, folder, account } = payload;
         if (!Buffer.isBuffer(raw)) return null;
 
-        const parsed = await simpleParser(raw);
+        const parsed = await simpleParser(raw, { skipImageLinks: true, skipTextToHtml: true });
+        parsed.text = emailText(parsed.text, parsed.html);
         const { emailDoc, attachmentDocs } = await this.#buildEmailDocument(parsed, raw, {
             uid, seqno, flags, uidValidity: payload.uidValidity,
             provider: 'imap',
@@ -311,8 +314,7 @@ export class WorkspaceMailIndex extends EventEmitter {
             ? await this.#getDb().getByChecksumString(messageKey).catch(() => null) : null;
         if (existing?.metadata?.outgoing && existing.metadata.mailAccount === account
             && existing.data?.subject === emailDoc.data.subject
-            && existing.data?.body === emailDoc.data.body
-            && existing.data?.bodyHtml === emailDoc.data.bodyHtml
+            && (existing.metadata.mailBodyChecksum || emailBodyChecksum(existing.data)) === emailDoc.metadata.mailBodyChecksum
             && JSON.stringify(existing.data?.from) === JSON.stringify(emailDoc.data.from)
             && JSON.stringify(existing.data?.to) === JSON.stringify(emailDoc.data.to)) {
             emailDoc.id = existing.id;
@@ -616,7 +618,14 @@ export class WorkspaceMailIndex extends EventEmitter {
             ...(emailDoc.metadata || {}),
             source: 'imap',
             workspaceId: this.#workspaceId,
+            contentType: 'message/rfc822',
+            size: rawBuffer.length,
+            mailBodyChecksum: emailBodyChecksum(emailDoc.data),
         };
+        // The durable .eml above owns the body. LMDB holds headers, the bounded
+        // preview and attachment references, so mailbox pages stay small.
+        delete emailDoc.data.body;
+        delete emailDoc.data.bodyHtml;
         return { emailDoc, attachmentDocs };
     }
 
@@ -841,26 +850,16 @@ export class WorkspaceMailIndex extends EventEmitter {
     // Shape: { backends: { "<name>": { driver: 'imap', ... } } }
     // ─────────────────────────────────────────────────────────────────────────
 
-    #storedConfigPath() {
-        return path.join(this.#configDir, 'stored.json');
-    }
-
     async readStoredConfig() {
         const parsed = await readStoredConfig(this.#configDir);
         return { ...parsed, backends: parsed.backends || {} };
     }
 
-    async writeStoredConfig(config) {
-        const target = this.#storedConfigPath();
-        await fs.mkdir(path.dirname(target), { recursive: true });
-        writePrivateJson(target, this.#protectConfig({ ...config, backends: config.backends || {} }));
-    }
-
     async patchStoredBackend(name, patch = {}) {
-        const config = await this.readStoredConfig();
-        config.backends[name] = { ...(config.backends[name] || {}), ...patch };
-        await this.writeStoredConfig(config);
-        return config.backends[name];
+        return updateStoredConfig(this.#configDir, config => {
+            config.backends[name] = { ...(config.backends[name] || {}), ...patch };
+            return config.backends[name];
+        }, this.#protectConfig);
     }
 
     // Register every enabled imap backend from stored.json. Does not start
@@ -912,12 +911,7 @@ export class WorkspaceMailIndex extends EventEmitter {
 
     async #syncImapBackend(name, backend) {
         const result = await backend.scan();
-        await this.patchStoredBackend(name, {
-            lastUid: result.lastUid,
-            uidValidity: result.uidValidity,
-            lastSyncAt: new Date().toISOString(),
-            lastError: null,
-        });
+        if (this.#backends.get(name) !== backend) return result;
         this.#backendStatus.set(name, { ...(this.#backendStatus.get(name) || {}), lastScanAt: new Date().toISOString(), lastError: null });
         return result;
     }
@@ -1051,28 +1045,32 @@ export class WorkspaceMailIndex extends EventEmitter {
     }
 
     async saveMailbox(input = {}) {
-        const stored = await this.readStoredConfig();
         const id = String(input.id || '').trim() || this.#generateMailboxId(input);
         const name = this.#mailboxName(id);
-        const current = stored.backends[name] || null;
-        const merged = { ...(current || {}), ...input, id };
-        merged.smtp = normalizeSmtp(input.smtp, current?.smtp);
-        if (current && typeof input.password === 'string' && input.password.length === 0) merged.password = current.password;
-        // initialSyncDays only governs the first sync (lastUid==0); see
-        // ImapBackend#searchCriteria. Reset the cursor only when the window
-        // WIDENED (older mail now wanted) — a same/narrower value must not
-        // force a full re-ingest on every save (re-ingest dedups, but it
-        // refetches and re-parses everything).
-        if (current && input.initialSyncDays != null && Number(input.initialSyncDays) > Number(current.initialSyncDays)) {
-            merged.lastUid = 0;
-            merged.lastSyncAt = null;
-        }
-        const mailbox = this.#normalizeMailbox(merged, id);
-        // Drop any running instance first so its in-memory cursor can't re-persist
-        // stale state, and so the rebuilt backend picks up the new config/cursor.
+        const prepare = current => {
+            const merged = { ...(current || {}), ...input, id };
+            merged.smtp = normalizeSmtp(input.smtp, current?.smtp);
+            if (current && typeof input.password === 'string' && input.password.length === 0) merged.password = current.password;
+            // initialSyncDays only governs the first sync (lastUid==0); see
+            // ImapBackend#searchCriteria. Reset the cursor only when the window
+            // WIDENED (older mail now wanted) — a same/narrower value must not
+            // force a full re-ingest on every save (re-ingest dedups, but it
+            // refetches and re-parses everything).
+            if (current && input.initialSyncDays != null && Number(input.initialSyncDays) > Number(current.initialSyncDays)) {
+                merged.lastUid = 0;
+                merged.lastSyncAt = null;
+            }
+            return this.#normalizeMailbox(merged, id);
+        };
+        // Validate before stopping the live mailbox; merge again under the
+        // config lock so a concurrent checkpoint is retained.
+        prepare((await this.readStoredConfig()).backends[name]);
         await this.#removeBackend(name);
-        stored.backends[name] = mailbox;
-        await this.writeStoredConfig(stored);
+        const mailbox = await updateStoredConfig(this.#configDir, stored => {
+            const value = prepare(stored.backends[name]);
+            stored.backends[name] = value;
+            return value;
+        }, this.#protectConfig);
         await this.#refreshMailboxBackend(id, mailbox);
         return this.#serializeMailbox(id, mailbox);
     }
@@ -1098,14 +1096,14 @@ export class WorkspaceMailIndex extends EventEmitter {
     }
 
     async removeMailbox(id) {
-        const stored = await this.readStoredConfig();
         const name = this.#mailboxName(id);
-        const removed = stored.backends[name];
-        if (!removed) return false;
         await this.#removeBackend(name);
-        delete stored.backends[name];
-        await this.writeStoredConfig(stored);
-        return this.#serializeMailbox(id, removed);
+        const removed = await updateStoredConfig(this.#configDir, stored => {
+            const entry = stored.backends[name];
+            delete stored.backends[name];
+            return entry;
+        }, this.#protectConfig);
+        return removed ? this.#serializeMailbox(id, removed) : false;
     }
 
     async testMailbox(id) {
@@ -1130,20 +1128,21 @@ export class WorkspaceMailIndex extends EventEmitter {
     }
 
     async subscribeFolders(id, folderPaths = []) {
-        const stored = await this.readStoredConfig();
-        const source = stored.backends[this.#mailboxName(id)];
-        if (!source) throw new Error(`Mailbox "${id}" not found`);
-        const folders = Array.from(new Set((folderPaths || []).map((f) => String(f || '').trim()).filter(Boolean)));
-        const result = [];
-        for (const folder of folders) {
-            const childId = this.#generateMailboxId({ ...source, folder });
-            const name = this.#mailboxName(childId);
-            if (!stored.backends[name]) {
-                stored.backends[name] = this.#normalizeMailbox({ ...source, folder, id: childId, lastUid: 0, lastSyncAt: null, lastError: null }, childId);
+        const result = await updateStoredConfig(this.#configDir, stored => {
+            const source = stored.backends[this.#mailboxName(id)];
+            if (!source) throw new Error(`Mailbox "${id}" not found`);
+            const folders = Array.from(new Set((folderPaths || []).map((f) => String(f || '').trim()).filter(Boolean)));
+            const result = [];
+            for (const folder of folders) {
+                const childId = this.#generateMailboxId({ ...source, folder });
+                const name = this.#mailboxName(childId);
+                if (!stored.backends[name]) {
+                    stored.backends[name] = this.#normalizeMailbox({ ...source, folder, id: childId, lastUid: 0, lastSyncAt: null, lastError: null }, childId);
+                }
+                result.push({ id: childId, config: stored.backends[name] });
             }
-            result.push({ id: childId, config: stored.backends[name] });
-        }
-        await this.writeStoredConfig(stored);
+            return result;
+        }, this.#protectConfig);
         for (const { id: childId, config } of result) {
             if (config.enabled !== false) await this.#refreshMailboxBackend(childId, config);
         }

@@ -36,7 +36,7 @@ const CANVAS_SKILL = {
         '- `canvas_notify` — send a notification to your user over their configured channel (WhatsApp/Slack).',
         '',
         '## Common schemas',
-        '- `data/schema/message/email` — ingested emails (data.subject, data.from, data.to, data.body)',
+        '- `data/schema/message/email` — ingested emails (data.subject, data.from, data.to, data.bodyPreview); use `canvas_get` to read the full message.',
         '- `data/schema/note` — notes (data.title, data.content)',
         '- `data/schema/tab` — browser tabs (data.url, data.title)',
         '- `data/schema/file` — indexed files',
