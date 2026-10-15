@@ -51,11 +51,14 @@ export default class Backends {
         const root = this.#runtime.objects.objectsBackend(backendName, { write: true }).root;
         const normalized = this.#runtime.objects.objectKey(backend, root, key);
         if (this.#runtime.state.stored.supportsScopedFolderDeletion !== true) throw objectsError('Upgrade canvas-stored to 1.12.1 or newer for deletion limited to this backend folder', 'STORED_TOO_OLD', 501);
+        const remote = this.#runtime.state.dataBackends[backendName].driver === 'gdrive';
+        if (remote && typeof this.#runtime.state.stored.removeDirectory !== 'function') throw objectsError('Upgrade canvas-stored for native Drive folder deletion', 'STORED_TOO_OLD', 501);
         return this.#index.withKeyLock(backendName, normalized, async () => {
-            if (!await backend.statContainer?.(normalized)) return { ok: true, key: normalized, type: 'directory' };
+            if (!remote && !await backend.statContainer?.(normalized)) return { ok: true, key: normalized, type: 'directory' };
             const release = await this.#runtime.scans.acquireBackendNamespace(backendName);
             try {
-                const result = await this.#runtime.state.stored.trashDirectory(backendName, normalized, { origin: `backend-delete:${randomUUID()}` });
+                const method = remote ? 'removeDirectory' : 'trashDirectory';
+                const result = await this.#runtime.state.stored[method](backendName, normalized, { origin: `backend-delete:${randomUUID()}` });
                 await this.#runtime.state.documentMutations;
                 return result;
             } finally { release(); }

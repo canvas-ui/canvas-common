@@ -37,6 +37,8 @@ export class InferdClient extends EventEmitter {
     #spawnCommand;
     #spawnArgs;
     #reconnectDelay = 250;
+    #reconnectTimer = null;
+    #cancelConnect = null;
 
     // Workspace adapters live here — the daemon holds only their names.
     #adapters = new Map();
@@ -88,54 +90,83 @@ export class InferdClient extends EventEmitter {
     }
 
     #connect() {
+        if (this.#stopped) { return Promise.resolve(null); }
+        if (this.connected) { return Promise.resolve(this); }
         if (this.#connecting) { return this.#connecting; }
+        clearTimeout(this.#reconnectTimer);
+        this.#reconnectTimer = null;
         this.#connecting = new Promise((resolve, reject) => {
-            // The daemon may still be binding its socket when we get here.
+            // Allow a bounded startup wait, then continue reconnecting in the
+            // background. Inferd may start much later than canvas-server.
             const deadline = Date.now() + 15_000;
+            let attemptTimer = null;
+            let pendingSocket = null;
+            this.#cancelConnect = () => {
+                clearTimeout(attemptTimer);
+                pendingSocket?.destroy();
+                resolve(null);
+            };
             const attempt = () => {
                 if (this.#stopped) { resolve(null); return; }
-                const socket = net.connect(this.#socketPath);
+                const socket = pendingSocket = net.connect(this.#socketPath);
+                const onError = (error) => {
+                    socket.destroy();
+                    if (this.#stopped) { resolve(null); return; }
+                    if (Date.now() > deadline) {
+                        reject(new Error(`inferd daemon unreachable at ${this.#socketPath}: ${error.message}`));
+                        return;
+                    }
+                    attemptTimer = setTimeout(attempt, 200);
+                };
+                socket.once('error', onError);
                 socket.once('connect', () => {
+                    if (this.#stopped) { socket.destroy(); resolve(null); return; }
+                    // Once connected, RpcPeer owns errors. Leaving the dial
+                    // handler installed can launch a second connection on error.
+                    socket.removeListener('error', onError);
+                    pendingSocket = null;
                     socket.setNoDelay(true);
                     this.#socket = socket;
-                    this.#peer = new RpcPeer(socket, { label: 'inferd-client' });
-                    this.#peer.handleAll(this.#callbacks());
-                    this.#peer.on('close', () => this.#onDisconnect());
-                    this.#peer.on('error', (error) => this.#logger.debug(`inferd peer: ${error.message}`));
+                    const peer = this.#peer = new RpcPeer(socket, { label: 'inferd-client' });
+                    peer.handleAll(this.#callbacks());
+                    peer.on('close', () => this.#onDisconnect(peer));
+                    peer.on('error', (error) => this.#logger.debug(`inferd peer: ${error.message}`));
                     this.#reconnectDelay = 250;
-                    this.#connecting = null;
                     this.#logger.info({ socketPath: this.#socketPath }, 'connected to inferd daemon');
                     this.#replayRegistrations();
                     this.emit('connected');
                     resolve(this);
                 });
-                socket.once('error', (error) => {
-                    socket.destroy();
-                    if (Date.now() > deadline) {
-                        this.#connecting = null;
-                        reject(new Error(`inferd daemon unreachable at ${this.#socketPath}: ${error.message}`));
-                        return;
-                    }
-                    setTimeout(attempt, 200);
-                });
             };
             attempt();
+        }).catch((error) => {
+            this.#scheduleReconnect();
+            throw error;
+        }).finally(() => {
+            this.#connecting = null;
+            this.#cancelConnect = null;
         });
         return this.#connecting;
     }
 
-    #onDisconnect() {
+    #onDisconnect(peer) {
+        if (this.#peer !== peer) { return; }
         this.#peer = null;
         this.#socket = null;
         this.emit('disconnected');
-        if (this.#stopped) { return; }
-        // Back off, but keep trying: a daemon restart should heal on its own.
+        this.#scheduleReconnect();
+    }
+
+    #scheduleReconnect() {
+        if (this.#stopped || this.connected || this.#reconnectTimer) { return; }
         const delay = this.#reconnectDelay;
         this.#reconnectDelay = Math.min(this.#reconnectDelay * 2, 30_000);
-        setTimeout(() => {
+        this.#reconnectTimer = setTimeout(() => {
+            this.#reconnectTimer = null;
             if (this.#stopped) { return; }
             this.#connect().catch((error) => this.#logger.debug(`inferd reconnect: ${error.message}`));
         }, delay);
+        this.#reconnectTimer.unref?.();
     }
 
     // A daemon that restarted has no memory of our workspaces; re-register them
@@ -245,6 +276,9 @@ export class InferdClient extends EventEmitter {
 
     async stop() {
         this.#stopped = true;
+        clearTimeout(this.#reconnectTimer);
+        this.#reconnectTimer = null;
+        this.#cancelConnect?.();
         if (this.#peer) { this.#peer.destroy(); this.#peer = null; }
         if (this.#socket) { try { this.#socket.destroy(); } catch { /* gone */ } this.#socket = null; }
         // Only kill a daemon we started; a shared one outlives us.

@@ -51,6 +51,7 @@ export default class WorkspaceBackends {
                 resyncing: runtime.resyncing === true,
                 resyncProgress: runtime.progress || null,
                 resyncStartedAt: runtime.resyncStartedAt || null,
+                cancelledAt: runtime.cancelledAt || null,
                 lastScanAt: runtime.lastScanAt || null,
                 lastError: this.#runtime.state.withoutSecrets && containsSecrets(config) ? 'Credentials locked — start with PIN/password' : runtime.lastError || null,
                 cacheStats: runtime.cacheStats || null,
@@ -138,6 +139,7 @@ export default class WorkspaceBackends {
             resyncing: status.resyncing === true,
             progress: status.resyncProgress || null,
             resyncStartedAt: status.resyncStartedAt || null,
+            resyncCancelledAt: status.cancelledAt || null,
             // Mirror node in the backends tree (/device/<device>/<mount> for
             // device-scoped mounts) so clients never re-derive path grammar.
             treePath: this.#runtime.state.storedIndex?.getBackendTreeRoot(name) || null,

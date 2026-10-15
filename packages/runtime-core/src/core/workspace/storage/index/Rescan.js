@@ -68,6 +68,7 @@ export default class Rescan {
         this.#patchResyncState(backendName, {
             resyncing: true,
             resyncStartedAt: new Date().toISOString(),
+            cancelledAt: null,
             progress: { scanned: 0, total: null },
         });
 

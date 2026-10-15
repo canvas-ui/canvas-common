@@ -1,6 +1,7 @@
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import { deleteDocumentsInBatches } from '../../../core/workspace/documents/bulk-delete.js';
 import { copyDocumentOnce } from '../../../core/workspace/documents/copy.js';
 import { parseDocumentId, parseDocumentIdArray } from '../../../utils/documentId.js';
 import { stripDeviceFeatureTags } from '../../../utils/device-features.js';
@@ -360,6 +361,141 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     sortBy: { type: 'string' },
   };
 
+  const documentQueryProps = {
+    ...contextQueryProps,
+    ...attributesQueryProps,
+    ...filtersQueryProps,
+    ...relQueryProps,
+    ...paginationQueryProps,
+    // q may repeat (?q=car&q=red): a stack of text queries that AND-narrow
+    // each other (stateless refinement). Single q == ordinary search.
+    q: { type: ['string', 'array'], items: { type: 'string' } },
+    search: { type: 'string' },
+    mode: { type: 'string', enum: ['fts', 'vector', 'hybrid'] },
+    // Optional cosine-distance floor for the dense side of vector/hybrid
+    // search — drops weak (far) kNN hits before fusion. 0..2 (0 = identical).
+    minDistance: { type: 'number' },
+    maxDistance: { type: 'number' },
+    // Calibration aid: attach raw (unfloored) image kNN cosine distances for
+    // the query to the response (`.debug.imageDistances`), to pick a floor.
+    debug: { type: 'boolean' },
+    // How many raw image distances to attach when debug is on. The top-25
+    // neighbours of any query cluster tightly, so calibrating a relevance
+    // floor needs a deeper window than the default.
+    debugLimit: { type: 'integer', minimum: 1, maximum: 500 },
+    // 'workspace' drops the path bucket entirely → list every document in
+    // the DB (synapsd default). 'path' (default) scopes to context/tree.
+    scope: { type: 'string', enum: ['path', 'workspace'], default: 'path' },
+    // Literal id-set constraint (may repeat: ?ids=1&ids=2) — ANDs into the
+    // structured scope. The external-producer seam: a lens/camera refine
+    // sends its kNN survivors here. NO default — [] means "match nothing"
+    // in synapsd, so absent must stay absent.
+    ids: { type: 'array', items: { type: 'integer', minimum: 1 } },
+    // Return document ids instead of documents — the cheap read a client
+    // uses to check whether a cached result set is still current.
+    idsOnly: { type: 'boolean', default: false },
+    // When false, do NOT fold a canvas leaf's stored querySpec into the
+    // read — the client is driving the filters itself (live canvas filter
+    // preview via the toolbox). Default true = normal canvas behavior.
+    applyCanvasSpec: { type: 'boolean', default: true },
+  };
+
+  // All server-side selection semantics live here: list and purge must agree.
+  async function resolveDocumentSelection(workspace, query, reply) {
+    // Whole-workspace scope = no path selector. Backend mirrors live in their
+    // own tree (linkContextRoot:false), so root/context queries never see
+    // them unless a user filed them somewhere.
+    const { context: ctxSelector, directory: dirSelector } = query.scope === 'workspace' || query.layerId
+      ? { context: null, directory: null }
+      : resolveScopeSelectors(workspace, query, '/');
+
+    // Collect the (possibly stacked) text queries. `q` may be a string or an
+    // array (repeated param); `search` is a legacy single alias.
+    const rawQ = query.q;
+    const rawQueries = (Array.isArray(rawQ) ? rawQ : (rawQ ? [rawQ] : []))
+      .concat(query.search ? [query.search] : [])
+      .filter((s) => typeof s === 'string' && s.trim().length > 0);
+
+    // A malformed rel token is a caller bug, like an unknown filter — 400 it
+    // instead of letting the generic catch report a 500.
+    let relFilters;
+    try { relFilters = parseRelTokens(query.rel); }
+    catch (e) { const r = new ResponseObject().badRequest(e.message); reply.code(r.statusCode).send(r.getResponse()); return null; }
+
+    // Inline `@predicate:value` tokens: strip them from the text, resolve
+    // values to anchor ids, fold into the rel filters. A POSITIVE token that
+    // resolves to no identity short-circuits to an empty result — running
+    // without the constraint would silently widen. A NEGATED one that
+    // resolves to nothing excludes nothing, so it is simply dropped.
+    const queries = [];
+    for (const q of rawQueries) {
+      if (query.layerId) { queries.push(q); continue; }
+      const { text, tokens } = parseInlineRelQuery(q);
+      if (text) { queries.push(text); }
+      for (const token of tokens) {
+        const anchors = await resolveRelAnchors(workspace, token.value);
+        if (anchors.length === 0) {
+          if (token.negated) { continue; }
+          return { documents: Object.assign([], { count: 0, totalCount: 0 }), ctxSelector, dirSelector, isSearch: true, spec: {} };
+        }
+        relFilters.push({ op: token.negated ? 'noneOf' : 'allOf', p: token.p, of: anchors, dir: token.dir });
+      }
+    }
+    const isSearch = queries.length > 0;
+
+    const spec = {
+      context: ctxSelector,
+      // Directory membership is node-exact (docs tick only their leaf node),
+      // so a folder listing stays exact but a search must scope to the whole
+      // subtree — otherwise searching the backends/directory tree at an
+      // ancestor folder matches nothing.
+      directory: isSearch && dirSelector ? { ...dirSelector, recursive: true } : dirSelector,
+      attributes: buildAttributes(query),
+      filters: query.filters,
+      ...(relFilters.length ? { rel: relFilters } : {}),
+      ...(query.ids !== undefined ? { ids: query.ids } : {}),
+      limit: query.limit,
+      offset: query.offset,
+      page: query.page,
+      order: query.order,
+      sortBy: query.sortBy,
+      idsOnly: query.idsOnly,
+      // Client-driven canvas preview opts out of stored-querySpec folding.
+      applyCanvasQuerySpec: query.applyCanvasSpec,
+    };
+
+    if (query.layerId) {
+      const tree = workspace.getTree(query.treeNameOrTreeId);
+      const layer = tree.getLayerById(query.layerId) || tree.getLayer(query.layerId);
+      if (!layer) {
+        const r = new ResponseObject().notFound(`Layer not found: ${query.layerId}`);
+        reply.code(r.statusCode).send(r.getResponse()); return null;
+      }
+      spec.attributes = { ...spec.attributes, allOf: [`context/${tree.id}/${layer.id}`, ...(spec.attributes?.allOf || [])] };
+      spec.applyCanvasQuerySpec = false;
+    }
+
+    const { minDistance, maxDistance } = query;
+    let documents;
+    if (queries.length > 1) {
+      // Stacked queries → stateless multi-query refinement (AND-narrow, last ranks).
+      documents = await workspace.searchRefined(queries, spec, {
+        limit: query.limit,
+        offset: query.offset,
+        mode: query.mode,
+        minDistance,
+        maxDistance,
+        debug: query.debug,
+        debugLimit: query.debugLimit,
+      });
+    } else if (queries.length === 1) {
+      documents = await workspace.search({ query: queries[0], mode: query.mode, minDistance, maxDistance, debug: query.debug, debugLimit: query.debugLimit, ...spec });
+    } else {
+      documents = await workspace.list(spec);
+    }
+    return { documents, ctxSelector, dirSelector, spec, isSearch };
+  }
+
   // ── List documents ──────────────────────────────────────────────────────
 
   fastify.get('/', {
@@ -371,42 +507,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       querystring: {
         type: 'object',
         properties: {
-          ...contextQueryProps,
-          ...attributesQueryProps,
-          ...filtersQueryProps,
-          ...relQueryProps,
-          ...paginationQueryProps,
-          // q may repeat (?q=car&q=red): a stack of text queries that AND-narrow
-          // each other (stateless refinement). Single q == ordinary search.
-          q: { type: ['string', 'array'], items: { type: 'string' } },
-          search: { type: 'string' },
-          mode: { type: 'string', enum: ['fts', 'vector', 'hybrid'] },
-          // Optional cosine-distance floor for the dense side of vector/hybrid
-          // search — drops weak (far) kNN hits before fusion. 0..2 (0 = identical).
-          minDistance: { type: 'number' },
-          maxDistance: { type: 'number' },
-          // Calibration aid: attach raw (unfloored) image kNN cosine distances for
-          // the query to the response (`.debug.imageDistances`), to pick a floor.
-          debug: { type: 'boolean' },
-          // How many raw image distances to attach when debug is on. The top-25
-          // neighbours of any query cluster tightly, so calibrating a relevance
-          // floor needs a deeper window than the default.
-          debugLimit: { type: 'integer', minimum: 1, maximum: 500 },
-          // 'workspace' drops the path bucket entirely → list every document in
-          // the DB (synapsd default). 'path' (default) scopes to context/tree.
-          scope: { type: 'string', enum: ['path', 'workspace'], default: 'path' },
-          // Literal id-set constraint (may repeat: ?ids=1&ids=2) — ANDs into the
-          // structured scope. The external-producer seam: a lens/camera refine
-          // sends its kNN survivors here. NO default — [] means "match nothing"
-          // in synapsd, so absent must stay absent.
-          ids: { type: 'array', items: { type: 'integer', minimum: 1 } },
-          // Return document ids instead of documents — the cheap read a client
-          // uses to check whether a cached result set is still current.
-          idsOnly: { type: 'boolean', default: false },
-          // When false, do NOT fold a canvas leaf's stored querySpec into the
-          // read — the client is driving the filters itself (live canvas filter
-          // preview via the toolbox). Default true = normal canvas behavior.
-          applyCanvasSpec: { type: 'boolean', default: true },
+          ...documentQueryProps,
         },
       },
     },
@@ -415,86 +516,9 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       const workspace = await getWorkspaceInstance(request, reply);
       if (!workspace) return reply;
 
-      // Whole-workspace scope = no path selector. Backend mirrors live in their
-      // own tree (linkContextRoot:false), so root/context queries never see
-      // them unless a user filed them somewhere.
-      const { context: ctxSelector, directory: dirSelector } = request.query.scope === 'workspace'
-        ? { context: null, directory: null }
-        : resolveScopeSelectors(workspace, request.query, '/');
-
-      // Collect the (possibly stacked) text queries. `q` may be a string or an
-      // array (repeated param); `search` is a legacy single alias.
-      const rawQ = request.query.q;
-      const rawQueries = (Array.isArray(rawQ) ? rawQ : (rawQ ? [rawQ] : []))
-        .concat(request.query.search ? [request.query.search] : [])
-        .filter((s) => typeof s === 'string' && s.trim().length > 0);
-
-      // A malformed rel token is a caller bug, like an unknown filter — 400 it
-      // instead of letting the generic catch report a 500.
-      let relFilters;
-      try { relFilters = parseRelTokens(request.query.rel); }
-      catch (e) { const r = new ResponseObject().badRequest(e.message); return reply.code(r.statusCode).send(r.getResponse()); }
-
-      // Inline `@predicate:value` tokens: strip them from the text, resolve
-      // values to anchor ids, fold into the rel filters. A POSITIVE token that
-      // resolves to no identity short-circuits to an empty result — running
-      // without the constraint would silently widen. A NEGATED one that
-      // resolves to nothing excludes nothing, so it is simply dropped.
-      const queries = [];
-      for (const q of rawQueries) {
-        const { text, tokens } = parseInlineRelQuery(q);
-        if (text) { queries.push(text); }
-        for (const token of tokens) {
-          const anchors = await resolveRelAnchors(workspace, token.value);
-          if (anchors.length === 0) {
-            if (token.negated) { continue; }
-            const r = new ResponseObject().found([], `No identity matched "${token.value}" for @${token.p}`, 200, 0, 0);
-            return reply.code(r.statusCode).send(r.getResponse());
-          }
-          relFilters.push({ op: token.negated ? 'noneOf' : 'allOf', p: token.p, of: anchors, dir: token.dir });
-        }
-      }
-      const isSearch = queries.length > 0;
-
-      const spec = {
-        context: ctxSelector,
-        // Directory membership is node-exact (docs tick only their leaf node),
-        // so a folder listing stays exact but a search must scope to the whole
-        // subtree — otherwise searching the backends/directory tree at an
-        // ancestor folder matches nothing.
-        directory: isSearch && dirSelector ? { ...dirSelector, recursive: true } : dirSelector,
-        attributes: buildAttributes(request.query),
-        filters: request.query.filters,
-        ...(relFilters.length ? { rel: relFilters } : {}),
-        ...(request.query.ids?.length ? { ids: request.query.ids } : {}),
-        limit: request.query.limit,
-        offset: request.query.offset,
-        page: request.query.page,
-        order: request.query.order,
-        sortBy: request.query.sortBy,
-        idsOnly: request.query.idsOnly,
-        // Client-driven canvas preview opts out of stored-querySpec folding.
-        applyCanvasQuerySpec: request.query.applyCanvasSpec,
-      };
-
-      const { minDistance, maxDistance } = request.query;
-      let documents;
-      if (queries.length > 1) {
-        // Stacked queries → stateless multi-query refinement (AND-narrow, last ranks).
-        documents = await workspace.searchRefined(queries, spec, {
-          limit: request.query.limit,
-          offset: request.query.offset,
-          mode: request.query.mode,
-          minDistance,
-          maxDistance,
-          debug: request.query.debug,
-          debugLimit: request.query.debugLimit,
-        });
-      } else if (queries.length === 1) {
-        documents = await workspace.search({ query: queries[0], mode: request.query.mode, minDistance, maxDistance, debug: request.query.debug, debugLimit: request.query.debugLimit, ...spec });
-      } else {
-        documents = await workspace.list(spec);
-      }
+      const selection = await resolveDocumentSelection(workspace, request.query, reply);
+      if (!selection) return reply;
+      const { documents, ctxSelector, spec, isSearch } = selection;
 
       if (documents.error) {
         fastify.log.error(`SynapsD error: ${documents.error}`);
@@ -1098,16 +1122,43 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   // ── Purge documents ─────────────────────────────────────────────────────
 
-  fastify.delete('/purge', {
+  // Retire the unsafe querystring contract. Cached clients must fail closed;
+  // new clients use POST and cannot fall back to an older server's DELETE.
+  fastify.delete('/purge', { onRequest: [fastify.authenticate] }, async (_request, reply) => {
+    const r = new ResponseObject().error('Purge requires the updated client with an explicit selection and expected count. Reload the app.', null, 410);
+    return reply.code(r.statusCode).send(r.getResponse());
+  });
+
+  const purgeSelectionProps = Object.fromEntries(Object.entries(documentQueryProps)
+    .filter(([key]) => !['limit', 'offset', 'page', 'order', 'sortBy', 'debug', 'debugLimit', 'idsOnly'].includes(key))
+    .map(([key, value]) => [key, Object.fromEntries(Object.entries(value).filter(([k]) => k !== 'default'))]));
+  purgeSelectionProps.layerId = { type: 'string', minLength: 1 };
+
+  fastify.post('/purge', {
     onRequest: [fastify.authenticate],
+    // Fastify normally removes unknown fields during validation. For a
+    // destructive selection that would silently drop a constraint: reject it.
+    preValidation: async (request, reply) => {
+      const body = request.body;
+      const unknown = Object.keys(request.query || {}).length > 0
+        || Object.keys(body || {}).some(key => !['selection', 'expectedCount'].includes(key))
+        || Object.keys(body?.selection || {}).some(key => !Object.hasOwn(purgeSelectionProps, key));
+      if (unknown) {
+        const r = new ResponseObject().badRequest('Unknown purge selection field; nothing was deleted.');
+        return reply.code(r.statusCode).send(r.getResponse());
+      }
+    },
     schema: {
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
-      querystring: {
-        type: 'object',
+      body: {
+        type: 'object', additionalProperties: false, required: ['selection', 'expectedCount'],
         properties: {
-          ...contextQueryProps,
-          ...attributesQueryProps,
-          ...filtersQueryProps,
+          expectedCount: { type: 'integer', minimum: 0 },
+          selection: {
+            type: 'object', additionalProperties: false,
+            required: ['treeNameOrTreeId', 'context', 'scope', 'allOf', 'anyOf', 'noneOf', 'filters', 'rel', 'q', 'applyCanvasSpec'],
+            properties: purgeSelectionProps,
+          },
         },
       },
     },
@@ -1115,50 +1166,44 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     try {
       const workspace = await getWorkspaceInstance(request, reply);
       if (!workspace) return reply;
-      const { context: ctxSel, directory: dirSel } = resolveScopeSelectors(workspace, request.query, '/');
-
-      const attributes = buildAttributes(request.query);
-      const matches = await workspace.list({
-        context: ctxSel,
-        directory: dirSel,
-        attributes,
-        filters: request.query.filters,
-        parse: false,
-        limit: 0,
-      });
-
-      if (matches.error) {
-        fastify.log.error(`SynapsD error in purge: ${matches.error}`);
-        const responseObject = new ResponseObject().error('Failed to purge documents due to a database error.', matches.error);
-        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      const selection = await resolveDocumentSelection(workspace, {
+        ...request.body.selection, limit: 0, offset: 0, idsOnly: true,
+      }, reply);
+      if (!selection) return reply;
+      const { documents: matches, ctxSelector, dirSelector } = selection;
+      if (matches.error || !Array.isArray(matches)) {
+        throw new Error('Failed to resolve purge selection');
+      }
+      // Resolve ONCE, before deleting. Never paginate a shrinking result set.
+      // Reject truncated, malformed, or stale results before the first mutation.
+      const documentIds = matches.map(doc => typeof doc === 'number' ? doc : doc?.id);
+      if (documentIds.some(id => !Number.isSafeInteger(id) || id <= 0)
+          || new Set(documentIds).size !== documentIds.length
+          || (matches.totalCount != null && matches.totalCount !== documentIds.length)) {
+        throw new Error('Incomplete purge selection');
+      }
+      if (documentIds.length !== request.body.expectedCount) {
+        const r = new ResponseObject().conflict('Matching documents changed. Nothing was deleted. Refresh the results and review the count before purging.', {
+          expectedCount: request.body.expectedCount, actualCount: documentIds.length,
+        });
+        return reply.code(r.statusCode).send(r.getResponse());
       }
 
-      const documentIds = matches.map(d => Number(d?.id)).filter(id => Number.isInteger(id) && id > 0);
-
-      if (documentIds.length === 0) {
-        const responseObject = new ResponseObject().success({ requested: 0, deleted: 0, result: { successful: [], failed: [], count: 0 } }, 'No matching documents to purge');
-        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
-      }
-
-      // Purge is scoped (we listed ids at this tree+path), so emit ONE tree-scoped
-      // batch event instead of N db-level per-doc events — drives cross-client
-      // auto-close + UI refresh without an event storm. deleteMany stays silent.
-      const result = await workspace.deleteMany(documentIds, { emitEvent: false });
-      const purgedIds = (result?.successful || []).map((entry) => entry.id).filter((id) => Number.isInteger(id));
-      if (purgedIds.length > 0) {
+      const result = await deleteDocumentsInBatches(workspace, documentIds, { emitEvent: false });
+      const purgedIds = result.successful.map(entry => entry.id).filter(Number.isSafeInteger);
+      if (purgedIds.length) {
         workspace.emitTreeDocumentEvent('tree.document.deleted.batch', {
-          context: ctxSel,
-          directory: dirSel,
-          documentIds: purgedIds,
+          context: ctxSelector, directory: dirSelector, documentIds: purgedIds,
         });
       }
-
-      const responseObject = new ResponseObject().deleted({ requested: documentIds.length, deleted: result?.successful?.length || 0, result }, 'Documents purged successfully', 200, result?.successful?.length || 0);
-      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      const deleted = result.successful.length;
+      const r = new ResponseObject().deleted({ requested: documentIds.length, deleted, result },
+        deleted === documentIds.length ? 'Documents purged successfully' : 'Purge stopped before all matching documents were deleted', 200, deleted);
+      return reply.code(r.statusCode).send(r.getResponse());
     } catch (error) {
       fastify.log.error(error);
-      const responseObject = new ResponseObject().serverError('Failed to purge documents');
-      return reply.code(responseObject.statusCode).send(responseObject.getResponse());
+      const r = new ResponseObject().serverError('Failed to purge documents. Refresh the results before retrying.');
+      return reply.code(r.statusCode).send(r.getResponse());
     }
   });
 

@@ -153,6 +153,11 @@ class Workspace extends EventEmitter {
 
     async #doStart({ passphrase, withoutSecrets = false } = {}) {
         this.#runtime.state.logger.debug({ workspaceId: this.id }, 'Starting workspace');
+        let startupStage = 'configuration';
+        const stage = (name) => {
+            startupStage = name;
+            this.#runtime.state.logger.info({ workspaceId: this.id, stage: name }, 'Workspace startup stage');
+        };
         try {
             this.#runtime.state.withoutSecrets = false;
             const configuredMode = this.#runtime.state.configStore.get('protection')?.mode;
@@ -190,6 +195,7 @@ class Workspace extends EventEmitter {
                     return undefined;
                 })
                 : undefined;
+            stage('database.open');
             this.#runtime.state.db = new Db({
                 path: dbPath,
                 // synapsd owns no model; if the inferd service is present, hand it
@@ -222,10 +228,13 @@ class Workspace extends EventEmitter {
                     ? 'Synapsd write still pending' : 'Slow synapsd write completed'),
             });
             instrumentDb(this.#runtime.state.db);
+            stage('database.initialize');
             await this.#runtime.operations.run('start.database', () => this.#runtime.state.db.start());
+            stage('trees.initialize');
             await this.#runtime.operations.run('start.context-tree', () => this.#runtime.trees.ensureContextTree());
             await this.#runtime.operations.run('start.directory-tree', () => this.#runtime.trees.ensureDirectoryTree());
             await this.#runtime.operations.run('start.backends-tree', () => this.#runtime.trees.ensureBackendsTree());
+            stage('inference.register');
             this.#bindRuntimeEvents();
             this.#runtime.inference.registerInferd();
             // Resume interrupted embedding: the inferd queue is in-memory, so a
@@ -243,6 +252,7 @@ class Workspace extends EventEmitter {
             // Mark ACTIVE before booting stored/mail indices: their initial sync
             // (IMAP scan → ingestMessage → #put → #getActiveDb) needs isActive,
             // otherwise every fetched message rejects with "Workspace not active".
+            stage('services.start');
             this.#setStatus(WORKSPACE_STATUS_CODES.ACTIVE);
             if (this.isServiceEnabled('home') || Object.values(this.dataBackends).some(cfg => cfg?.enabled && cfg.supported !== false)) {
                 await this.#runtime.operations.run('start.services', () => this.#runtime.integrations.startStoredIndex());
@@ -263,10 +273,11 @@ class Workspace extends EventEmitter {
             this.#runtime.contacts.runDataMigrations().catch((err) =>
                 this.#runtime.state.logger.warn({ workspaceId: this.id, error: err.message }, 'Data migrations failed; will retry on next start'));
 
+            stage('ready');
             this.emit('started', { id: this.id });
             return this;
         } catch (err) {
-            console.error(`Failed to start workspace "${this.id}": ${err.message}`);
+            this.#runtime.state.logger.error({ workspaceId: this.id, stage: startupStage, err }, 'Failed to start workspace');
             try { await this.#runtime.integrations.stopStoredIndex(); } catch { /* continue cleanup */ }
             await this.#runtime.contacts.stopContactExtraction();
             this.#runtime.inference.unregisterInferd();

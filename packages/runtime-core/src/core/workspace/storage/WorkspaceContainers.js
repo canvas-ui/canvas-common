@@ -103,7 +103,7 @@ export default class WorkspaceContainers {
             if (!target) throw new Error(`Container "${name}" not found on imap/${address}`);
             return this.#workspace.removeImapMailbox(target.id);
         }
-        if (driver === 'file') return this.#workspace.deleteBackendFolder(driver, address, name);
+        if (driver === 'file' || driver === 'gdrive') return this.#workspace.deleteBackendFolder(driver, address, name);
         throw new Error(`Backend "${driver}/${address}" has no containers`);
     }
 
@@ -158,7 +158,7 @@ export default class WorkspaceContainers {
     }
 
     async deleteBackendFolder(driver, address, name) {
-        this.#assertFolderDriver(driver);
+        if (driver !== 'gdrive') this.#assertFolderDriver(driver);
         const key = this.#backendFolderKey(name);
         const tree = await this.#directoryTreeForBackends();
         // Stored moves the complete directory into recoverable backend Trash

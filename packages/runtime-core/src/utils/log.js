@@ -12,6 +12,8 @@ import pretty from 'pino-pretty';
 import debugModule from 'debug';
 import { env } from '../env.js';
 
+// Diagnostic mode: retain the last message even if native code crashes or blocks.
+const SYNC_LOGGING = process.env.CANVAS_LOG_SYNC === '1';
 const isDev = process.env.NODE_ENV !== 'production';
 const VALID_LEVELS = new Set(['trace', 'debug', 'info', 'warn', 'error', 'fatal']);
 const MAX_TAIL_LINES = 500;
@@ -300,7 +302,7 @@ class BroadcastStream extends Writable {
 function buildStreams() {
     const streams = [
         { level: FILE_LOG_LEVEL, stream: new BroadcastStream() },
-        { level: FILE_LOG_LEVEL, stream: pino.destination({ dest: LOG_FILE_PATH, mkdir: true, sync: false }) },
+        { level: FILE_LOG_LEVEL, stream: pino.destination({ dest: LOG_FILE_PATH, mkdir: true, sync: SYNC_LOGGING }) },
     ];
 
     if (CONSOLE_ENABLED) {
@@ -311,9 +313,9 @@ function buildStreams() {
                     colorize: true,
                     translateTime: 'SYS:standard',
                     ignore: 'pid,hostname,service',
-                    sync: false,
+                    sync: SYNC_LOGGING,
                 })
-                : pino.destination({ dest: 1, sync: false }),
+                : pino.destination({ dest: 1, sync: SYNC_LOGGING }),
         });
     }
 
