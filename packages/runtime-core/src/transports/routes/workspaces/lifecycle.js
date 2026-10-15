@@ -10,6 +10,38 @@ import { requireWorkspaceRead, requireWorkspaceWrite, requireWorkspaceAdmin } fr
  * @param {Object} options - Plugin options
  */
 export default async function workspaceLifecycleRoutes(fastify, _options) {
+  fastify.get('/cache/maintenance', {
+    onRequest: [fastify.authenticate, requireWorkspaceAdmin()],
+  }, async (request, reply) => {
+    const result = request.workspace.cacheMaintenance.status();
+    const response = new ResponseObject().found(result, 'Cache maintenance status');
+    return reply.code(response.statusCode).send(response.getResponse());
+  });
+
+  fastify.post('/cache/maintenance', {
+    onRequest: [fastify.authenticate, requireWorkspaceAdmin()],
+    schema: {
+      body: {
+        type: 'object', additionalProperties: false, required: ['store', 'action'],
+        properties: {
+          store: { type: 'string', enum: ['workspace:cache', 'workspace:data'] },
+          action: { type: 'string', enum: ['collect', 'verify', 'compact'] },
+          confirm: { type: 'boolean' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const job = request.workspace.cacheMaintenance.start(request.body);
+      const response = new ResponseObject().success(job, 'Cache maintenance queued', 202);
+      return reply.code(202).send(response.getResponse());
+    } catch (error) {
+      const response = new ResponseObject().serverError(error.message || 'Failed to start cache maintenance');
+      response.statusCode = error.statusCode || 500;
+      return reply.code(response.statusCode).send(response.getResponse());
+    }
+  });
+
   async function resolveWorkspaceId(request, reply) {
     const identifier = request.params.id;
     const userId = request.user.id;

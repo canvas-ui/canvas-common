@@ -31,6 +31,7 @@ import WorkspaceServices from './runtime/WorkspaceServices.js';
 import WorkspaceContacts from './services/contacts/WorkspaceContacts.js';
 import WorkspaceMessaging from './services/messages/WorkspaceMessaging.js';
 import OperationMonitor from './runtime/OperationMonitor.js';
+import WorkspaceCacheMaintenance from './storage/WorkspaceCacheMaintenance.js';
 
 // Stable public API and runtime lifecycle. Domain collaborators live beside it.
 class Workspace extends EventEmitter {
@@ -69,6 +70,7 @@ class Workspace extends EventEmitter {
 
     get storagePolicyService() { return this.#runtime.state.storagePolicyService; }
     get storageOperations() { return this.#runtime.state.storedIndex?.stored?.replicas; }
+    get cacheMaintenance() { return this.#runtime.cacheMaintenance; }
 
     constructor(options) {
         super({
@@ -79,6 +81,10 @@ class Workspace extends EventEmitter {
             ...(options.eventEmitterOptions || {})
         });
         this.#runtime = { state: createWorkspaceState() };
+        this.#runtime.cacheMaintenance = new WorkspaceCacheMaintenance(
+            () => this.#runtime.state.storedIndex?.stored,
+            action => this.#runtime.operations.run('cache.maintenance', action),
+        );
         this.#runtime.config = new WorkspaceConfiguration(this, this.#runtime);
         this.#runtime.pins = new WorkspacePins(this, this.#runtime);
         this.#runtime.docs = new WorkspaceDocuments(this, this.#runtime);
