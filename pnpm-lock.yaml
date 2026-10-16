@@ -8,6 +8,7 @@ overrides:
   fast-jwt: 6.2.4
 
 importers:
+
   .:
     dependencies:
       '@augmentd-labs/canvas-agent-runtime':
@@ -66,10 +67,10 @@ importers:
         version: 20.0.4
       canvas-stored:
         specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/67e724e116a48f8d5bbd101d78538399e8510ee5
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/640d33efd489a76591dd99046b6dd071dfee5819
       canvas-synapsd:
         specifier: git+https://github.com/canvas-ui/canvas-synapsd.git#main
-        version: git+https://github.com/canvas-ui/canvas-synapsd.git#d1e3edc0a001e1b3810e8602a92bb0989f3b8d71(@types/node@26.6.4)
+        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#e222af37db66a2df971cf3871e5d494f76950498(@types/node@26.6.4)
       conf:
         specifier: ^14.0.0
         version: 14.0.0
@@ -113,8 +114,8 @@ importers:
         specifier: ^3.0.7
         version: 3.0.7
       lmdb:
-        specifier: 3.5.6
-        version: 3.5.6
+        specifier: 3.5.7
+        version: 3.5.7
       mailparser:
         specifier: ^3.9.9
         version: 3.9.36
@@ -179,6 +180,7 @@ importers:
       prettier:
         specifier: ^3.6.2
         version: 3.9.6
+
   packages/api-client:
     dependencies:
       '@augmentd-labs/canvas-protocol':
@@ -197,7 +199,9 @@ importers:
       socket.io:
         specifier: ^4.8.3
         version: 4.8.4
+
   packages/protocol: {}
+
   packages/runtime-core:
     dependencies:
       '@augmentd-labs/canvas-agent-runtime':
@@ -256,10 +260,10 @@ importers:
         version: 20.0.4
       canvas-stored:
         specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/67e724e116a48f8d5bbd101d78538399e8510ee5
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/640d33efd489a76591dd99046b6dd071dfee5819
       canvas-synapsd:
         specifier: git+https://github.com/canvas-ui/canvas-synapsd.git#main
-        version: git+https://github.com/canvas-ui/canvas-synapsd.git#d1e3edc0a001e1b3810e8602a92bb0989f3b8d71(@types/node@26.6.4)
+        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#e222af37db66a2df971cf3871e5d494f76950498(@types/node@26.6.4)
       conf:
         specifier: ^14.0.0
         version: 14.0.0
@@ -303,8 +307,8 @@ importers:
         specifier: ^3.0.7
         version: 3.0.7
       lmdb:
-        specifier: 3.5.6
-        version: 3.5.6
+        specifier: 3.5.7
+        version: 3.5.7
       mailparser:
         specifier: ^3.9.9
         version: 3.9.36
@@ -353,39 +357,11 @@ importers:
       zod:
         specifier: ^3.25.76
         version: 3.25.76
+
   packages/schemas: {}
+
   packages/wallpapers: {}
-  runtimes/edge:
-    dependencies:
-      '@augmentd-labs/canvas-api-client':
-        specifier: workspace:*
-        version: link:../../packages/api-client
-      '@augmentd-labs/canvas-protocol':
-        specifier: workspace:*
-        version: link:../../packages/protocol
-      canvas-stored:
-        specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/67e724e116a48f8d5bbd101d78538399e8510ee5
-      fastify:
-        specifier: ^4.29.1
-        version: 4.29.1
-      pino:
-        specifier: ^10.3.1
-        version: 10.3.1
-      socket.io-client:
-        specifier: ^4.8.3
-        version: 4.8.3
-  runtimes/workspaced:
-    dependencies:
-      '@augmentd-labs/canvas-agent-runtime':
-        specifier: workspace:*
-        version: link:../agent
-      '@augmentd-labs/canvas-runtime-core':
-        specifier: workspace:*
-        version: link:../../packages/runtime-core
-      proper-lockfile:
-        specifier: ^4.1.2
-        version: 4.1.2
+
   runtimes/agent:
     dependencies:
       '@augmentd-labs/canvas-api-client':
@@ -437,6 +413,39 @@ importers:
         specifier: ^11.1.1
         version: 11.1.1
 
+  runtimes/edge:
+    dependencies:
+      '@augmentd-labs/canvas-api-client':
+        specifier: workspace:*
+        version: link:../../packages/api-client
+      '@augmentd-labs/canvas-protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      canvas-stored:
+        specifier: github:canvas-ui/canvas-stored#main
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/640d33efd489a76591dd99046b6dd071dfee5819
+      fastify:
+        specifier: ^4.29.1
+        version: 4.29.1
+      pino:
+        specifier: ^10.3.1
+        version: 10.3.1
+      socket.io-client:
+        specifier: ^4.8.3
+        version: 4.8.3
+
+  runtimes/workspaced:
+    dependencies:
+      '@augmentd-labs/canvas-agent-runtime':
+        specifier: workspace:*
+        version: link:../agent
+      '@augmentd-labs/canvas-runtime-core':
+        specifier: workspace:*
+        version: link:../../packages/runtime-core
+      proper-lockfile:
+        specifier: ^4.1.2
+        version: 4.1.2
+
 packages:
 
   '@anthropic-ai/sdk@0.91.1':
@@ -451,44 +460,88 @@ packages:
   '@augmentd-labs/canvas-web@2.15.0':
     resolution: {integrity: sha512-PSmxpltIDOsQt1JmKDKOrrAIbYOEBQGUcaYoygKteSuBgPwlGIghMtskhZqxYNwI0Me9ipSIGAuxWnP04Sm64w==}
 
+  '@aws-sdk/checksums@3.1001.3':
+    resolution: {integrity: sha512-CcAkVyEUKGngbEqJdVdSc53Iy52+XzVL5NIcTen2BlK8UByNC1DThVtf5VKSrNzyA+SqyTvs+3S+knVBbOUizQ==}
+    engines: {node: '>=20.0.0'}
+
   '@aws-sdk/client-bedrock-runtime@3.1147.0':
     resolution: {integrity: sha512-ib48dDyWaaW6fny5Ut+D3lo6XM0cN/OHiAuru+4255M8KfWukshRdwdsyb4b+LiQ1dKCH+Rrx2+3Nea5s1QSHw==}
+    engines: {node: '>=20.0.0'}
+
+  '@aws-sdk/client-s3@3.1152.0':
+    resolution: {integrity: sha512-oI1+ZaM6pSOwZazu4nAb7rL8ug7LSjg31tDoJqRB9MooRqqWCf/qvkIZqne1mRA3xK3slg6K0RNWXaJYHbWLvg==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/core@3.978.1':
     resolution: {integrity: sha512-LbY9aGsEiznDWmUc30Nwv3aIX/+dbwTx8KfS0yOC3NPYMO+O91e6jkT1azf34FwjOndq8/Q+RcVVZz5xnerwdg==}
     engines: {node: '>=20.0.0'}
 
+  '@aws-sdk/core@3.978.3':
+    resolution: {integrity: sha512-nslpzUCTI9b2IQMWSd6mSAXldBexPc8rr0d3dXUutXYFLFaTdsHa2GD7sJdsn3PhyjK0O5K8ypd6zi+RXXPVlg==}
+    engines: {node: '>=20.0.0'}
+
   '@aws-sdk/credential-provider-env@3.972.72':
     resolution: {integrity: sha512-xTKO/FWJPozTIXbozVnVGoNBhaGba8TBcx+KyUjRVeOlXE+dUc7GTR1cLvu0uTdIdmemzaFbqqCshXeZA1fZew==}
+    engines: {node: '>=20.0.0'}
+
+  '@aws-sdk/credential-provider-env@3.972.74':
+    resolution: {integrity: sha512-rsRJcW2iFUhCgclyD6OSbMEaPl8Eu0qSeRZb2uuCK1ViZ66hl5wOe/p6Vr6MO3b+ydyKgFeqza2p6tZThvILlw==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/credential-provider-http@3.972.74':
     resolution: {integrity: sha512-u91E/hT8f4d1xy0Jl7VG4nVKJ3lxbrZkoBTeSVoJdWBiSEUMwMS/9+e0H/aJVQV//Lt5wuzP+E69v4aRSsNTmw==}
     engines: {node: '>=20.0.0'}
 
+  '@aws-sdk/credential-provider-http@3.972.76':
+    resolution: {integrity: sha512-pnKdh0Br7OJPj+7qKjzgTfDTFW0RhEMKXNDR2jv9CAM4oHuG/4z3hRh8KtutLfpmItuRtDbKBmwWkDqHwwAWXw==}
+    engines: {node: '>=20.0.0'}
+
   '@aws-sdk/credential-provider-ini@3.973.17':
     resolution: {integrity: sha512-ged4KXdBkvIC81bLvNHHuQKdKak/VXhQTR1NWYTTqW0474nlmsxy9O/vlgTIohDDWH3xpBdtVMZRyjb+DnocDA==}
+    engines: {node: '>=20.0.0'}
+
+  '@aws-sdk/credential-provider-ini@3.973.19':
+    resolution: {integrity: sha512-kcjvAxqQEV8yuwkX58RelNn3ne65o7JgRWf3Z/gVvbi7Xuw1qSDLJlatrLD76+40cmRxmNkLxBoyp/vAQChQ5g==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/credential-provider-login@3.972.79':
     resolution: {integrity: sha512-L+Z85anONJd8MaiuraO4wRxATCdEejBZ3K3eymzWI5JPXa9sOS9CkIm72PBKqXKX+Z9p9NGMX5AIMXm0LEflgw==}
     engines: {node: '>=20.0.0'}
 
+  '@aws-sdk/credential-provider-login@3.972.81':
+    resolution: {integrity: sha512-CeQHSbE2CnVdaHIJ/NayRaCecIER+Pm9faUPkmRATO54rCoMTEPSbVieGHzEwvm1dZM2HIs6qQZCznhayNTWJQ==}
+    engines: {node: '>=20.0.0'}
+
   '@aws-sdk/credential-provider-node@3.972.84':
     resolution: {integrity: sha512-oHt854odINVwzwsh+c5x69j0ajm4DbqqqVJ+O1ECsCIZeMDAbzFpXItaqP7UZstJj/ATdTk/KFSH0LaNAgV+kA==}
+    engines: {node: '>=20.0.0'}
+
+  '@aws-sdk/credential-provider-node@3.972.86':
+    resolution: {integrity: sha512-WNttSyr6e8innPtBSty//CdnqJcgZN6eAbtw3v/CR2IObz6MYZEo8eusdtuCHJ2ujwFqC2bSPHVyhXGHx8HruQ==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/credential-provider-process@3.972.72':
     resolution: {integrity: sha512-rLIp2xbMjX/k9/od7APpqq1ZgXXnV0pOL1Th3ZsL8Wu0TRtBsDTVS8iPqcfRFcHakFxPvR04OSTv2ka2qOb/2A==}
     engines: {node: '>=20.0.0'}
 
+  '@aws-sdk/credential-provider-process@3.972.74':
+    resolution: {integrity: sha512-Yj6kZFJQdbR+PygTkqdVLPHHpdDpOS9GCYVcDCuweCRRig9LF24ELQBMfyUw1vspvrZJUfnOGVyMjhaL094ahw==}
+    engines: {node: '>=20.0.0'}
+
   '@aws-sdk/credential-provider-sso@3.973.16':
     resolution: {integrity: sha512-IGihaJfFZYacJJr/odqILCoK7W/mvrZ7cuK7ECn3sAu4vLC6u0V8bS7mCGbdugJ8Aum2tnvqmx0F2MRFp2rn9g==}
     engines: {node: '>=20.0.0'}
 
+  '@aws-sdk/credential-provider-sso@3.973.18':
+    resolution: {integrity: sha512-FnpPhdY4qUGtX/8X6eKxh+uD+9Y19i9FYibgk4SBe0M935s9vocHkHzaxaMNk+YkHmvzgdu8cHA5SCoeU+kkew==}
+    engines: {node: '>=20.0.0'}
+
   '@aws-sdk/credential-provider-web-identity@3.972.78':
     resolution: {integrity: sha512-/y9WvNtlcPBGLR0qc1a+9J/xtYZfVczvLUOuXaVWylzttH7ewsxwHtjmiJSolNrVSDorIxHGHMU61CbonRkmwA==}
+    engines: {node: '>=20.0.0'}
+
+  '@aws-sdk/credential-provider-web-identity@3.972.80':
+    resolution: {integrity: sha512-TJF25Ndwy2HxcVj6oxMgp8qVlJAawlExHYBXqhuC6Zt2m+A7WpdkjBD6QglNbiArlteYljZHEY3R7KKmno6ISA==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/eventstream-handler-node@3.972.35':
@@ -499,6 +552,10 @@ packages:
     resolution: {integrity: sha512-B6gvZlcnRBNWraKgyEjKsbhv+VjtbyHmpU7hmtTHzXpDSxHPpCJnYLpglEOOsF+SFne20DbZC5IVC1aNr2Pb4A==}
     engines: {node: '>=20.0.0'}
 
+  '@aws-sdk/middleware-sdk-s3@3.972.79':
+    resolution: {integrity: sha512-UfgAQosf4IEXldMsyntVuHsJnaQzlH6pmkOr6dQy7CaOYSlGz3mWiW4Di7XfQ/kPJP6xE7oMshz1V0E8RqGdRg==}
+    engines: {node: '>=20.0.0'}
+
   '@aws-sdk/middleware-websocket@3.972.54':
     resolution: {integrity: sha512-bhESdru8u8KosziH8jcVta/NM/dNreeRz2+2aU86si5bfBYOiJ6IiqD+9U4URUcU5WJO3Yw+jO3GLDIHlscXMQ==}
     engines: {node: '>= 14.0.0'}
@@ -507,8 +564,16 @@ packages:
     resolution: {integrity: sha512-oRxtBcka/JGHGs9l9p9IVajGoTP8vTPmoAzdHGy4Qcy9P5vPnDf6nhIeM/COQNY9k/OahImTRaLkHftoXvfcmQ==}
     engines: {node: '>=20.0.0'}
 
+  '@aws-sdk/nested-clients@3.997.48':
+    resolution: {integrity: sha512-B01jdXJtAW/XOiUzGdI2mz67WyEHbGEc9X6Euzw3bjLAa+txTqdZDER4X2FsIEcXzV2ABqudVZ5thali8tCCzQ==}
+    engines: {node: '>=20.0.0'}
+
   '@aws-sdk/signature-v4-multi-region@3.996.47':
     resolution: {integrity: sha512-Zk08macMvQTHzQJCLJVkOlviVoqwYMrpXv4lmLN7b7sAbiMoOK7Go0NYdR5UeF+MW8LIbRmwrNy9u/5VvX1U5g==}
+    engines: {node: '>=20.0.0'}
+
+  '@aws-sdk/signature-v4-multi-region@3.996.48':
+    resolution: {integrity: sha512-cFDXfEbXaGwbnpvR/DyqfxfjxpjXVRVthQLgkwvcfDS5u3+8G9WSj1X1Ag/pTRg/QOeOno1Tq3ycEdrKsCUcOA==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/token-providers@3.1138.0':
@@ -517,6 +582,10 @@ packages:
 
   '@aws-sdk/token-providers@3.1147.0':
     resolution: {integrity: sha512-uem2B/WYeZvcJmiLWyUds0eUuOdGLuru9/Ei7HsNEdXrJH1l19IiQVVUyAcavKK3lvlJXSOHCjCDLkeV4Vhcmw==}
+    engines: {node: '>=20.0.0'}
+
+  '@aws-sdk/token-providers@3.1150.0':
+    resolution: {integrity: sha512-wDU36ofhabZYu+d2KSriyDbwzxNoaOp+4dG0p3qkabk7HeALR5nIWyQbjoyJZLn3iqWkv/xNdyUfbfevDVDzzg==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/types@3.974.6':
@@ -1167,8 +1236,18 @@ packages:
     cpu: [arm64]
     os: [darwin]
 
+  '@lmdb/lmdb-darwin-arm64@3.5.7':
+    resolution: {integrity: sha512-Y0CUvoj3ToaPQGdiqtodR0yrbAToNV74ylGQGSsNzmACO6iqKIUdU2OyFhkB+AAYpyfCA6oYh8hxbtc7eZhklA==}
+    cpu: [arm64]
+    os: [darwin]
+
   '@lmdb/lmdb-darwin-x64@3.5.6':
     resolution: {integrity: sha512-foa+pwitysO8k+xhs7psBFfTKnVgR69NlZRRTHaFVDqphh7AdGpLeyRzKw/ofatr/sN6TiHRRW6mmop0ZrrppQ==}
+    cpu: [x64]
+    os: [darwin]
+
+  '@lmdb/lmdb-darwin-x64@3.5.7':
+    resolution: {integrity: sha512-6WBLAMJxEJU7mhqvGmajtr9DKljh8Gd3uw4seeCnBLHsOsTOFZQ3evREZPiaz//wVamR/m9pFeexJZqWn6epfA==}
     cpu: [x64]
     os: [darwin]
 
@@ -1177,8 +1256,18 @@ packages:
     cpu: [arm64]
     os: [linux]
 
+  '@lmdb/lmdb-linux-arm64@3.5.7':
+    resolution: {integrity: sha512-Lt+Iu1FY4zfxEI35WnjvfyF5tC7r4jif6lcujjBsdyyCPtzJorPFCu983tGmroqo2yyBPhOzKFq9r1BFfuDO+Q==}
+    cpu: [arm64]
+    os: [linux]
+
   '@lmdb/lmdb-linux-arm@3.5.6':
     resolution: {integrity: sha512-QR4YRyR5h5Z8eGXrNQjiyo2NNDfqi3tCc9dQG5Is1blCt+qWw1ZoBWhlWAr5d+jshkifMIJjVHzHGKbkKzF8Tw==}
+    cpu: [arm]
+    os: [linux]
+
+  '@lmdb/lmdb-linux-arm@3.5.7':
+    resolution: {integrity: sha512-G7S80aRTbTwJ8b2HvnPu6aUQHqylKrThp7RjFtqpsicozHN8YBm/tGM0GOJTk/e2XKc1ohTB3nke6fi6BZSPjA==}
     cpu: [arm]
     os: [linux]
 
@@ -1187,13 +1276,28 @@ packages:
     cpu: [x64]
     os: [linux]
 
+  '@lmdb/lmdb-linux-x64@3.5.7':
+    resolution: {integrity: sha512-9wv08LC1zp9JNxOegfNIwvL1AScx+EM8+hJF52uZl+CbwlYV24NdFibB+Jn8ZvOxCqqDGOUZfy0+XQ3qd3cuQQ==}
+    cpu: [x64]
+    os: [linux]
+
   '@lmdb/lmdb-win32-arm64@3.5.6':
     resolution: {integrity: sha512-J7A9aEQsQiv0TYtBGL7NDIPp2lOS8nnl+zm4sWZm1xlsTTaQ4PgD096Adzdrk27rw3UxCkDXdCUa4ax41oztBQ==}
     cpu: [arm64]
     os: [win32]
 
+  '@lmdb/lmdb-win32-arm64@3.5.7':
+    resolution: {integrity: sha512-+qU4H80gI3OiWcka+2wDZ/KV89ZKKfvWz9aAZ64WYMhczPsn7BQqYvI5by/AdOcWSQL1tT0LLwmVM3QIbubwqQ==}
+    cpu: [arm64]
+    os: [win32]
+
   '@lmdb/lmdb-win32-x64@3.5.6':
     resolution: {integrity: sha512-1g7G0knRX2iV/voDu54yxrGqw5Dk0w2oIYb7dgJq8IkOi+m7wbD8Q3QpPFjh0C01G58S88dqGn03len6UPCXsg==}
+    cpu: [x64]
+    os: [win32]
+
+  '@lmdb/lmdb-win32-x64@3.5.7':
+    resolution: {integrity: sha512-iKT8EOWsWFihWe8UdUFAVfd6tvqACY9UC76f3MbkgPFEzMaKG2QUwWXP9GZibEeBCHajXf0nigKLrlFIsjYm3g==}
     cpu: [x64]
     os: [win32]
 
@@ -1478,6 +1582,10 @@ packages:
 
   '@smithy/core@3.35.1':
     resolution: {integrity: sha512-i4YPS4B6ts7bjn7UwLnGjiZdprOvHvgGobFZsYK3GIY3E5hIqtj0rReU69BcTpGp+fvtraSNXeG1l+jtJvF55w==}
+    engines: {node: '>=18.0.0'}
+
+  '@smithy/core@3.36.0':
+    resolution: {integrity: sha512-3hJiwG1F5t1SoXqp/yOCmYXziyx7ZVqF63S5W6YU201e/qwVaHPex+E/3vvyY9a3ORq/b+BydeNZpP2saQ9X2g==}
     engines: {node: '>=18.0.0'}
 
   '@smithy/credential-provider-imds@4.5.2':
@@ -1772,14 +1880,14 @@ packages:
     resolution: {integrity: sha512-L28STB170nwWS63UjtlEOE3dldQApaJXZkOI1uMFfzf3rRuPegHaHesyee+YxQ+W6SvRDQV6UrdOdRiR153wJg==}
     engines: {node: '>=6'}
 
-  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/67e724e116a48f8d5bbd101d78538399e8510ee5:
-    resolution: {tarball: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/67e724e116a48f8d5bbd101d78538399e8510ee5}
-    version: 1.9.3
+  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/640d33efd489a76591dd99046b6dd071dfee5819:
+    resolution: {tarball: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/640d33efd489a76591dd99046b6dd071dfee5819}
+    version: 1.15.0
     engines: {node: '>=20.0.0'}
 
-  canvas-synapsd@git+https://github.com/canvas-ui/canvas-synapsd.git#d1e3edc0a001e1b3810e8602a92bb0989f3b8d71:
-    resolution: {commit: d1e3edc0a001e1b3810e8602a92bb0989f3b8d71, repo: https://github.com/canvas-ui/canvas-synapsd.git, type: git}
-    version: 3.23.3
+  canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#e222af37db66a2df971cf3871e5d494f76950498:
+    resolution: {commit: e222af37db66a2df971cf3871e5d494f76950498, repo: git@github.com:canvas-ui/canvas-synapsd.git, type: git}
+    version: 3.23.7
     engines: {node: '>=22.0.0'}
 
   chalk-template@0.4.0:
@@ -2642,6 +2750,10 @@ packages:
 
   lmdb@3.5.6:
     resolution: {integrity: sha512-j3uE8ReKNyUWDjhfEFSJqE/1DLtfTR5Z8yFzVHvBjAk37wNg7HdScjcv8ttPHRvrdgPQMPWxFFI0SsdBzI5lBw==}
+    hasBin: true
+
+  lmdb@3.5.7:
+    resolution: {integrity: sha512-cSXt4RnfRAaGRXVI3hiJS3fQPQebj/c7RCRBvUL2cH5gTLpgvuGFqGJbH+ZkI2sFgvSlzwJw3GTw6ffFmN/uUw==}
     hasBin: true
 
   locate-path@5.0.0:
@@ -3640,6 +3752,14 @@ snapshots:
 
   '@augmentd-labs/canvas-web@2.15.0': {}
 
+  '@aws-sdk/checksums@3.1001.3':
+    dependencies:
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
   '@aws-sdk/client-bedrock-runtime@3.1147.0':
     dependencies:
       '@aws-sdk/core': 3.978.1
@@ -3650,6 +3770,20 @@ snapshots:
       '@aws-sdk/token-providers': 3.1147.0
       '@aws-sdk/types': 3.974.6
       '@smithy/core': 3.35.1
+      '@smithy/fetch-http-handler': 5.8.0
+      '@smithy/node-http-handler': 4.12.1
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
+  '@aws-sdk/client-s3@3.1152.0':
+    dependencies:
+      '@aws-sdk/checksums': 3.1001.3
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/credential-provider-node': 3.972.86
+      '@aws-sdk/middleware-sdk-s3': 3.972.79
+      '@aws-sdk/signature-v4-multi-region': 3.996.48
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
       '@smithy/fetch-http-handler': 5.8.0
       '@smithy/node-http-handler': 4.12.1
       '@smithy/types': 4.19.0
@@ -3666,6 +3800,17 @@ snapshots:
       bowser: 2.14.1
       tslib: 2.8.1
 
+  '@aws-sdk/core@3.978.3':
+    dependencies:
+      '@aws-sdk/types': 3.974.6
+      '@aws-sdk/xml-builder': 3.972.41
+      '@aws/lambda-invoke-store': 0.3.0
+      '@smithy/core': 3.36.0
+      '@smithy/signature-v4': 5.7.4
+      '@smithy/types': 4.19.0
+      bowser: 2.14.1
+      tslib: 2.8.1
+
   '@aws-sdk/credential-provider-env@3.972.72':
     dependencies:
       '@aws-sdk/core': 3.978.1
@@ -3674,11 +3819,29 @@ snapshots:
       '@smithy/types': 4.19.0
       tslib: 2.8.1
 
+  '@aws-sdk/credential-provider-env@3.972.74':
+    dependencies:
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
   '@aws-sdk/credential-provider-http@3.972.74':
     dependencies:
       '@aws-sdk/core': 3.978.1
       '@aws-sdk/types': 3.974.6
       '@smithy/core': 3.35.1
+      '@smithy/fetch-http-handler': 5.8.0
+      '@smithy/node-http-handler': 4.12.1
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
+  '@aws-sdk/credential-provider-http@3.972.76':
+    dependencies:
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
       '@smithy/fetch-http-handler': 5.8.0
       '@smithy/node-http-handler': 4.12.1
       '@smithy/types': 4.19.0
@@ -3700,12 +3863,37 @@ snapshots:
       '@smithy/types': 4.19.0
       tslib: 2.8.1
 
+  '@aws-sdk/credential-provider-ini@3.973.19':
+    dependencies:
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/credential-provider-env': 3.972.74
+      '@aws-sdk/credential-provider-http': 3.972.76
+      '@aws-sdk/credential-provider-login': 3.972.81
+      '@aws-sdk/credential-provider-process': 3.972.74
+      '@aws-sdk/credential-provider-sso': 3.973.18
+      '@aws-sdk/credential-provider-web-identity': 3.972.80
+      '@aws-sdk/nested-clients': 3.997.48
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
+      '@smithy/credential-provider-imds': 4.5.2
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
   '@aws-sdk/credential-provider-login@3.972.79':
     dependencies:
       '@aws-sdk/core': 3.978.1
       '@aws-sdk/nested-clients': 3.997.46
       '@aws-sdk/types': 3.974.6
       '@smithy/core': 3.35.1
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
+  '@aws-sdk/credential-provider-login@3.972.81':
+    dependencies:
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/nested-clients': 3.997.48
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
       '@smithy/types': 4.19.0
       tslib: 2.8.1
 
@@ -3723,11 +3911,33 @@ snapshots:
       '@smithy/types': 4.19.0
       tslib: 2.8.1
 
+  '@aws-sdk/credential-provider-node@3.972.86':
+    dependencies:
+      '@aws-sdk/credential-provider-env': 3.972.74
+      '@aws-sdk/credential-provider-http': 3.972.76
+      '@aws-sdk/credential-provider-ini': 3.973.19
+      '@aws-sdk/credential-provider-process': 3.972.74
+      '@aws-sdk/credential-provider-sso': 3.973.18
+      '@aws-sdk/credential-provider-web-identity': 3.972.80
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
+      '@smithy/credential-provider-imds': 4.5.2
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
   '@aws-sdk/credential-provider-process@3.972.72':
     dependencies:
       '@aws-sdk/core': 3.978.1
       '@aws-sdk/types': 3.974.6
       '@smithy/core': 3.35.1
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
+  '@aws-sdk/credential-provider-process@3.972.74':
+    dependencies:
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
       '@smithy/types': 4.19.0
       tslib: 2.8.1
 
@@ -3741,12 +3951,31 @@ snapshots:
       '@smithy/types': 4.19.0
       tslib: 2.8.1
 
+  '@aws-sdk/credential-provider-sso@3.973.18':
+    dependencies:
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/nested-clients': 3.997.48
+      '@aws-sdk/token-providers': 3.1150.0
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
   '@aws-sdk/credential-provider-web-identity@3.972.78':
     dependencies:
       '@aws-sdk/core': 3.978.1
       '@aws-sdk/nested-clients': 3.997.46
       '@aws-sdk/types': 3.974.6
       '@smithy/core': 3.35.1
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
+  '@aws-sdk/credential-provider-web-identity@3.972.80':
+    dependencies:
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/nested-clients': 3.997.48
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
       '@smithy/types': 4.19.0
       tslib: 2.8.1
 
@@ -3761,6 +3990,15 @@ snapshots:
     dependencies:
       '@aws-sdk/types': 3.974.6
       '@smithy/core': 3.35.1
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
+  '@aws-sdk/middleware-sdk-s3@3.972.79':
+    dependencies:
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/signature-v4-multi-region': 3.996.48
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
       '@smithy/types': 4.19.0
       tslib: 2.8.1
 
@@ -3785,7 +4023,25 @@ snapshots:
       '@smithy/types': 4.19.0
       tslib: 2.8.1
 
+  '@aws-sdk/nested-clients@3.997.48':
+    dependencies:
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/signature-v4-multi-region': 3.996.48
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
+      '@smithy/fetch-http-handler': 5.8.0
+      '@smithy/node-http-handler': 4.12.1
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
   '@aws-sdk/signature-v4-multi-region@3.996.47':
+    dependencies:
+      '@aws-sdk/types': 3.974.6
+      '@smithy/signature-v4': 5.7.4
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
+  '@aws-sdk/signature-v4-multi-region@3.996.48':
     dependencies:
       '@aws-sdk/types': 3.974.6
       '@smithy/signature-v4': 5.7.4
@@ -3807,6 +4063,15 @@ snapshots:
       '@aws-sdk/nested-clients': 3.997.46
       '@aws-sdk/types': 3.974.6
       '@smithy/core': 3.35.1
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
+  '@aws-sdk/token-providers@3.1150.0':
+    dependencies:
+      '@aws-sdk/core': 3.978.3
+      '@aws-sdk/nested-clients': 3.997.48
+      '@aws-sdk/types': 3.974.6
+      '@smithy/core': 3.36.0
       '@smithy/types': 4.19.0
       tslib: 2.8.1
 
@@ -4498,22 +4763,43 @@ snapshots:
   '@lmdb/lmdb-darwin-arm64@3.5.6':
     optional: true
 
+  '@lmdb/lmdb-darwin-arm64@3.5.7':
+    optional: true
+
   '@lmdb/lmdb-darwin-x64@3.5.6':
+    optional: true
+
+  '@lmdb/lmdb-darwin-x64@3.5.7':
     optional: true
 
   '@lmdb/lmdb-linux-arm64@3.5.6':
     optional: true
 
+  '@lmdb/lmdb-linux-arm64@3.5.7':
+    optional: true
+
   '@lmdb/lmdb-linux-arm@3.5.6':
+    optional: true
+
+  '@lmdb/lmdb-linux-arm@3.5.7':
     optional: true
 
   '@lmdb/lmdb-linux-x64@3.5.6':
     optional: true
 
+  '@lmdb/lmdb-linux-x64@3.5.7':
+    optional: true
+
   '@lmdb/lmdb-win32-arm64@3.5.6':
     optional: true
 
+  '@lmdb/lmdb-win32-arm64@3.5.7':
+    optional: true
+
   '@lmdb/lmdb-win32-x64@3.5.6':
+    optional: true
+
+  '@lmdb/lmdb-win32-x64@3.5.7':
     optional: true
 
   '@lukeed/ms@2.0.2': {}
@@ -4722,6 +5008,11 @@ snapshots:
       - supports-color
 
   '@smithy/core@3.35.1':
+    dependencies:
+      '@smithy/types': 4.19.0
+      tslib: 2.8.1
+
+  '@smithy/core@3.36.0':
     dependencies:
       '@smithy/types': 4.19.0
       tslib: 2.8.1
@@ -5062,8 +5353,9 @@ snapshots:
 
   camelcase@5.3.1: {}
 
-  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/67e724e116a48f8d5bbd101d78538399e8510ee5:
+  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/640d33efd489a76591dd99046b6dd071dfee5819:
     dependencies:
+      '@aws-sdk/client-s3': 3.1152.0
       cacache: 20.0.4
       chokidar: 5.0.0
       debug: 4.4.3
@@ -5073,13 +5365,13 @@ snapshots:
       fs-extra: 11.4.0
       image-size: 2.0.2
       imap: 0.8.19
-      lmdb: 3.5.6
+      lmdb: 3.5.7
       music-metadata: 11.15.0
       picomatch: 2.3.2
     transitivePeerDependencies:
       - supports-color
 
-  canvas-synapsd@git+https://github.com/canvas-ui/canvas-synapsd.git#d1e3edc0a001e1b3810e8602a92bb0989f3b8d71(@types/node@26.6.4):
+  canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#e222af37db66a2df971cf3871e5d494f76950498(@types/node@26.6.4):
     dependencies:
       '@lancedb/lancedb': 0.39.0(@types/node@26.6.4)(apache-arrow@18.1.0)
       apache-arrow: 18.1.0
@@ -6076,6 +6368,23 @@ snapshots:
       '@lmdb/lmdb-linux-x64': 3.5.6
       '@lmdb/lmdb-win32-arm64': 3.5.6
       '@lmdb/lmdb-win32-x64': 3.5.6
+
+  lmdb@3.5.7:
+    dependencies:
+      '@harperfast/extended-iterable': 1.0.3
+      msgpackr: 1.12.1
+      node-addon-api: 6.1.0
+      node-gyp-build-optional-packages: 5.2.2
+      ordered-binary: 1.6.1
+      weak-lru-cache: 1.2.2
+    optionalDependencies:
+      '@lmdb/lmdb-darwin-arm64': 3.5.7
+      '@lmdb/lmdb-darwin-x64': 3.5.7
+      '@lmdb/lmdb-linux-arm': 3.5.7
+      '@lmdb/lmdb-linux-arm64': 3.5.7
+      '@lmdb/lmdb-linux-x64': 3.5.7
+      '@lmdb/lmdb-win32-arm64': 3.5.7
+      '@lmdb/lmdb-win32-x64': 3.5.7
 
   locate-path@5.0.0:
     dependencies:

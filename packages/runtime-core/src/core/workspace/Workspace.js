@@ -32,6 +32,7 @@ import WorkspaceContacts from './services/contacts/WorkspaceContacts.js';
 import WorkspaceMessaging from './services/messages/WorkspaceMessaging.js';
 import OperationMonitor from './runtime/OperationMonitor.js';
 import WorkspaceCacheMaintenance from './storage/WorkspaceCacheMaintenance.js';
+import WorkspaceBackups from './storage/WorkspaceBackups.js';
 
 // Stable public API and runtime lifecycle. Domain collaborators live beside it.
 class Workspace extends EventEmitter {
@@ -70,6 +71,7 @@ class Workspace extends EventEmitter {
 
     get storagePolicyService() { return this.#runtime.state.storagePolicyService; }
     get storageOperations() { return this.#runtime.state.storedIndex?.stored?.replicas; }
+    get backups() { return this.#runtime.backups; }
     get cacheMaintenance() { return this.#runtime.cacheMaintenance; }
 
     constructor(options) {
@@ -81,6 +83,7 @@ class Workspace extends EventEmitter {
             ...(options.eventEmitterOptions || {})
         });
         this.#runtime = { state: createWorkspaceState() };
+        this.#runtime.backups = new WorkspaceBackups(this, this.#runtime);
         this.#runtime.cacheMaintenance = new WorkspaceCacheMaintenance(
             () => this.#runtime.state.storedIndex?.stored,
             action => this.#runtime.operations.run('cache.maintenance', action),
@@ -131,10 +134,11 @@ class Workspace extends EventEmitter {
     }
     get status() { return this.#runtime.state.status; }
     get runtimeDiagnostics() { return this.#runtime.operations.snapshot(); }
-    get isActive() { return this.#runtime.state.status === WORKSPACE_STATUS_CODES.ACTIVE; }
+    get isActive() { return !this.backups.restoring && this.#runtime.state.status === WORKSPACE_STATUS_CODES.ACTIVE; }
     assertActive() { if (!this.isActive) throw workspaceStopped(this); }
 
     get db() {
+        if (this.backups.restoring) throw workspaceStopped(this);
         if (!this.#runtime.state.db) throw new Error('Database not initialized');
         return this.#runtime.state.db;
     }
@@ -149,6 +153,7 @@ class Workspace extends EventEmitter {
     // #db whose tree registry isn't loaded yet — duplicating the pre-created
     // trees ("context" et al.) in LMDB.
     async start(options = {}) {
+        if (this.backups.restoring) throw protectionError('WORKSPACE_BUSY', 'Workspace database is being restored', 409);
         if (this.#runtime.state.protectionPromise) throw protectionError('WORKSPACE_BUSY', 'Workspace protection is being changed', 409);
         if (this.isActive) return this;
         if (this.#runtime.state.startPromise) return this.#runtime.state.startPromise;
@@ -201,9 +206,13 @@ class Workspace extends EventEmitter {
                     return undefined;
                 })
                 : undefined;
+            stage('database.backup');
+            await this.backups.startup();
             stage('database.open');
             this.#runtime.state.db = new Db({
                 path: dbPath,
+                backupOnOpen: false,
+                backupOnClose: false,
                 // synapsd owns no model; if the inferd service is present, hand it
                 // the query embedder so dense/hybrid search works. Absent → FTS.
                 semantic: !this.#runtime.state.withoutSecrets && this.#runtime.state.inferd
@@ -279,6 +288,7 @@ class Workspace extends EventEmitter {
             this.#runtime.contacts.runDataMigrations().catch((err) =>
                 this.#runtime.state.logger.warn({ workspaceId: this.id, error: err.message }, 'Data migrations failed; will retry on next start'));
 
+            this.backups.schedule();
             stage('ready');
             this.emit('started', { id: this.id });
             return this;
@@ -299,6 +309,7 @@ class Workspace extends EventEmitter {
     }
 
     async stop(reason = 'user-request') {
+        await this.backups.pause();
         if (this.#runtime.state.protectionPromise) { try { await this.#runtime.state.protectionPromise; } catch { /* release keys below */ } }
         if (this.#runtime.state.startPromise) { try { await this.#runtime.state.startPromise; } catch { /* already stopped */ } }
         this.#runtime.state.configStore.set('lastStopReason', reason);
@@ -318,6 +329,7 @@ class Workspace extends EventEmitter {
                 this.#unbindRuntimeEvents();
                 await this.#runtime.state.db.shutdown();
                 this.#runtime.state.db = null;
+                this.#runtime.state.trashOperations = null;
             }
             this.#setStatus(WORKSPACE_STATUS_CODES.INACTIVE);
             this.emit('stopped', { id: this.id });

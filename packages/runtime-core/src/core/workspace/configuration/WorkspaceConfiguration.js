@@ -44,7 +44,7 @@ export default class WorkspaceConfiguration {
     get stoppedAt() { return this.#runtime.state.configStore.get('stoppedAt', null); }
 
     async configureProtection(options) {
-        if (this.#workspace.isActive || this.#runtime.state.startPromise || this.#runtime.state.protectionPromise) throw protectionError('WORKSPACE_MUST_STOP', 'Stop the workspace before changing protection', 409);
+        if (this.#workspace.backups.busy || this.#workspace.isActive || this.#runtime.state.startPromise || this.#runtime.state.protectionPromise) throw protectionError('WORKSPACE_MUST_STOP', 'Stop the workspace before changing protection', 409);
         this.#runtime.state.protectionPromise = (async () => {
             try {
                 const result = await this.#runtime.state.crypto.configure(options);

@@ -5,6 +5,7 @@ import { containsSecrets } from '../../security/WorkspaceCrypto.js';
 import EventEmitter from 'eventemitter2';
 import path from 'path';
 import crypto from 'crypto';
+import { isDeepStrictEqual } from 'node:util';
 import GitRepositories, { repoName, gitTreePath, decodeGitSegment } from '../git/GitRepositories.js';
 const addressFor = (driver, value) => driver === 'git' ? repoName(value) : normalizeSegment(value);
 import { getBackendFileContext, normalizeSegment } from '../../../../utils/backend-documents.js';
@@ -53,6 +54,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     #homePath;
     #gitPath;
     #linkDocument;
+    #ensureBackendMembership;
     #removeBackendPath;
     #workspaceId;
     #logger;
@@ -76,8 +78,9 @@ export class WorkspaceConnectorIndex extends EventEmitter {
     #backends = new Map(); // name (`<driver>:<address>`) -> { driver, address, config, instance }
     #status = new Map();   // name -> { syncing, lastSyncAt, lastError, backoff }
     #timers = new Map();   // name -> timeout handle
+    #pendingWhatsAppIngests = new Map();
 
-    constructor({ gitPath = null, linkDocument = null, removeBackendPath = null, onContacts = null, sessionSecrets = null, resolveCredentials = (value) => value, protectConfig = (value) => value, secretsLocked = () => false, rootPath, configDir = path.join(rootPath, 'config'), varPath = path.join(rootPath, 'var'), homePath = path.join(rootPath, 'home'), workspaceId, logger, put, getBackendsTreeSelector, insertBackendPath = null, lockBackendNode = null, unlockBackendNode = null, listDocumentIdsUnderBackendPath = null, getDocumentsByIdArray = null, reconcileRemovedLocations = null, resolveDocumentIdByChecksum = null, inheritThreadMemberships = null }) {
+    constructor({ gitPath = null, linkDocument = null, ensureBackendMembership = null, removeBackendPath = null, onContacts = null, sessionSecrets = null, resolveCredentials = (value) => value, protectConfig = (value) => value, secretsLocked = () => false, rootPath, configDir = path.join(rootPath, 'config'), varPath = path.join(rootPath, 'var'), homePath = path.join(rootPath, 'home'), workspaceId, logger, put, getBackendsTreeSelector, insertBackendPath = null, lockBackendNode = null, unlockBackendNode = null, listDocumentIdsUnderBackendPath = null, getDocumentsByIdArray = null, reconcileRemovedLocations = null, resolveDocumentIdByChecksum = null, inheritThreadMemberships = null }) {
         super({ wildcard: true, delimiter: '.', maxListeners: 100 });
         if (!rootPath) throw new Error('rootPath is required');
         if (!put || !getBackendsTreeSelector) throw new Error('put and getBackendsTreeSelector are required');
@@ -87,6 +90,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         this.#homePath = homePath;
         this.#gitPath = gitPath;
         this.#linkDocument = linkDocument;
+        this.#ensureBackendMembership = ensureBackendMembership;
         this.#removeBackendPath = removeBackendPath;
         this.#sessionSecrets = sessionSecrets;
         this.#onContacts = onContacts;
@@ -729,7 +733,35 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         return { ...data, relations: [...relations, { p: 'replies-to', to: parentId }] };
     }
 
-    async #ingest(name, entry, container, spec, { features = [] } = {}) {
+    async #ingest(name, entry, container, spec, options = {}) {
+        if (entry.driver !== 'whatsapp') return this.#ingestDocument(name, entry, container, spec, options);
+        // Live messages and a history replay can reach the same identity at
+        // once. Compare with the committed row AFTER the preceding ingest,
+        // and never remember a failed write as successfully synchronized.
+        const key = spec.locations?.find((location) => location?.metadata?.provenance)?.url;
+        const previous = this.#pendingWhatsAppIngests.get(key);
+        const pending = (previous || Promise.resolve()).catch(() => {}).then(() => this.#ingestDocument(name, entry, container, spec, options));
+        this.#pendingWhatsAppIngests.set(key, pending);
+        try { return await pending; }
+        finally { if (this.#pendingWhatsAppIngests.get(key) === pending) this.#pendingWhatsAppIngests.delete(key); }
+    }
+
+    static #sameWhatsAppDocument(previous, incoming) {
+        if (!previous || previous.schema !== incoming.schema) return false;
+        // Metadata also contains storage/extraction fields that the driver
+        // does not own. Compare only the keys this ingest would overwrite.
+        // JSON normalization treats absent and undefined optional fields the
+        // same, including persisted messages from earlier runtime versions.
+        const project = (document) => ({
+            data: document.data,
+            locations: document.locations,
+            checksumArray: document.checksumArray,
+            metadata: Object.fromEntries(Object.keys(incoming.metadata).map((key) => [key, document.metadata?.[key]])),
+        });
+        return isDeepStrictEqual(JSON.parse(JSON.stringify(project(previous))), JSON.parse(JSON.stringify(project(incoming))));
+    }
+
+    async #ingestDocument(name, entry, container, spec, { features = [] } = {}) {
         const { schema, metadata = {}, locations = [], containerSegment } = spec;
         const provenance = locations.find((l) => l?.metadata?.provenance)?.url;
         if (!provenance) throw new Error(`Connector document without provenance location (${name})`);
@@ -748,12 +780,16 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         const contextSpec = entry.instance.treePath?.(container, spec) || getBackendFileContext(entry.driver, entry.address, containerSegment || container.id);
         if (entry.driver === 'git') await this.#ensureGitPath(entry, contextSpec);
         let existingId = null;
-        if (entry.driver === 'git' && this.#resolveDocumentIdByChecksum && this.#getDocumentsByIdArray) {
+        if (['git', 'whatsapp'].includes(entry.driver) && this.#resolveDocumentIdByChecksum && this.#getDocumentsByIdArray) {
             const id = await this.#resolveDocumentIdByChecksum(doc.checksumArray[0]);
             if (id != null) {
                 const result = await this.#getDocumentsByIdArray([id]);
                 const previous = (Array.isArray(result) ? result : result?.data || [])[0];
-                if (previous?.metadata?.git?.oid === metadata.git?.oid && previous.locations?.some(l => l.url === provenance)) existingId = id;
+                if (entry.driver === 'git') {
+                    if (previous?.metadata?.git?.oid === metadata.git?.oid && previous.locations?.some(l => l.url === provenance)) existingId = id;
+                } else if (!features.length && WorkspaceConnectorIndex.#sameWhatsAppDocument(previous, doc)) {
+                    existingId = id;
+                }
             }
         }
         const docId = existingId ?? await this.#put(doc, {
@@ -762,6 +798,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
             emitEvent: true,
             ...(features.length ? { features } : {}),
         });
+        if (existingId != null && entry.driver === 'whatsapp') await this.#ensureBackendMembership?.(docId, contextSpec);
         for (const placement of entry.instance.placements?.(spec) || []) {
             await this.#linkDocument?.(docId, placement);
         }
@@ -774,7 +811,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
             await this.#inheritThreadMemberships(docId, parentId).catch((error) =>
                 this.#logger.warn({ workspaceId: this.#workspaceId, backend: name, docId, parentId, error: error.message }, 'Connector thread membership inherit failed'));
         }
-        this.emit('object:add', { kind: entry.driver, docId, source: name, payload: { container: container.id } });
+        if (existingId == null || entry.driver !== 'whatsapp') this.emit('object:add', { kind: entry.driver, docId, source: name, payload: { container: container.id } });
         return docId;
     }
 

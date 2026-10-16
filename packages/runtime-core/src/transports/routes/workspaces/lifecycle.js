@@ -42,6 +42,30 @@ export default async function workspaceLifecycleRoutes(fastify, _options) {
     }
   });
 
+  const backupOwner = async (request, reply) => {
+    if (request.resourceToken || !request.workspaceAccess?.isOwner) {
+      return reply.code(403).send({ message: 'Only the workspace owner can manage database backups' });
+    }
+  };
+  fastify.get('/db/backups', {
+    onRequest: [fastify.authenticate, requireWorkspaceAdmin(), backupOwner],
+  }, async request => new ResponseObject().found(await request.workspace.backups.status(), 'Workspace backups').getResponse());
+
+  fastify.post('/db/backups', {
+    onRequest: [fastify.authenticate, requireWorkspaceAdmin(), backupOwner],
+    schema: { body: { type: 'object', additionalProperties: false, required: ['action'], properties: {
+      action: { type: 'string', enum: ['backup', 'restore'] },
+      backupId: { type: 'string', maxLength: 160 }, confirm: { type: 'boolean' },
+    } } },
+  }, async (request, reply) => {
+    try {
+      const job = request.workspace.backups.start(request.body);
+      return reply.code(202).send(new ResponseObject().success(job, 'Database operation started', 202).getResponse());
+    } catch (error) {
+      return reply.code(error.statusCode || 500).send({ message: error.message });
+    }
+  });
+
   async function resolveWorkspaceId(request, reply) {
     const identifier = request.params.id;
     const userId = request.user.id;

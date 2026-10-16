@@ -13,6 +13,7 @@ export default class OperationMonitor {
         this.#report = report;
         this.#threshold = Math.max(1, thresholdMs);
     }
+    async drain() { await Promise.allSettled([...this.#pending.values()].map(item => item.promise)); }
     snapshot() {
         const now = performance.now();
         return [...this.#pending.values()].map(({ operation, started }) => ({ operation, elapsedMs: Math.round(now - started) }));
@@ -22,7 +23,7 @@ export default class OperationMonitor {
         const result = action();
         if (!result || typeof result.then !== 'function') return result;
         const key = Symbol(operation);
-        this.#pending.set(key, { operation, started });
+        this.#pending.set(key, { operation, started, promise: result });
         if (!this.#timer) {
             this.#timer = setInterval(() => {
                 const pending = this.snapshot().filter(op => op.elapsedMs >= this.#threshold);

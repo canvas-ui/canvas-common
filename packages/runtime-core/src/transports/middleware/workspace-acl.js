@@ -9,7 +9,7 @@ import ResponseObject from '../ResponseObject.js';
 // Lifecycle and configuration metadata remain reachable while stopped.
 export function allowsStoppedWorkspace(request) {
   const url = (request.raw?.url || request.url || '').split('?')[0].replace(/\/$/, '');
-  return /\/workspaces\/[^/]+(?:\/(?:start|stop|status|protection))?$/.test(url);
+  return /\/workspaces\/[^/]+(?:\/(?:start|stop|status|protection|db\/backups|export|exports(?:\/[^/]+)?))?$/.test(url);
 }
 async function ensureStarted(request, workspace) {
   if (workspace?.isActive === false && !allowsStoppedWorkspace(request)) throw workspaceStopped(workspace);

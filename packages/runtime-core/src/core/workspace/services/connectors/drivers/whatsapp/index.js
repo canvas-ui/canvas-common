@@ -162,6 +162,19 @@ export default class WhatsAppConnector extends BaseConnector {
         socket.ev.on('messages.upsert', ({ messages }) => {
             for (const m of messages || []) this.#enqueue(() => this.#ingest(m));
         });
+        socket.ev.on('messages.update', (updates) => {
+            for (const { key, update } of updates || []) {
+                // Baileys delivers edits here, alongside delivery/read receipts.
+                // Only content updates affect the imported document; keep the
+                // original sent time when the update carries the edit time.
+                if (!key?.id || !key.remoteJid || !update?.message) continue;
+                this.#enqueue(async () => {
+                    const previous = await this.#readMessage(key);
+                    if (previous) await this.#ingest({ ...previous, ...update, key: { ...previous.key, ...key },
+                        messageTimestamp: previous.messageTimestamp || update.messageTimestamp });
+                });
+            }
+        });
     }
 
     async stop() {
@@ -207,6 +220,9 @@ export default class WhatsAppConnector extends BaseConnector {
         await this.#start();
         // Initial history arrives during pairing, before the picker selection
         // is saved. Replay that local history after selecting a conversation.
+        // Revisit it on later polls too: contacts/chat names and attachment
+        // availability can change without a new message timestamp. The index
+        // skips unchanged documents after resolving their reply relationships.
         await this.#queue;
         if (!this.#selected(container.id)) return { documents: [], nextCursor: cursor, done: true };
         const documents = [];
@@ -224,6 +240,12 @@ export default class WhatsAppConnector extends BaseConnector {
     }
 
     #messageFile(key) { return path.join(this.#root, `${hash(`${key.remoteJid}/${key.id}`)}.json`); }
+    async #cacheMessage(message) {
+        const file = this.#messageFile(message.key);
+        const serialized = JSON.stringify(message, this.#lib.BufferJSON.replacer);
+        const previous = await fs.readFile(file, 'utf8').catch((error) => { if (error.code !== 'ENOENT') throw error; return null; });
+        if (previous !== serialized) await fs.writeFile(file, serialized, { mode: 0o600 });
+    }
     async #readMessage(key) {
         try { return JSON.parse(await fs.readFile(this.#messageFile(key), 'utf8'), this.#lib.BufferJSON.reviver); }
         catch { return undefined; }
@@ -287,6 +309,11 @@ export default class WhatsAppConnector extends BaseConnector {
         const contact = this.#contacts.get(senderId) || this.#contacts.get(senderId.replace(/:\d+(?=@)/, ''));
         const senderName = contact?.name || contact?.notify || contact?.verifiedName || message.pushName;
         const quoted = content.contextInfo?.stanzaId;
+        // A missing source timestamp must not manufacture a new document on
+        // every history replay. The cached file supplies a stable fallback;
+        // Date.now is only needed if an outgoing message could not be cached.
+        const timestamp = message.messageTimestamp || await fs.stat(this.#messageFile(message.key))
+            .then((stat) => stat.mtimeMs / 1000, () => Date.now() / 1000);
         return this.document({
             schema: 'data/schema/message', containerSegment: jid,
             provenanceUrl: this.provenance(this.address, jid, message.key.id),
@@ -294,7 +321,7 @@ export default class WhatsAppConnector extends BaseConnector {
             data: { text, platform: 'whatsapp', channel: { id: jid, name: this.#chats.get(jid)?.name || jid },
                 sender: { id: senderId, name: senderName, username: senderName },
                 attachments, ...(mediaError ? { mediaError } : {}),
-                timestamp: new Date(Number(message.messageTimestamp || Date.now() / 1000) * 1000).toISOString(),
+                timestamp: new Date(Number(timestamp) * 1000).toISOString(),
             },
             metadata: { remoteId: message.key.id, whatsappKey: message.key, outgoing: message.key.fromMe === true },
         });
@@ -302,7 +329,7 @@ export default class WhatsAppConnector extends BaseConnector {
     async #ingest(message) {
         const jid = message.key?.remoteJid;
         if (!message.key?.id || !jid || jid.endsWith('@broadcast')) return;
-        await fs.writeFile(this.#messageFile(message.key), JSON.stringify(message, this.#lib.BufferJSON.replacer), { mode: 0o600 });
+        await this.#cacheMessage(message);
         if (this.#stopped || !this.#selected(jid)) return;
         const document = await this.#toDocument(message);
         if (document) await this.#onDocument({ id: jid, name: this.#chats.get(jid)?.name || jid }, document);
@@ -325,7 +352,7 @@ export default class WhatsAppConnector extends BaseConnector {
     async sendMessage(prepared) {
         const message = await this.#socket.sendMessage(prepared.target, prepared.picture ? { image: prepared.picture.content, caption: prepared.text, mimetype: prepared.picture.contentType } : { text: prepared.text }, { quoted: prepared.quoted });
         if (!message?.key?.id) throw new Error('WhatsApp did not acknowledge the message');
-        await fs.writeFile(this.#messageFile(message.key), JSON.stringify(message, this.#lib.BufferJSON.replacer), { mode: 0o600 }).catch(() => {});
+        await this.#cacheMessage(message).catch(() => {});
         return { status: 'accepted', providerMessageId: message.key.id,
             document: await this.#toDocument(message), container: { id: prepared.target, name: prepared.target } };
     }

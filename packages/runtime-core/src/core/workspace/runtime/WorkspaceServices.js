@@ -210,6 +210,12 @@ export default class WorkspaceServices {
                     ? { context: null, directory: placement }
                     : { context: placement, directory: null });
             },
+            ensureBackendMembership: async (id, treePath) => {
+                const paths = await this.#workspace.listDocumentTreeMemberships(id, Workspace.BACKENDS_TREE_NAME);
+                if (!paths.includes(treePath)) await this.#workspace.link(id, {
+                    context: null, directory: this.#workspace.getBackendsTreeSelector(treePath), allowBackendsWrite: true,
+                });
+            },
             workspaceId: this.#workspace.id,
             logger: this.#runtime.state.logger,
             put: (record, options = {}) => this.#workspace.put(record, { ...options, allowBackendsWrite: true }),
