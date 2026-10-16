@@ -5,6 +5,7 @@ import path from 'path';
 import getFolderSize from 'get-folder-size';
 import { normalizeSegment } from '../../../utils/backend-documents.js';
 import { detectMountSync } from 'canvas-stored/src/utils/mount.js';
+import { getBackendCapabilities } from 'canvas-stored/src/backends/BackendManager.js';
 import GdriveBackend from 'canvas-stored/src/backends/gdrive/index.js';
 import S3Backend from 'canvas-stored/src/backends/s3/index.js';
 import { WorkspaceStoredIndex } from './WorkspaceStoredIndex.js';
@@ -45,6 +46,7 @@ export default class WorkspaceBackends {
             const runtime = this.#runtime.state.storedIndex?.getBackendStatus(name) || {};
             return [name, {
                 ...config,
+                capabilities: runtime.capabilities,
                 root: WorkspaceConfiguration.resolveWorkspaceRoot(config.root, this.#runtime.state.rootPath),
                 running: runtime.running || false,
                 watching: runtime.watching || false,
@@ -109,17 +111,18 @@ export default class WorkspaceBackends {
             return { sync: true, test: true, containers: true, mutableContainers: false, deleteObject: true, paths: false };
         }
         const supported = config.supported !== false;
+        const features = config.capabilities || getBackendCapabilities({ ...config, driver });
         return {
+            ...features,
             sync: Boolean(config.resync) && supported,
             test: ['gdrive', 's3'].includes(driver) && supported,
             containers: false,
-            mutableContainers: (driver === 'file' || driver === 'gdrive') && config.readOnly !== true && supported,
-            // These drivers implement create-only keyed uploads.
-            upload: ['file', 'gdrive', 's3'].includes(driver) && config.enabled !== false && config.readOnly !== true && supported,
-            deleteObject: config.readOnly !== true && supported && (driver !== 's3' || config.permanentDelete === true),
+            mutableContainers: features.mutableContainers === true && config.readOnly !== true && supported,
+            upload: features.upload === true && config.enabled !== false && config.readOnly !== true && supported,
+            deleteObject: features.delete === true && config.readOnly !== true && supported,
             // Objects live under person-chosen paths (folder + filename on
             // transfer) — false for the content-hash keyed blob store.
-            paths: driver !== 'cacache' && supported,
+            paths: features.paths === true && supported,
         };
     }
 

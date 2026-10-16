@@ -157,6 +157,7 @@ const WHEN_CHECKS = {
     schema: (c, matcher) => asArray(matcher).some((s) => c.isSchema(s)),
     path: (c, matcher) => asArray(matcher).some((p) => c.inPath(p)),
     pathExact: (c, matcher) => asArray(matcher).some((p) => c.pathMatches(p).some((match) => match.rel === '')),
+    eventPathExact: (c, matcher) => asArray(matcher).some((p) => c.eventPathMatches(p).some((match) => match.rel === '')),
     url: (c, matcher) => asArray(matcher).some((u) => matchUrl(c, u)),
     from: (c, matcher) => asArray(matcher).some((f) => matchText(c.from, f)),
     // Any To/Cc recipient matches (substring or {equals|contains|startsWith|regex}).
@@ -223,7 +224,7 @@ export function matchRule(rule, eventName, c) {
     if (!when || typeof when !== 'object') { return false; }
 
     if (!WHEN_CHECKS.event(c, when.event, eventName)) { return false; }
-    for (const key of ['reason', 'schema', 'path', 'pathExact', 'url', 'from', 'to', 'subject', 'body', 'sender', 'thread', 'channel', 'platform', 'mime', 'filename', 'attachment']) {
+    for (const key of ['reason', 'schema', 'path', 'pathExact', 'eventPathExact', 'url', 'from', 'to', 'subject', 'body', 'sender', 'thread', 'channel', 'platform', 'mime', 'filename', 'attachment']) {
         if (when[key] !== undefined && !WHEN_CHECKS[key](c, when[key])) { return false; }
     }
 
@@ -497,7 +498,9 @@ const ACTIONS = {
      *     "recursive": true }
      *
      * filed under dir:/projects/canvas/UI/mobile → home:Projects/Canvas/UI/mobile/<name>.
-     * Context memberships cannot be mapped recursively onto filesystem paths.
+     * Context paths use when.eventPathExact and pathMode:'full': only the
+     * explicitly targeted folder matches, and its full path is recreated
+     * beneath folder. Ancestor membership is never an insertion destination.
      * The three parts are joined with `..`/leading-slash segments dropped.
      *
      * Copy is the default. A move requires one explicit `from` backend and
@@ -527,8 +530,17 @@ const ACTIONS = {
             const matches = scope.match?.all || (scope.match ? [scope.match] : []);
             const isDirectory = match => ['directory', 'backends'].includes(match.tree)
                 || workspace.getTree?.(match.tree)?.type === 'directory';
-            if (!matches.length || matches.some(match => !isDirectory(match))) {
-                throw new Error('Recursive storage requires a directory source. Context paths can store files in a fixed backend folder with recursive:false.');
+            const exactContext = action.pathMode === 'full' && scope.rule?.when?.eventPathExact !== undefined
+                && asArray(scope.rule.when.eventPathExact).length === 1
+                && matches.every(match => match.tree === 'context' && match.rel === '');
+            if (!matches.length || (!exactContext && matches.some(match => !isDirectory(match)))) {
+                throw new Error('Recursive storage requires a directory source, or one exact Context insertion path with pathMode:"full".');
+            }
+            if (action.pathMode === 'full' && !exactContext) {
+                throw new Error('Full path recreation requires one exact Context insertion path.');
+            }
+            if (!workspace.backendKeepsPaths(String(action.to || '').trim())) {
+                throw new Error('Recreating the sub-folder path requires a destination backend that supports folder paths');
             }
         }
         if (action.autoLink === true && !placement) {
@@ -579,7 +591,7 @@ const ACTIONS = {
             const name = action.autoLink === true
                 ? path.posix.basename(filenameOf(doc, source.key).replaceAll('\\', '/')) || String(doc.id)
                 : action.key ? render(action.key) : render('{{basename}}{{ext}}');
-            const rel = recursive ? String(scope.match?.rel || '') : '';
+            const rel = recursive ? String((action.pathMode === 'full' ? scope.match?.path : scope.match?.rel) || '') : '';
             key = joinKey(folder, rel, name);
             if (!key) {
                 logger.warn(`rule store: ${doc.id} destination key rendered empty (folder="${action.folder ?? ''}", key="${action.key ?? ''}"), skipping`);
@@ -883,7 +895,8 @@ const ACTIONS = {
 // {{match.rel}} / {{match.path}} / {{match.prefix}} and consumed by
 // `recursive: true` on link/unlink.
 function matchedPath(rule, context) {
-    const prefixes = asArray(rule?.when?.pathExact || rule?.when?.path || []).filter(Boolean);
+    const eventExact = rule?.when?.eventPathExact !== undefined;
+    const prefixes = asArray(rule?.when?.eventPathExact || rule?.when?.pathExact || rule?.when?.path || []).filter(Boolean);
     if (!prefixes.length || typeof context?.classify !== 'function') { return null; }
     let c;
     try { c = context.classify(); } catch { return null; }
@@ -895,7 +908,8 @@ function matchedPath(rule, context) {
     }
     const placements = new Map();
     for (const prefix of autoLink ? [...prefixes].sort((a, b) => String(b).length - String(a).length) : prefixes) {
-        const all = c.pathMatches(prefix).filter((match) => rule?.when?.pathExact === undefined || match.rel === '');
+        const all = (eventExact ? c.eventPathMatches(prefix) : c.pathMatches(prefix))
+            .filter((match) => (!eventExact && rule?.when?.pathExact === undefined) || match.rel === '');
         if (autoLink) {
             for (const match of all) {
                 const key = `${match.tree}:${match.path}`;
@@ -930,7 +944,7 @@ export async function executeRuleActions(rule, context, logger) {
         payload,
         event: eventName,
         workspace: { id: workspace.id, name: workspace.name },
-        rule: { id: rule.id, description: rule.description },
+        rule: { id: rule.id, description: rule.description, when: rule.when },
         match: matchedPath(rule, context),
     };
     // Writes this rule makes are automation caused by the triggering event.

@@ -113,6 +113,8 @@ function mimeMatch(mime, pattern) {
 // Event payloads carry `context`/`directory` specs whose path lives in either
 // `path` (string) or `paths` (array), depending on the emitting call.
 function extractPaths(spec) {
+    if (typeof spec === 'string') return spec ? [spec] : [];
+    if (Array.isArray(spec)) return spec.flatMap(extractPaths);
     if (!spec || typeof spec !== 'object') { return []; }
     const paths = Array.isArray(spec.paths) ? spec.paths : (spec.path ? [spec.path] : []);
     return paths.filter((p) => typeof p === 'string' && p.length > 0);
@@ -182,6 +184,10 @@ class Classification {
         const allDirectory = [...new Set([...directoryPaths, ...changedDirectory])];
         if (allContext.length) { this.treePaths.context = allContext; }
         if (allDirectory.length) { this.treePaths[directoryTree] = allDirectory; }
+        // Preserve the paths explicitly targeted by this operation BEFORE
+        // enrichment adds live membership (Context membership includes ancestors).
+        // A backfill cannot reconstruct where an earlier insertion was made.
+        this.eventTreePaths = payload?.backfill ? {} : { ...this.treePaths };
         // Pre-built map from the emitter ({ treeName: [paths] }) — backfill
         // loads a document's LIVE placements this way, since a stored doc has
         // no landing selectors.
@@ -293,11 +299,13 @@ class Classification {
      * lands in `dir:/bar/a/b` rather than flat in `dir:/bar`.
      * @returns {Array<{ tree: string, path: string, rel: string }>}
      */
-    pathMatches(prefix) {
+    eventPathMatches(prefix) { return this.pathMatches(prefix, this.eventTreePaths); }
+
+    pathMatches(prefix, treePaths = this.treePaths) {
         if (!prefix) { return []; }
         let raw = String(prefix);
         const qualifier = raw.match(/^([A-Za-z][\w-]*):(?=\/|$)/);
-        let trees = Object.keys(this.treePaths);
+        let trees = Object.keys(treePaths);
         if (qualifier) {
             trees = [({ ctx: 'context', dir: 'directory' })[qualifier[1]] || qualifier[1]];
             raw = raw.slice(qualifier[0].length);
@@ -305,7 +313,7 @@ class Classification {
         const target = raw.replace(/\/+$/, '') || '/';
         const out = [];
         for (const tree of trees) {
-            for (const p of this.treePaths[tree] || []) {
+            for (const p of treePaths[tree] || []) {
                 if (target === '/') {
                     out.push({ tree, path: p, rel: p.replace(/^\/+/, '') });
                 } else if (p === target) {

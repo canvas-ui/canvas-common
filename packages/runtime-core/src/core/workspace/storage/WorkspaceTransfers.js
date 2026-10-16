@@ -1,5 +1,5 @@
 import { joinKey, transferFilename } from '../services/hook/key-utils.js';
-import { isConnectorDriver } from '../services/connectors/index.js';
+import { getBackendCapabilities } from 'canvas-stored/src/backends/BackendManager.js';
 
 export default class WorkspaceTransfers {
     #workspace;
@@ -58,8 +58,10 @@ export default class WorkspaceTransfers {
     backendKeepsPaths(backendName) {
         const config = this.#workspace.dataBackends[backendName];
         if (!config) return false;
-        const driver = config.driver || 'file';
-        return driver !== 'cacache' && driver !== 'imap' && !isConnectorDriver(driver);
+        if (config.supported === false) return false;
+        const features = this.#runtime.state.storedIndex?.getBackendStatus(backendName)?.capabilities
+            || getBackendCapabilities(config);
+        return features.paths === true;
     }
 
     /**

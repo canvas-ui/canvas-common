@@ -565,6 +565,10 @@ export default async function workspaceHooksRoutes(fastify) {
           const response = new ResponseObject().notFound(`Rule "${ruleId}" not found`);
           return reply.code(response.statusCode).send(response.getResponse());
         }
+        if (rule.when?.eventPathExact !== undefined) {
+          const response = new ResponseObject().badRequest('This rule requires the original insert/link destination. Current Context membership cannot reconstruct it; replay an original event instead.');
+          return reply.code(response.statusCode).send(response.getResponse());
+        }
       }
 
       // Discovery: schema filter from the request, else from the rule's own

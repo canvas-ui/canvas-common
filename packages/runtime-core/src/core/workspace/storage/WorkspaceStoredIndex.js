@@ -91,6 +91,7 @@ export class WorkspaceStoredIndex {
         return {
             ...status,
             running: !!backend,
+            capabilities: backend?.capabilities,
             watching: backend?.watching || false,
             // Network mount (NFS/CIFS/sshfs/…) detected from the kernel mount
             // table by the file driver, or declared in config. The UI badges it
