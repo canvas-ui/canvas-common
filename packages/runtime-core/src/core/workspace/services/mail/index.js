@@ -169,10 +169,7 @@ export class WorkspaceMailIndex extends EventEmitter {
     }
 
     async stop() {
-        for (const backend of this.#backends.values()) {
-            await backend.stop().catch(() => {});
-        }
-        this.#backends.clear();
+        for (const name of [...this.#backends.keys()]) await this.#removeBackend(name);
         this.#backendStatus.clear();
         this.#started = false;
     }
@@ -233,6 +230,7 @@ export class WorkspaceMailIndex extends EventEmitter {
         backend.onState = payload => this.#persistBackendState(payload, backend);
         backend.onInventory = inventory => this.reconcileInventory(inventory, config);
         backend.on('error', (error) => {
+            if (this.#backends.get(name) !== backend) return;
             this.#setBackendError(name, error);
             this.emit('error', { source: name, error: error?.message || String(error) });
         });
@@ -248,8 +246,9 @@ export class WorkspaceMailIndex extends EventEmitter {
     async #removeBackend(name) {
         const backend = this.#backends.get(name);
         if (!backend) return;
-        await backend.stop().catch(() => {});
         this.#backends.delete(name);
+        this.#backendStatus.delete(name);
+        await backend.stop().catch(() => {});
         this.#applyAccountNodeLock(name, backend.config, false);
     }
 
@@ -287,6 +286,8 @@ export class WorkspaceMailIndex extends EventEmitter {
             Object.assign(current, { lastUid: payload.lastUid, uidValidity: payload.uidValidity,
                 lastSyncAt: new Date().toISOString(), lastError: null });
         }, this.#protectConfig);
+        if (this.#backends.get(payload.backend) !== backend) return;
+        this.#backendStatus.set(payload.backend, { ...(this.#backendStatus.get(payload.backend) || {}), lastError: null, lastScanAt: new Date().toISOString() });
         this.emit('source:state', { source: payload.backend, lastUid: payload.lastUid });
     }
 
@@ -894,17 +895,20 @@ export class WorkspaceMailIndex extends EventEmitter {
     #kickBackendSync(name, backend) {
         const status = this.#backendStatus.get(name) || {};
         if (status.syncing) return;
-        this.#backendStatus.set(name, { ...status, syncing: true });
+        this.#backendStatus.set(name, { ...status, syncing: true, lastError: null });
         (async () => {
             try {
                 await this.#syncImapBackend(name, backend);
             } catch (error) {
+                if (this.#backends.get(name) !== backend) return;
                 this.#setBackendError(name, error);
                 this.#logger.warn({ workspaceId: this.#workspaceId, backend: name, error: error.message }, 'IMAP sync failed');
             } finally {
-                this.#backendStatus.set(name, { ...(this.#backendStatus.get(name) || {}), syncing: false });
                 // The backend may have been removed (config change) mid-sync.
-                if (this.#backends.get(name) === backend) backend.watch?.();
+                if (this.#backends.get(name) === backend) {
+                    this.#backendStatus.set(name, { ...(this.#backendStatus.get(name) || {}), syncing: false });
+                    backend.watch?.();
+                }
             }
         })();
     }
@@ -973,7 +977,8 @@ export class WorkspaceMailIndex extends EventEmitter {
     #serializeMailbox(id, config) {
         const name = this.#mailboxName(id);
         const backend = this.#getBackend(name);
-        const syncing = this.#backendStatus.get(name)?.syncing === true;
+        const runtime = this.#backendStatus.get(name);
+        const syncing = runtime?.syncing === true || backend?.syncing === true;
         return {
             id,
             enabled: config.enabled !== false,
@@ -982,7 +987,8 @@ export class WorkspaceMailIndex extends EventEmitter {
             readOnly: config.readOnly === true,
             removalPolicy: normalizeRemovalPolicy(config.removalPolicy),
             pollInterval: config.pollInterval, initialSyncDays: config.initialSyncDays,
-            lastUid: config.lastUid || 0, lastSyncAt: config.lastSyncAt || null, lastError: this.#secretsLocked() && containsSecrets(config) ? 'Credentials locked — start with PIN/password' : config.lastError || null,
+            lastUid: config.lastUid || 0, lastSyncAt: config.lastSyncAt || null,
+            lastError: this.#secretsLocked() && containsSecrets(config) ? 'Credentials locked — start with PIN/password' : (runtime ? runtime.lastError : config.lastError) || null,
             passwordConfigured: Boolean(config.password),
             smtp: { ...config.smtp, password: undefined, passwordConfigured: Boolean(config.smtp?.password) },
             runtime: {
@@ -1056,7 +1062,9 @@ export class WorkspaceMailIndex extends EventEmitter {
             // WIDENED (older mail now wanted) — a same/narrower value must not
             // force a full re-ingest on every save (re-ingest dedups, but it
             // refetches and re-parses everything).
-            if (current && input.initialSyncDays != null && Number(input.initialSyncDays) > Number(current.initialSyncDays)) {
+            const previousDays = Number(current?.initialSyncDays ?? IMAP_DEFAULT_INITIAL_SYNC_DAYS);
+            const nextDays = Number(input.initialSyncDays);
+            if (current && input.initialSyncDays != null && previousDays !== 0 && (nextDays === 0 || nextDays > previousDays)) {
                 merged.lastUid = 0;
                 merged.lastSyncAt = null;
             }
@@ -1091,8 +1099,8 @@ export class WorkspaceMailIndex extends EventEmitter {
         }
         if (!ids.length) throw new Error(`No IMAP mailbox found for account "${accountSegment}"`);
         const results = [];
-        for (const id of ids) results.push(await this.syncMailbox(id));
-        return { account: wanted, mailboxes: results.length, results };
+        for (const id of ids) results.push(await this.syncMailbox(id, { full: true }));
+        return { account: wanted, mailboxes: results.length, syncing: results.some(result => result.syncing), results };
     }
 
     async removeMailbox(id) {
@@ -1112,6 +1120,8 @@ export class WorkspaceMailIndex extends EventEmitter {
         if (!entry) throw new Error(`Mailbox "${id}" not found`);
         const result = await new ImapBackend(this.#mailboxName(id), this.#resolveCredentials(entry)).verify();
         await this.patchStoredBackend(this.#mailboxName(id), { lastError: null });
+        const status = this.#backendStatus.get(this.#mailboxName(id));
+        if (status) status.lastError = null;
         return { mailbox: this.#serializeMailbox(id, entry), result };
     }
 
@@ -1152,7 +1162,15 @@ export class WorkspaceMailIndex extends EventEmitter {
     // Kick a sync for one mailbox. Non-blocking: a full (re)sync can take
     // longer than any sane HTTP timeout — progress surfaces via
     // runtime.status 'syncing' and the persisted lastUid/lastSyncAt.
-    async syncMailbox(id) {
+    async syncMailbox(id, { full = false } = {}) {
+        if (full) {
+            // An explicit Resync must revisit the configured date window, not
+            // merely ask for UIDs newer than the last poll. Saving resets the
+            // durable cursor and retires any old scan before starting the new
+            // instance. Failed attempts therefore retry from the reset cursor.
+            const mailbox = await this.saveMailbox({ id, lastUid: 0, lastSyncAt: null });
+            return { mailbox, syncing: mailbox.runtime.syncing };
+        }
         const name = this.#mailboxName(id);
         let backend = this.#getBackend(name);
         if (!backend) {

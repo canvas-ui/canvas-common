@@ -77,7 +77,7 @@ export default class WorkspaceContainers {
         if (driver !== 'imap') throw new Error(`Backend "${driver}/${address}" has no containers`);
         const container = (await this.#workspace.listBackendContainers('imap', address)).find((c) => c.name === name);
         if (!container) throw new Error(`Container "${name}" not found on imap/${address}`);
-        return (await this.#runtime.integrations.mail()).syncMailbox(container.mailboxId);
+        return (await this.#runtime.integrations.mail()).syncMailbox(container.mailboxId, { full: true });
     }
 
     // Add containers: imap → subscribe folders (per-folder mailboxes); file →

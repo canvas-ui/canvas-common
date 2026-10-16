@@ -204,6 +204,7 @@ export default class WorkspaceBackends {
     #imapBackendDescriptor(address, mailboxes = []) {
         const errored = mailboxes.find((m) => m.lastError);
         const anyRunning = mailboxes.some((m) => m.runtime?.active);
+        const syncing = mailboxes.some((m) => m.runtime?.syncing);
         const lastSyncAt = mailboxes.map((m) => m.lastSyncAt).filter(Boolean).sort().at(-1) || null;
         const primary = mailboxes[0] || {};
         return {
@@ -211,7 +212,8 @@ export default class WorkspaceBackends {
             address,
             kind: 'messages',
             enabled: mailboxes.some((m) => m.enabled !== false),
-            status: errored ? 'error' : (anyRunning ? 'running' : 'idle'),
+            status: syncing ? 'syncing' : errored ? 'error' : (anyRunning ? 'running' : 'idle'),
+            resyncing: syncing,
             lastSyncAt,
             lastError: errored?.lastError || null,
             capabilities: this.#backendCapabilities('imap'),

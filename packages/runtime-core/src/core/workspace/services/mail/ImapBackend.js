@@ -30,6 +30,8 @@ export default class ImapBackend extends StorageBackend {
     #lastUid = 0;
     #syncing = false;
     #scanPromise = null;
+    #connections = new Set();
+    #stopped = false;
     // Poll backoff: consecutive scan failures push the next attempt out
     // exponentially (capped) instead of re-running a possibly full initial
     // sync every poll tick.
@@ -57,6 +59,7 @@ export default class ImapBackend extends StorageBackend {
     nativeUrl(key) { return `imap://${this.#account}/${key}`; }
     get watching() { return !!this.#pollTimer; }
     get lastUid() { return this.#lastUid; }
+    get syncing() { return this.#scanPromise !== null; }
     get #folder() { return this.config.folder || DEFAULT_FOLDER; }
     get #account() { return this.config.account || this.config.user; }
 
@@ -77,23 +80,32 @@ export default class ImapBackend extends StorageBackend {
 
     // Connect, run `fn(imap)`, always end the connection.
     #withConnection(fn) {
+        if (this.#stopped) return Promise.reject(this.#stoppedError());
         return new Promise((resolve, reject) => {
             const imap = new Imap(this.#options());
             let settled = false;
-            const done = (err, val) => {
+            const cancel = () => done(this.#stoppedError(), undefined, true);
+            const done = (err, val, abort = false) => {
                 if (settled) return;
                 settled = true;
-                try { imap.end(); } catch { /* already closed */ }
+                this.#connections.delete(cancel);
+                try { if (abort) imap.destroy(); else imap.end(); } catch { /* already closed */ }
                 err ? reject(err) : resolve(val);
             };
+            this.#connections.add(cancel);
             imap.once('ready', () => {
-                Promise.resolve().then(() => fn(imap, done))
+                if (settled) return;
+                Promise.resolve().then(() => { if (!settled) return fn(imap, done); })
                     .then((val) => done(null, val), (e) => done(e));
             });
             imap.once('error', (e) => done(e));
-            imap.connect();
+            imap.once('close', () => done(new Error('IMAP connection closed before the operation completed')));
+            try { imap.connect(); } catch (error) { done(error); }
         });
     }
+
+    #stoppedError() { return Object.assign(new Error('IMAP backend was stopped'), { code: 'IMAP_STOPPED' }); }
+    #assertActive() { if (this.#stopped) throw this.#stoppedError(); }
 
     #openBox(imap, folder, readOnly) {
         return new Promise((resolve, reject) => {
@@ -225,6 +237,7 @@ export default class ImapBackend extends StorageBackend {
     }
 
     #fetchBatch(imap, source) {
+        this.#assertActive();
         return new Promise((resolve, reject) => {
             const fetch = imap.fetch(source, { bodies: '' });
             const payloads = [];
@@ -257,6 +270,7 @@ export default class ImapBackend extends StorageBackend {
             // service dedups re-ingests).
             fetch.once('end', () => {
                 (async () => {
+                    this.#assertActive();
                     if (this.onBatch) {
                         await this.onBatch(payloads);
                     } else {
@@ -264,6 +278,7 @@ export default class ImapBackend extends StorageBackend {
                             await (this.onMessage ? this.onMessage(payload) : this.emit('object:add', payload));
                         }
                     }
+                    this.#assertActive();
                     const maxUid = payloads.reduce((max, p) => Math.max(max, p.uid || 0), this.#lastUid);
                     this.#lastUid = maxUid;
                 })().then(resolve, reject);
@@ -287,21 +302,27 @@ export default class ImapBackend extends StorageBackend {
         try {
             const result = await this.#withConnection(async imap => {
                 const box = await this.#openBox(imap, this.#folder, true);
+                this.#assertActive();
                 const uidValidity = String(box.uidvalidity || '');
                 const previousValidity = this.config.uidValidity;
                 const reset = Boolean(previousValidity && uidValidity && String(previousValidity) !== uidValidity);
                 if (reset) this.#lastUid = 0;
                 this.config.uidValidity = uidValidity;
                 await this.onFolder?.({ account: this.#account, folder: this.#folder, delimiter: this.config.folderDelimiter });
-                const search = criteria => new Promise((resolve, reject) => imap.search(criteria, (err, uids) => err ? reject(err) : resolve(uids || [])));
+                const search = criteria => {
+                    this.#assertActive();
+                    return new Promise((resolve, reject) => imap.search(criteria, (err, uids) => err ? reject(err) : resolve(uids || [])));
+                };
                 // ALL is a UID inventory only; raw messages are still fetched
                 // incrementally. Failed searches/fetches never reconcile absence.
                 const found = await search(this.#searchCriteria());
                 const results = found.filter(uid => Number(uid) > this.#lastUid);
                 for (const range of this.#fetchBatches(results)) await this.#fetchBatch(imap, range);
                 const present = await search(['ALL']);
+                this.#assertActive();
                 await this.onInventory?.({ backend: this.name, account: this.#account, folder: this.#folder,
                     uids: present, uidValidity, reset, previousValidity, delimiter: this.config.folderDelimiter });
+                this.#assertActive();
                 const state = { backend: this.name, lastUid: this.#lastUid, uidValidity };
                 if (this.onState) await this.onState(state);
                 else this.emit('backend:state', state);
@@ -329,6 +350,7 @@ export default class ImapBackend extends StorageBackend {
      * incremental scan; messages surface as `object:add` events.
      */
     async watch() {
+        if (this.#stopped) return false;
         if (this.#pollTimer) return true;
         const interval = Number(this.config.pollInterval || DEFAULT_POLL_INTERVAL);
         const tick = async () => {
@@ -347,6 +369,11 @@ export default class ImapBackend extends StorageBackend {
     }
 
     async stop() {
+        this.#stopped = true;
         if (this.#pollTimer) { clearInterval(this.#pollTimer); this.#pollTimer = null; debug(`Stopped polling ${this.name}`); }
+        // Settings changes replace this instance. Retire its connections too,
+        // so the old credentials cannot keep authenticating in the background.
+        for (const cancel of this.#connections) cancel();
+        await this.#scanPromise?.catch(() => {});
     }
 }

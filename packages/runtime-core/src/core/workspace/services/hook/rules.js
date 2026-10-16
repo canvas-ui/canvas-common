@@ -8,6 +8,7 @@ import { isDisabledFile } from './naming.js';
 import { WORKSPACE_DIRECTORIES } from '../../configuration/constants.js';
 import { sanitizeSegment, joinKey, MIME_EXTENSIONS } from './key-utils.js';
 import { download } from './download.js';
+import { extractAttachments } from './attachments.js';
 import { classifyDocument } from '../../documents/classifier.js';
 
 /**
@@ -35,7 +36,7 @@ import { classifyDocument } from '../../documents/classifier.js';
  * Every matching rule fires — there is no first-match-wins, which keeps the
  * format trivially composable for a UI rule builder.
  *
- * Actions: link, unlink, tag, store, unstore, download, delete, destroy, agent,
+ * Actions: link, unlink, tag, store, unstore, download, extractAttachments, delete, destroy, agent,
  * notify, script, emit. `link`/`unlink` take `recursive: true` to append the
  * document's sub-path below the matched `when.path` prefix to every target
  * (mirror a folder subtree: `backends:/workspace/home/foo` → `dir:/bar`);
@@ -405,8 +406,7 @@ function filenameOf(doc, sourceKey) {
  * filesystem-safe, falls back to basename), id. Everything else is left for
  * the generic {{doc.*}} interpolation, which runs after this.
  */
-export function expandKeyTemplate(template, { doc, sourceKey } = {}) {
-    const date = documentDate(doc);
+export function expandKeyTemplate(template, { doc, sourceKey, date = documentDate(doc) } = {}) {
     const pad = (n, width = 2) => String(n).padStart(width, '0');
     const filename = filenameOf(doc, sourceKey);
     const ext = (path.posix.extname(filename)
@@ -638,6 +638,10 @@ const ACTIONS = {
      */
     async download(action, args) {
         return download(action, { ...args, helpers: { interpolate, expandKeyTemplate, parseLinkTarget, directorySelector } });
+    },
+
+    async extractAttachments(action, args) {
+        return extractAttachments(action, { ...args, helpers: { interpolate, expandKeyTemplate } });
     },
 
     async unstore(action, { workspace, doc, logger }) {

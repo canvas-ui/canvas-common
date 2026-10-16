@@ -292,9 +292,10 @@ export default class WorkspaceServices {
     async getImapStatus() { return this.mailReadonly().getImapStatus(); }
     async saveImapMailbox(input) { return (await this.mail()).saveMailbox(input); }
     async removeImapMailbox(id) { return (await this.mail()).removeMailbox(id); }
-    async testImapMailbox(id) { return (await this.mail()).testMailbox(id); }
-    async listImapMailboxFolders(id) { return (await this.mail()).listMailboxFolders(id); }
-    async discoverImapFolders(input) { return (await this.mail()).discoverFolders(input); }
+    // Connection probes must not start polling every configured account.
+    async testImapMailbox(id) { return this.mailReadonly().testMailbox(id); }
+    async listImapMailboxFolders(id) { return this.mailReadonly().listMailboxFolders(id); }
+    async discoverImapFolders(input) { return this.mailReadonly().discoverFolders(input); }
     async subscribeImapFolders(id, folders) { return (await this.mail()).subscribeFolders(id, folders); }
 
     // Ingest one raw RFC822 message as an Email document (+ its attachments as
