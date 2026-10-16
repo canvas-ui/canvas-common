@@ -23,19 +23,7 @@ function nodeAt(root, path) {
 
 async function memberIds(tree, path, node) {
     if (node.type === 'canvas') return [];
-    if (tree.type === 'directory') return (await tree.find(path))?.toArray() || [];
-    // Context paths are intersections, not recursive directory listings. Never
-    // export a reused layer's documents from outside the selected branch.
-    const layers = tree.resolveLayerIds(path);
-    if (!layers.length) layers.push(tree.rootLayer.id);
-    let members = null;
-    for (const id of layers) {
-        const bitmap = await tree.collection.getBitmap(id, false);
-        if (!bitmap) return [];
-        if (members) members.andInPlace(bitmap);
-        else members = bitmap.clone();
-    }
-    return members?.toArray() || [];
+    return tree.memberIds(path);
 }
 
 /** Metadata and graph only. No backend reads, byte copies, or source writes. */

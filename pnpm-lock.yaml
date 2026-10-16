@@ -113,9 +113,6 @@ importers:
       ldapjs:
         specifier: ^3.0.7
         version: 3.0.7
-      lmdb:
-        specifier: 3.5.7
-        version: 3.5.7
       mailparser:
         specifier: ^3.9.9
         version: 3.9.36
@@ -306,9 +303,6 @@ importers:
       ldapjs:
         specifier: ^3.0.7
         version: 3.0.7
-      lmdb:
-        specifier: 3.5.7
-        version: 3.5.7
       mailparser:
         specifier: ^3.9.9
         version: 3.9.36

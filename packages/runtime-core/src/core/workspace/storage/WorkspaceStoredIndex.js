@@ -126,8 +126,10 @@ export class WorkspaceStoredIndex {
     async start() {
         if (this.#runtime.state.stored) return;
 
+        let opened = false;
         try {
-            this.#runtime.state.stored = new Stored({
+            this.#runtime.state.stored = await Stored.open({
+                onStartupStage: stage => this.#runtime.state.logger.info({ workspaceId: this.#runtime.state.workspaceId, ...stage }, 'Workspace startup stage'),
                 // Configured runtime root (default db/stored) — NOT a hidden
                 // .stored/. Holds Stored's metadata index; the blob cache is
                 // redirected to the workspace cache dir (services.stored.cache).
@@ -147,6 +149,7 @@ export class WorkspaceStoredIndex {
                 // longer history is the backup system's job.
                 retention: RETENTION_DAYS > 0 ? { days: RETENTION_DAYS } : null,
             });
+            opened = true;
 
             await this.#runtime.state.operations.run('start.backends', () => this.#runtime.backends.registerConfiguredBackends());
 
@@ -155,8 +158,11 @@ export class WorkspaceStoredIndex {
             // Keep chokidar's ignoreInitial watcher running: scans reconcile the
             // snapshot while the watcher continues to capture live edits.
         } catch (error) {
-            this.#runtime.state.logger.warn({ workspaceId: this.#runtime.state.workspaceId, error: error.message }, 'Stored home indexing unavailable');
+            this.#runtime.state.logger.warn({ workspaceId: this.#runtime.state.workspaceId, err: error, error: error.message, databasePath: error.databasePath }, 'Stored home indexing unavailable');
             await this.stop();
+            // Starting without durable replica/receipt/Trash state is unsafe.
+            // Let the workspace report failure while the server stays alive.
+            if (!opened) throw error;
         }
     }
 
