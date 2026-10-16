@@ -335,7 +335,7 @@ export default class WhatsAppConnector extends BaseConnector {
         if (document) await this.#onDocument({ id: jid, name: this.#chats.get(jid)?.name || jid }, document);
     }
 
-    async prepareMessage(input, parent) {
+    async prepareMessage(input, parent, { files = [] } = {}) {
         if (!this.canWrite || this.config.sendEnabled !== true) throw new Error('Sending is disabled for this WhatsApp account');
         await this.#start();
         if (this.#state !== 'connected') throw new Error('WhatsApp is disconnected; reconnect before sending');
@@ -344,13 +344,17 @@ export default class WhatsAppConnector extends BaseConnector {
         const quoted = parent ? await this.#readMessage(parent.metadata?.whatsappKey || {}) : undefined;
         if (parent && !quoted) throw new Error('The original WhatsApp message is unavailable for quoting');
         const pictures = messageImages(input.images);
+        if (files.length > 1 || (files.length && pictures.length)) throw new Error('WhatsApp supports one file or picture per message');
+        if (files.length && input.text.length > 1024) throw new Error('WhatsApp file captions must be at most 1,024 characters');
         if (pictures.length && input.text.length > 1024) throw new Error('WhatsApp picture captions must be at most 1,024 characters');
         if (pictures.length > 1) throw new Error('WhatsApp supports one picture per message');
-        return { target, quoted, text: input.text, picture: pictures[0] };
+        return { target, quoted, text: input.text, picture: pictures[0], file: files[0] };
     }
 
     async sendMessage(prepared) {
-        const message = await this.#socket.sendMessage(prepared.target, prepared.picture ? { image: prepared.picture.content, caption: prepared.text, mimetype: prepared.picture.contentType } : { text: prepared.text }, { quoted: prepared.quoted });
+        const content = prepared.file ? { document: prepared.file.content, fileName: prepared.file.filename, mimetype: prepared.file.contentType, caption: prepared.text }
+            : prepared.picture ? { image: prepared.picture.content, caption: prepared.text, mimetype: prepared.picture.contentType } : { text: prepared.text };
+        const message = await this.#socket.sendMessage(prepared.target, content, { quoted: prepared.quoted });
         if (!message?.key?.id) throw new Error('WhatsApp did not acknowledge the message');
         await this.#cacheMessage(message).catch(() => {});
         return { status: 'accepted', providerMessageId: message.key.id,

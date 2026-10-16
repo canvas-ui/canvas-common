@@ -301,6 +301,7 @@ export class WorkspaceMailIndex extends EventEmitter {
         parsed.text = emailText(parsed.text, parsed.html);
         const { emailDoc, attachmentDocs } = await this.#buildEmailDocument(parsed, raw, {
             uid, seqno, flags, uidValidity: payload.uidValidity,
+            internalDate: payload.internalDate,
             provider: 'imap',
             accountId: account,
             folderName: folder,
@@ -1025,7 +1026,7 @@ export class WorkspaceMailIndex extends EventEmitter {
         return this.#resolveCredentials(config);
     }
 
-    async storeSentMessage(config, raw) {
+    async storeSentMessage(config, raw, { provenance, fileDeliveryRules } = {}) {
         let uid = null;
         const warnings = [];
         const folder = config.smtp.sentFolder || 'Sent';
@@ -1037,9 +1038,10 @@ export class WorkspaceMailIndex extends EventEmitter {
         if (!uid) item.emailDoc.locations = item.emailDoc.locations.filter((l) => !l.url.startsWith('imap://'));
         item.emailDoc.metadata.outgoing = true;
         item.emailDoc.metadata.mailAccount = config.account || config.user;
+        if (fileDeliveryRules?.length) item.emailDoc.metadata.fileDeliveryRules = fileDeliveryRules;
         const docId = await this.#put(item.emailDoc, {
             context: null, directory: this.#directoryFor(config.account || config.user, folder),
-            features: item.features, emitEvent: true,
+            features: item.features, emitEvent: true, ...(provenance ? { provenance } : {}),
         });
         await this.#linkThread(docId, item.emailDoc.data);
         return { docId, warnings };

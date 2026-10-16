@@ -124,6 +124,44 @@ and URL while the file still exists, so binding the rule to both
 `document.inserted` and `document.linked` is safe. Requires `yt-dlp` and
 `wget` on the server for the video / page / website kinds.
 
+## Send files — the `sendFile` action
+
+Send real file bytes through a configured SMTP, WhatsApp or Slack account.
+The builder calls this **Send file(s) via a channel**; **Send me a notification**
+is the existing `notify` action and still notifies the workspace owner.
+
+```json
+{
+  "id": "accounting-ingestion",
+  "when": { "event": "document.inserted", "schema": "email", "to": { "equals": "accounting@example.com" } },
+  "then": [{
+    "action": "sendFile", "source": "attachments", "mime": "application/pdf",
+    "driver": "imap", "address": "accounting-example-com",
+    "to": ["ingest@accounting-firm.example"], "subject": "Invoice: {{file.name}}"
+  }]
+}
+```
+
+Select the sending account in the builder; `address` is its saved account
+address, and `imap` selects that account's SMTP configuration. Slack and
+WhatsApp use `target` (a configured conversation) instead of `to`/`subject`.
+Sending must be enabled on the account. Slack file delivery needs `files:write`.
+
+`source` defaults to `document` (the triggering File). `attachments` selects
+email attachments using `mime`, optional literal `filename` and `includeInline`
+(false by default). `download` selects files produced by earlier `download`
+actions in this rule, including their cached results on replay. A separate
+File-insertion rule watching automation-created files must opt into `cascade`.
+
+Each file is a separate message, capped at 18 MiB, and the source stays intact.
+`message` supplies an optional body/caption; templates include `{{file.name}}`
+and the triggering `{{doc.data.subject}}`. The durable message outbox prevents
+repeat delivery for the same rule, file version and rendered destination.
+Unconfirmed sends remain fenced and appear as errors in the rule run log;
+they are never automatically retried. Changing the destination, template output
+or file content creates a new delivery. Slack file shares appear locally on
+the next normal sync (the upload response supplies file IDs, not message IDs).
+
 ## Dedupe — the `unstore` action
 
 The inverse of `store`: delete a document's bytes from named backends while

@@ -258,6 +258,7 @@ export default class ImapBackend extends StorageBackend {
                         uidValidity: this.config.uidValidity,
                         seqno,
                         flags: attrs.flags || [],
+                        internalDate: attrs.date,
                         folder: this.#folder,
                         account: this.#account,
                     });

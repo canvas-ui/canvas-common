@@ -53,6 +53,9 @@ export default async function messageRoutes(app) {
                 requestId: { type: 'string', pattern: '^[\\w-]{16,128}$' },
                 // Empty only for a forward without a note (checked in the service).
                 text: { type: 'string', maxLength: 32000 },
+                files: { type: 'array', maxItems: 8, items: { type: 'object', additionalProperties: false, required: ['documentId'], properties: {
+                    documentId: { type: 'integer', minimum: 1 }, attachmentIndex: { type: 'integer', minimum: 0 },
+                } } },
                 images: { type: 'array', maxItems: 8, items: { type: 'object', additionalProperties: false, required: ['mimeType', 'base64'], properties: { name: { type: 'string', maxLength: 200 }, mimeType: { type: 'string', enum: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] }, base64: { type: 'string', maxLength: 11184812 } } } },
                 html: { type: 'string', maxLength: 512000 },
                 quote: { type: 'boolean' }, forward: { type: 'boolean' },

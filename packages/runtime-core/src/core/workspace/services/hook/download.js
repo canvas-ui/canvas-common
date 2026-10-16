@@ -111,7 +111,7 @@ export async function download(action, { workspace, doc, context, scope, logger,
     const previous = ledger[ledgerKey];
     if (previous?.file && fs.existsSync(path.resolve(homeRoot, previous.file))) {
         logger.debug(`rule download: ${url} already downloaded to home/${previous.file}, skipping`);
-        return { status: 'skipped', reason: 'already downloaded' };
+        return { status: 'skipped', reason: 'already downloaded', documentId: previous.documentId };
     }
 
     const kind = await resolveKind(url, action.kind, fetchers.probe);

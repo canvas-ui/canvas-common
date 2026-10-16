@@ -38,22 +38,26 @@ function previousKey(endpoints, to, key, onConflict) {
  * and its blobs. Per-message names/dates come from the Email, not the shared
  * content-addressed File (the same PDF can occur under several names/dates).
  */
+export function matchingAttachments(doc, action) {
+    const patterns = array(action.mime ?? '*').map(value => String(value).trim().toLowerCase());
+    if (!patterns.length || patterns.some(pattern => !/^(\*|[a-z0-9!#$&^_.+-]+\/(\*|[a-z0-9!#$&^_.+-]+)|\*\/\*)$/.test(pattern))) {
+        throw new Error('Choose an attachment MIME type, such as application/pdf or image/*');
+    }
+    if (action.filename !== undefined && typeof action.filename !== 'string') throw new Error('Attachment filename filter must be text');
+    return (doc.data?.attachments || []).filter(attachment => attachment &&
+        (action.includeInline === true || attachment.isInline !== true) &&
+        patterns.some(pattern => pattern === '*' || pattern === '*/*' || (pattern.endsWith('/*')
+            ? attachmentType(attachment).startsWith(pattern.slice(0, -1)) : attachmentType(attachment) === pattern)) &&
+        (!action.filename || String(attachment.filename || '').toLowerCase().includes(action.filename.toLowerCase())));
+}
+
 export async function extractAttachments(action, { workspace, doc, scope, logger, provenance, helpers }) {
     if (!doc?.id || !classifyDocument(doc).isEmail()) return { status: 'skipped', error: 'Not an email' };
     const to = String(action.to || '').trim();
     if (!to || !workspace.backendKeepsPaths(to)) throw new Error('Choose a destination backend that supports folder paths');
     const onConflict = action.onConflict || 'rename';
     if (!['rename', 'error'].includes(onConflict)) throw new Error('Attachment extraction supports rename or error on conflict');
-    const patterns = array(action.mime ?? '*').map(value => String(value).trim().toLowerCase());
-    if (!patterns.length || patterns.some(pattern => !/^(\*|[a-z0-9!#$&^_.+-]+\/(\*|[a-z0-9!#$&^_.+-]+)|\*\/\*)$/.test(pattern))) {
-        throw new Error('Choose an attachment MIME type, such as application/pdf or image/*');
-    }
-    if (action.filename !== undefined && typeof action.filename !== 'string') throw new Error('Attachment filename filter must be text');
-    const attachments = (doc.data?.attachments || []).filter(attachment => attachment &&
-        (action.includeInline === true || attachment.isInline !== true) &&
-        patterns.some(pattern => pattern === '*' || pattern === '*/*' || (pattern.endsWith('/*')
-            ? attachmentType(attachment).startsWith(pattern.slice(0, -1)) : attachmentType(attachment) === pattern)) &&
-        (!action.filename || String(attachment.filename || '').toLowerCase().includes(action.filename.toLowerCase())));
+    const attachments = matchingAttachments(doc, action);
     if (!attachments.length) return { status: 'skipped', error: 'No matching attachments' };
 
     const date = emailDate(doc);

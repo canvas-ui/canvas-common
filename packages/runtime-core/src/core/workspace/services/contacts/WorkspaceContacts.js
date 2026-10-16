@@ -124,6 +124,11 @@ export default class WorkspaceContacts {
         if (!done.contentTimelines) {
             mark('contentTimelines', await db.rederiveSchemaTimelines({ schemas: ['data/schema/message'] }));
         }
+        // Re-run for existing mail after adding header/sent/received fallbacks.
+        // Keep this separate: older workspaces already completed contentTimelines.
+        if (!done.emailContentTimelinesV2) {
+            mark('emailContentTimelinesV2', await db.rederiveSchemaTimelines({ schemas: ['data/schema/message/email'] }));
+        }
         // Identities stored before they carried identity-email/* alias keys:
         // re-derive checksums so extraction finds hand-made contacts.
         if (!done.identityEmailAliases) {

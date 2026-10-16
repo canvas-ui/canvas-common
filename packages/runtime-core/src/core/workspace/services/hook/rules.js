@@ -9,6 +9,7 @@ import { WORKSPACE_DIRECTORIES } from '../../configuration/constants.js';
 import { sanitizeSegment, joinKey, MIME_EXTENSIONS } from './key-utils.js';
 import { download } from './download.js';
 import { extractAttachments } from './attachments.js';
+import { sendFile } from './send-file.js';
 import { classifyDocument } from '../../documents/classifier.js';
 
 /**
@@ -36,7 +37,7 @@ import { classifyDocument } from '../../documents/classifier.js';
  * Every matching rule fires — there is no first-match-wins, which keeps the
  * format trivially composable for a UI rule builder.
  *
- * Actions: link, unlink, tag, store, unstore, download, extractAttachments, delete, destroy, agent,
+ * Actions: link, unlink, tag, store, unstore, download, extractAttachments, sendFile, delete, destroy, agent,
  * notify, script, emit. `link`/`unlink` take `recursive: true` to append the
  * document's sub-path below the matched `when.path` prefix to every target
  * (mirror a folder subtree: `backends:/workspace/home/foo` → `dir:/bar`);
@@ -643,6 +644,9 @@ const ACTIONS = {
     async extractAttachments(action, args) {
         return extractAttachments(action, { ...args, helpers: { interpolate, expandKeyTemplate } });
     },
+    async sendFile(action, args) {
+        return sendFile(action, { ...args, interpolate });
+    },
 
     async unstore(action, { workspace, doc, logger }) {
         if (!doc?.id) { logger.debug('rule unstore: event carries no document, skipping'); return; }
@@ -950,6 +954,7 @@ export async function executeRuleActions(rule, context, logger) {
         workspace: { id: workspace.id, name: workspace.name },
         rule: { id: rule.id, description: rule.description, when: rule.when },
         match: matchedPath(rule, context),
+        downloads: [],
     };
     // Writes this rule makes are automation caused by the triggering event.
     // Actions routed through the hook context (agent output, script output,
@@ -972,6 +977,7 @@ export async function executeRuleActions(rule, context, logger) {
             // A handler may return { status: 'skipped', error } to say why it
             // did nothing; anything else is a plain success.
             const outcome = await handler(action, { workspace, doc, payload, context, scope, logger, provenance });
+            if (action.action === 'download' && outcome?.documentId) scope.downloads.push(outcome.documentId);
             results.push(outcome && typeof outcome === 'object' && outcome.status === 'skipped'
                 ? { action: action.action, status: 'skipped', ...(outcome.error ? { error: String(outcome.error) } : {}) }
                 : { action: action.action, status: 'ok' });

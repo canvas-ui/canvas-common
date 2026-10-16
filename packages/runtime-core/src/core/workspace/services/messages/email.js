@@ -1,4 +1,5 @@
 import { messageImages } from './images.js';
+import { MAX_FILE_BYTES } from './files.js';
 import nodemailer from 'nodemailer';
 import addressparser from 'nodemailer/lib/addressparser/index.js';
 import crypto from 'node:crypto';
@@ -134,7 +135,7 @@ async function parentAttachments(data, forward, quoting, loadAttachment) {
     return out;
 }
 
-export async function prepareEmail(config, input, parent = null, { loadAttachment = null } = {}) {
+export async function prepareEmail(config, input, parent = null, { loadAttachment = null, files = [] } = {}) {
     const smtp = config.smtp;
     if (!smtp?.enabled || config.readOnly) throw messageError('Sending is not enabled for this email account', 403);
     const own = emailAddresses(smtp.from)[0];
@@ -165,7 +166,9 @@ export async function prepareEmail(config, input, parent = null, { loadAttachmen
     const html = authoredHtml || pictures.length || quoted?.hasHtml
         ? `<!doctype html><html><body>${ownHtml}${quoted ? `${ownHtml ? '<br>' : ''}${quoted.html}` : ''}</body></html>`
         : undefined;
-    const attachments = [...(parent ? await parentAttachments(data, forward, quoting && !!html, loadAttachment) : []), ...pictures.map((picture) => ({ ...picture, contentDisposition: 'inline' }))];
+    const attachments = [...(parent ? await parentAttachments(data, forward, quoting && !!html, loadAttachment) : []), ...pictures.map((picture) => ({ ...picture, contentDisposition: 'inline' })),
+        ...files.map(({ filename, contentType, content }) => ({ filename, contentType, content, contentDisposition: 'attachment' }))];
+    if (attachments.reduce((bytes, file) => bytes + file.content.length, 0) > MAX_FILE_BYTES) throw messageError('Attachments must total at most 18 MB');
     const mail = {
         from: smtp.from, to, cc, subject, text, messageId,
         ...(html ? { html } : {}),

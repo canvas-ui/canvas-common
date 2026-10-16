@@ -330,10 +330,10 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         return entry;
     }
 
-    async storeSentMessage(driver, address, sent) {
+    async storeSentMessage(driver, address, sent, options = {}) {
         const entry = this.messageAccount(driver, address);
         if (!sent.document || !sent.container?.id) throw new Error(`${driver} returned no indexable sent message or conversation`);
-        return this.#ingest(`${driver}:${entry.address}`, entry, sent.container, sent.document);
+        return this.#ingest(`${driver}:${entry.address}`, entry, sent.container, sent.document, options);
     }
 
     async messageConnection(driver, address, reset = false) {
@@ -761,7 +761,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         return isDeepStrictEqual(JSON.parse(JSON.stringify(project(previous))), JSON.parse(JSON.stringify(project(incoming))));
     }
 
-    async #ingestDocument(name, entry, container, spec, { features = [] } = {}) {
+    async #ingestDocument(name, entry, container, spec, { features = [], eventProvenance } = {}) {
         const { schema, metadata = {}, locations = [], containerSegment } = spec;
         const provenance = locations.find((l) => l?.metadata?.provenance)?.url;
         if (!provenance) throw new Error(`Connector document without provenance location (${name})`);
@@ -797,6 +797,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
             directory: this.#getBackendsTreeSelector(contextSpec),
             emitEvent: true,
             ...(features.length ? { features } : {}),
+            ...(eventProvenance ? { provenance: eventProvenance } : {}),
         });
         if (existingId != null && entry.driver === 'whatsapp') await this.#ensureBackendMembership?.(docId, contextSpec);
         for (const placement of entry.instance.placements?.(spec) || []) {

@@ -69,7 +69,7 @@ export default class SlackConnector extends BaseConnector {
         return json;
     }
 
-    async prepareMessage(input, parent) {
+    async prepareMessage(input, parent, { files = [] } = {}) {
         if (this.config.sendEnabled !== true || !this.canWrite) throw new Error('Sending is disabled for this Slack account');
         const target = parent?.data?.channel?.id || input.target;
         const containers = await this.listContainers();
@@ -78,11 +78,27 @@ export default class SlackConnector extends BaseConnector {
         const team = await this.#team();
         const thread = parent ? (parent.data.threadId || parent.metadata?.remoteId) : undefined;
         if (parent && !thread) throw new Error('Reply target has no Slack thread identifier');
-        return { container, team, thread, text: input.text };
+        return { container, team, thread, text: input.text, files };
     }
 
     async sendMessage(prepared, requestId) {
         const { container, team, thread, text } = prepared;
+        if (prepared.files?.length) {
+            const files = [];
+            for (const file of prepared.files) {
+                const ticket = await this.#call('files.getUploadURLExternal', { filename: file.filename, length: file.content.length });
+                const url = new URL(ticket.upload_url);
+                if (url.protocol !== 'https:' || !(url.hostname === 'files.slack.com' || url.hostname.endsWith('.slack.com'))) throw new Error('Slack returned an invalid upload URL');
+                const uploaded = await fetch(url.href, { method: 'POST', body: file.content, headers: { 'Content-Type': 'application/octet-stream' }, signal: AbortSignal.timeout(60000), redirect: 'error' });
+                if (!uploaded.ok) throw new Error(`Slack file upload: HTTP ${uploaded.status}`);
+                files.push({ id: ticket.file_id, title: file.filename });
+            }
+            await this.#call('files.completeUploadExternal', { files: JSON.stringify(files), channel_id: container.id, thread_ts: thread, initial_comment: text || undefined });
+            // Completion acknowledges file IDs, not a message timestamp. Let
+            // normal sync index the real share instead of inventing a message ID.
+            return { status: 'accepted', providerMessageId: files.map(file => file.id).join(','), deferIndex: true,
+                warnings: ['File upload accepted. Its message will appear after the next Slack sync.'] };
+        }
         const hex = crypto.createHash('sha256').update(requestId).digest('hex');
         const clientId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
         const response = await this.#call('chat.postMessage', {
