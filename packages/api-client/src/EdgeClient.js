@@ -7,15 +7,6 @@ import { PassThrough } from 'node:stream';
 // Body frames carry at most this many raw bytes, as socket.io binary attachments.
 const CHUNK_SIZE = 256 * 1024;
 
-const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
-
-/** Hub URLs must be https, except on loopback: device tokens and request bodies cross this link. */
-function assertSecureHub(serverUrl) {
-    const url = new URL(serverUrl);
-    if (url.protocol === 'https:' || (url.protocol === 'http:' && LOOPBACK.has(url.hostname))) return;
-    throw new Error(`Refusing ${url.protocol}//${url.host}: a hub is reached over https (plain http only on loopback)`);
-}
-
 // A binary frame as socket.io delivers it, or null when it carries no bytes.
 function frameBytes(data) {
     if (Buffer.isBuffer(data)) return data;
@@ -58,7 +49,6 @@ export default class EdgeClient {
         if (!serverUrl || !token || (!localApp?.inject && !localUrl) || !announce?.instanceId) {
             throw new Error('EdgeClient requires serverUrl, token, localApp (fastify) and announce.instanceId');
         }
-        assertSecureHub(serverUrl);
         this.#transport = createTlsTransport(serverUrl, resolveTls(tls));
         this.#serverUrl = serverUrl.replace(/\/+$/, '');
         this.#token = token;
@@ -75,7 +65,6 @@ export default class EdgeClient {
    * runtime pins to verify what this hub forwards.
    */
     static async pair({ serverUrl, userToken, name, type = 'edge', tls, ...deviceInfo }) {
-        assertSecureHub(serverUrl);
         const transport = createTlsTransport(serverUrl, resolveTls(tls));
         try {
             const res = await transport.fetch(`${serverUrl.replace(/\/+$/, '')}/rest/v2/auth/devices/register`, {

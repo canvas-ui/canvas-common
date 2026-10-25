@@ -16,9 +16,11 @@ import registerAgent from '../transports/websocket/channels/agent.js';
 import { isHubCredential, verifyHubCredential } from '@augmentd-labs/canvas-api-client/hub-credential';
 
 const envelope = payload => ({ status: 'success', statusCode: 200, payload });
-const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
 
-/** runtime.json `tls: { cert, key }` (PEM file paths) as Fastify https options, or null. */
+/**
+ * runtime.json `tls: { cert, key }` (PEM file paths) as Fastify https options,
+ * or null. Optional: a reverse proxy usually terminates TLS in front.
+ */
 function httpsOptions(tls) {
     if (!tls) return null;
     if (!tls.cert || !tls.key) throw new Error('runtime.json tls needs both cert and key (PEM file paths)');
@@ -169,9 +171,7 @@ export async function createAgentHost({ root, name, model, ollamaUrl, voice = {}
     }
     app.addHook('onClose', async () => { await agents.stop(user.id, config.agentId, user.id); });
     return { app, config, runtimeFile, user, agents,
-        /** Tokens cross a TCP link in the clear without TLS, so an address other than loopback needs runtime.json `tls`. */
         async start({ host = '127.0.0.1', port = 0 } = {}) {
-            if (!https && !LOOPBACK.has(host)) throw new Error(`Listening on ${host} needs TLS: set tls.cert and tls.key in ${runtimeFile}, or bind 127.0.0.1`);
             await app.listen({ host, port });
             const bind = app.server.address().address;
             const local = bind === '0.0.0.0' ? '127.0.0.1' : bind === '::' ? '[::1]' : bind.includes(':') ? `[${bind}]` : bind;
