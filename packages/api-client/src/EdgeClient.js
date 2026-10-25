@@ -4,7 +4,16 @@ import { createTlsTransport, resolveTls } from '@augmentd-labs/canvas-api-client
 import { io } from 'socket.io-client';
 import { PassThrough } from 'node:stream';
 
+// Body frames carry at most this many raw bytes, as socket.io binary attachments.
 const CHUNK_SIZE = 256 * 1024;
+
+// A binary frame as socket.io delivers it, or null when it carries no bytes.
+function frameBytes(data) {
+    if (Buffer.isBuffer(data)) return data;
+    if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    if (data instanceof ArrayBuffer) return Buffer.from(data);
+    return null;
+}
 
 /**
  * canvas-edge tunnel client.
@@ -88,10 +97,14 @@ export default class EdgeClient {
         this.#socket.on('edge:abort', ({ id } = {}) => this.#requests.get(id)?.controller.abort());
         this.#socket.on('edge:upload', ({ id, seq, data } = {}, ack = () => {}) => {
             const request = this.#requests.get(id);
-            if (!request?.upload || seq !== request.seq++ || typeof data !== 'string' || data.length > 360_000) {
+            if (request && typeof data === 'string') {
+                ack({ error: 'The hub sends text body frames: update canvas-server' }); request.controller.abort(); return;
+            }
+            const bytes = frameBytes(data);
+            if (!request?.upload || seq !== request.seq++ || !bytes || bytes.length > CHUNK_SIZE) {
                 ack({ error: 'Invalid upload' }); request?.controller.abort(); return;
             }
-            request.upload.write(Buffer.from(data, 'base64'), () => ack({ ok: true }));
+            request.upload.write(bytes, () => ack({ ok: true }));
         });
         this.#socket.on('edge:upload:end', ({ id } = {}) => this.#requests.get(id)?.upload?.end());
         this.#socket.on('edge:req', (frame) => this.handleRequest(frame));
@@ -118,17 +131,15 @@ export default class EdgeClient {
    */
     async handleRequest(frame = {}, socket = this.#socket) {
         if (frame.protocol === 2 && this.#localUrl) return this.#handleStream(frame, socket);
-        const { id, method, path, headers = {}, body, bodyEncoding } = frame;
+        const { id, method, path, headers = {}, body } = frame;
         if (!id || !method || !path) return;
         try {
-            const payload = body == null
-                ? undefined
-                : (bodyEncoding === 'base64' ? Buffer.from(body, 'base64') : body);
+            const payload = body == null ? undefined : (frameBytes(body) ?? body);
             const res = await this.#localApp.inject({ method, url: path, headers, payload });
             socket.emit('edge:res', { id, status: res.statusCode, headers: res.headers });
             const buf = res.rawPayload;
             for (let offset = 0, seq = 0; offset < buf.length; offset += CHUNK_SIZE, seq++) {
-                socket.emit('edge:chunk', { id, seq, data: buf.subarray(offset, offset + CHUNK_SIZE).toString('base64') });
+                socket.emit('edge:chunk', { id, seq, data: buf.subarray(offset, offset + CHUNK_SIZE) });
             }
             socket.emit('edge:end', { id });
         } catch (err) {
@@ -171,7 +182,7 @@ export default class EdgeClient {
                 for (let offset = 0; offset < bytes.length; offset += CHUNK_SIZE) {
                     if (controller.signal.aborted) throw new Error('Cancelled');
                     await new Promise((resolve, reject) => socket.timeout(120_000).emit('edge:chunk',
-                        { id, seq: seq++, data: bytes.subarray(offset, offset + CHUNK_SIZE).toString('base64') },
+                        { id, seq: seq++, data: bytes.subarray(offset, offset + CHUNK_SIZE) },
                         (err, response) => err || response?.error ? reject(err || new Error(response.error)) : resolve()));
                 }
             }
