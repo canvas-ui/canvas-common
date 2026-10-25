@@ -13,8 +13,17 @@ import Voice from '../services/voice/src/index.js';
 import agentRoutes from '../transports/routes/agents/index.js';
 import voiceRoutes from '../transports/routes/voice/index.js';
 import registerAgent from '../transports/websocket/channels/agent.js';
+import { isHubCredential, verifyHubCredential } from '@augmentd-labs/canvas-api-client/hub-credential';
 
 const envelope = payload => ({ status: 'success', statusCode: 200, payload });
+const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
+
+/** runtime.json `tls: { cert, key }` (PEM file paths) as Fastify https options, or null. */
+function httpsOptions(tls) {
+    if (!tls) return null;
+    if (!tls.cert || !tls.key) throw new Error('runtime.json tls needs both cert and key (PEM file paths)');
+    return { cert: fs.readFileSync(tls.cert), key: fs.readFileSync(tls.key) };
+}
 export function privateJson(file, value) {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     fs.writeFileSync(`${file}.tmp`, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
@@ -50,7 +59,7 @@ export async function createAgentHost({ root, name, model, ollamaUrl, voice = {}
         } else {
             config = { version: 2, instanceId: randomUUID(), userId: randomUUID(), kind: 'agent',
                 name: name || path.basename(root).toLowerCase().replace(/[^a-z0-9._-]/g, '-') || 'local',
-                token: `canvas-local-${randomBytes(32).toString('hex')}`, tunnelToken: randomBytes(32).toString('hex'),
+                token: `canvas-local-${randomBytes(32).toString('hex')}`,
                 voice, model: model || 'qwen3:latest', ollamaUrl: ollamaUrl || 'http://127.0.0.1:11434/v1', remotes: [] };
         }
     }
@@ -63,7 +72,7 @@ export async function createAgentHost({ root, name, model, ollamaUrl, voice = {}
     const users = { get: async id => [user.id, user.email].includes(id) ? user : null,
         resolveId: async id => [user.id, user.email].includes(id) ? user.id : null,
         getUserPaths: () => ({ home: state, agents: state }) };
-    const index = new Conf({ cwd: path.join(state, 'host'), configName: 'agents', accessPropertiesByDotNotation: false });
+    const index = new Conf({ configFileMode: 0o600, cwd: path.join(state, 'host'), configName: 'agents', accessPropertiesByDotNotation: false });
     const agentConfigPath = path.join(state, 'config/agent.json');
     const existing = readJson(agentConfigPath);
     if (existing && !index.has(`${user.id}/${existing.id}`)) {
@@ -86,21 +95,23 @@ export async function createAgentHost({ root, name, model, ollamaUrl, voice = {}
             config: { baseUrl: config.ollamaUrl, workingDirectory: root }, deferProviderValidation: true }, user.id);
     }
     privateJson(runtimeFile, config);
-    const app = Fastify({ logger, bodyLimit: 1024 * 1024 * 1024, ignoreTrailingSlash: true });
+    const https = httpsOptions(config.tls);
+    const app = Fastify({ logger, bodyLimit: 1024 * 1024 * 1024, ignoreTrailingSlash: true, ...(https ? { https } : {}) });
     await app.register(multipart, { limits: { fileSize: 1024 * 1024 * 1024 } });
     await app.register(socketIO, { transports: ['websocket'], maxHttpBufferSize: 1024 * 1024 });
     for (const [key, value] of Object.entries({ users, agents, voice: new Voice(config.voice) })) app.decorate(key, value);
     const authenticate = async (request, reply) => {
         const value = request.headers.authorization?.replace(/^Bearer /, '');
         if (equals(value, config.token)) {
-            if (request.headers['x-canvas-edge-context']) return reply.code(403).send({ message: 'Internal context is not accepted with local credentials' });
-        } else if (equals(value, config.tunnelToken)) {
-            let context;
-            try { context = JSON.parse(Buffer.from(request.headers['x-canvas-edge-context'] || '', 'base64url')); } catch { /* rejected below */ }
+            // the local owner
+        } else if (isHubCredential(value)) {
+            // An attached hub acting for this agent's owner (runtime.json `remotes[].hub` holds its keys).
+            const claims = verifyHubCredential(value, { audience: config.instanceId, keys: (config.remotes || []).flatMap(remote => remote.hub?.keys || []) });
             const route = request.url.split('?')[0];
             const prefix = `/rest/v2/agents/${config.agentId}`;
-            if (context?.resourceType !== 'agent' || context.resourceId !== config.agentId || context.binding ||
-                !(route === prefix || route.startsWith(`${prefix}/`))) return reply.code(403).send({ message: 'Invalid tunnel context' });
+            if (!claims) return reply.code(401).send({ message: 'Invalid hub credential' });
+            if (claims.res.type !== 'agent' || claims.res.id !== config.agentId || claims.binding ||
+                !(route === prefix || route.startsWith(`${prefix}/`))) return reply.code(403).send({ message: 'Hub credential does not name this agent' });
         } else return reply.code(401).send({ message: 'Valid local bearer token required' });
         request.user = user;
     };
@@ -123,6 +134,14 @@ export async function createAgentHost({ root, name, model, ollamaUrl, voice = {}
     app.get('/rest/v2/ping', async () => envelope({ name: 'Canvas agent runtime', runtime: 'agent' }));
     app.get('/rest/v2/runtime/capabilities', async () => envelope({ local: true, auth: 'token', workspace: false, agent: true,
         voice: { stt: !!config.voice?.stt?.baseUrl, tts: !!config.voice?.tts?.baseUrl } }));
+    // Replace the local owner token; the old one and every socket opened with it stop working at once.
+    app.post('/rest/v2/runtime/token', async (request, reply) => {
+        if (!equals(request.headers.authorization?.replace(/^Bearer /, ''), config.token)) return reply.code(403).send({ message: 'The local owner token is required to rotate it' });
+        config.token = `canvas-local-${randomBytes(32).toString('hex')}`;
+        privateJson(runtimeFile, config);
+        app.io.disconnectSockets(true);
+        return envelope({ token: config.token });
+    });
     app.get('/rest/v2/auth/config', async () => envelope({ allowUserRegistrations: false, strategies: { local: { enabled: false }, imap: { enabled: false, domains: [] } } }));
     app.get('/rest/v2/auth/me', async () => envelope(user));
     app.post('/rest/v2/auth/logout', async () => envelope({ loggedOut: true }));
@@ -150,10 +169,12 @@ export async function createAgentHost({ root, name, model, ollamaUrl, voice = {}
     }
     app.addHook('onClose', async () => { await agents.stop(user.id, config.agentId, user.id); });
     return { app, config, runtimeFile, user, agents,
+        /** Tokens cross a TCP link in the clear without TLS, so an address other than loopback needs runtime.json `tls`. */
         async start({ host = '127.0.0.1', port = 0 } = {}) {
+            if (!https && !LOOPBACK.has(host)) throw new Error(`Listening on ${host} needs TLS: set tls.cert and tls.key in ${runtimeFile}, or bind 127.0.0.1`);
             await app.listen({ host, port });
             const bind = app.server.address().address;
             const local = bind === '0.0.0.0' ? '127.0.0.1' : bind === '::' ? '[::1]' : bind.includes(':') ? `[${bind}]` : bind;
-            return `http://${local}:${app.server.address().port}`;
+            return `${https ? 'https' : 'http'}://${local}:${app.server.address().port}`;
         }, save() { privateJson(runtimeFile, config); }, close: () => app.close() };
 }

@@ -7,6 +7,15 @@ import { PassThrough } from 'node:stream';
 // Body frames carry at most this many raw bytes, as socket.io binary attachments.
 const CHUNK_SIZE = 256 * 1024;
 
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/** Hub URLs must be https, except on loopback: device tokens and request bodies cross this link. */
+function assertSecureHub(serverUrl) {
+    const url = new URL(serverUrl);
+    if (url.protocol === 'https:' || (url.protocol === 'http:' && LOOPBACK.has(url.hostname))) return;
+    throw new Error(`Refusing ${url.protocol}//${url.host}: a hub is reached over https (plain http only on loopback)`);
+}
+
 // A binary frame as socket.io delivers it, or null when it carries no bytes.
 function frameBytes(data) {
     if (Buffer.isBuffer(data)) return data;
@@ -19,9 +28,14 @@ function frameBytes(data) {
  * canvas-edge tunnel client.
  *
  * Dials out to a canvas-server instance, announces what this runtime hosts,
- * and replays proxied requests into the local fastify app (`app.inject()`),
- * so the tunnel and localhost serve identical APIs by construction.
- * Reconnection/backoff and heartbeat come from socket.io.
+ * and replays proxied requests into the local app (`app.inject()`, or
+ * `localUrl`), so the tunnel and localhost serve identical APIs by
+ * construction. Reconnection/backoff and heartbeat come from socket.io.
+ *
+ * A streamed request carries the hub-signed credential for its caller as its
+ * bearer; the local runtime verifies it against the hub keys it trusts. This
+ * client holds no local credential. `onHub({ iss, keys })` receives the hub's
+ * public keys with every announce ack and after each hub key rotation.
  *
  * See docs/canvas-edge-protocol.md for the frame protocol.
  */
@@ -36,29 +50,32 @@ export default class EdgeClient {
     #forwarded = [];
     #requests = new Map();
     #localUrl;
-    #localToken;
+    #onHub;
     #status = { connected: false, registered: false, error: null };
     get status() { return { ...this.#status }; }
 
-    constructor({ serverUrl, token, localApp, localUrl, localToken, announce, tls }) {
+    constructor({ serverUrl, token, localApp, localUrl, announce, tls, onHub = () => {} }) {
         if (!serverUrl || !token || (!localApp?.inject && !localUrl) || !announce?.instanceId) {
             throw new Error('EdgeClient requires serverUrl, token, localApp (fastify) and announce.instanceId');
         }
+        assertSecureHub(serverUrl);
         this.#transport = createTlsTransport(serverUrl, resolveTls(tls));
         this.#serverUrl = serverUrl.replace(/\/+$/, '');
         this.#token = token;
         this.#localApp = localApp;
         this.#localUrl = localUrl;
-        this.#localToken = localToken;
+        this.#onHub = onHub;
         this.#announce = announce;
     }
 
     /**
    * One-time pairing: exchange a user API token for a device token via the
    * existing device registration endpoint. Persist the result locally and
-   * never touch the user token again.
+   * never touch the user token again. `hub` is `{ iss, keys }`, the keys a
+   * runtime pins to verify what this hub forwards.
    */
     static async pair({ serverUrl, userToken, name, type = 'edge', tls, ...deviceInfo }) {
+        assertSecureHub(serverUrl);
         const transport = createTlsTransport(serverUrl, resolveTls(tls));
         try {
             const res = await transport.fetch(`${serverUrl.replace(/\/+$/, '')}/rest/v2/auth/devices/register`, {
@@ -70,7 +87,7 @@ export default class EdgeClient {
             if (!res.ok || !json?.payload?.token) {
                 throw new Error(`Edge pairing failed: ${json?.message || res.statusText}`);
             }
-            return { token: json.payload.token, deviceId: json.payload.deviceId || json.payload.id };
+            return { token: json.payload.token, deviceId: json.payload.deviceId || json.payload.id, hub: json.payload.hub || null };
         } finally { await transport.dispose(); }
     }
 
@@ -87,7 +104,11 @@ export default class EdgeClient {
         });
         // Announce on every (re)connect — announce is idempotent full state.
         this.#socket.on('connect', () => { this.#status = { connected: true, registered: false, error: null }; this.#socket.emit('edge:announce', this.#announce); });
-        this.#socket.on('edge:announced', () => { this.#announced = true; this.#status.registered = true; });
+        this.#socket.on('edge:announced', (ack = {}) => {
+            this.#announced = true; this.#status.registered = true;
+            if (ack.hub) this.#onHub(ack.hub);
+        });
+        this.#socket.on('edge:hub', (hub) => { if (hub) this.#onHub(hub); });
         this.#socket.on('disconnect', () => {
             this.#announced = false; this.#status.connected = false; this.#status.registered = false;
             for (const request of this.#requests.values()) request.controller.abort();
@@ -148,7 +169,7 @@ export default class EdgeClient {
     }
 
     async #handleStream(frame, socket) {
-        const { id, method, path, context } = frame;
+        const { id, method, path, resource: named, credential } = frame;
         const controller = new AbortController();
         const upload = frame.upload ? new PassThrough({ highWaterMark: CHUNK_SIZE }) : null;
         upload?.on('error', () => {});
@@ -159,17 +180,17 @@ export default class EdgeClient {
             const target = new URL(path, this.#localUrl);
             const base = new URL(this.#localUrl);
             if (target.origin !== base.origin || !path.startsWith('/rest/v2/')) throw new Error('Invalid tunnel target');
-            // Context is delivered only by the authenticated tunnel. The private token is never sent to the hub.
+            // The runtime verifies the credential; this check only keeps requests on exported resources.
+            if (typeof credential !== 'string') throw new Error('Missing hub credential');
             const exports = this.#announce.exports || [];
-            const resource = exports.find(e => e.id === context?.resourceId && e.type === context?.resourceType);
+            const resource = exports.find(e => e.id === named?.id && e.type === named?.type);
             if (!resource) throw new Error('Resource is not exported by this runtime');
             const prefix = `/rest/v2/${resource.type === 'agent' ? 'agents' : 'workspaces'}/${resource.id}`;
             const allowed = target.pathname === prefix || target.pathname.startsWith(`${prefix}/`);
             if (!allowed && !(resource.type === 'workspace' && target.pathname.startsWith('/rest/v2/contexts'))) throw new Error('Resource path mismatch');
             const headers = Object.fromEntries(Object.entries(frame.headers || {}).filter(([key]) =>
-                !['authorization', 'cookie', 'host', 'connection', 'content-length', 'transfer-encoding', 'x-canvas-edge-context', 'x-canvas-device-id'].includes(key.toLowerCase())));
-            headers.authorization = `Bearer ${this.#localToken}`;
-            headers['x-canvas-edge-context'] = Buffer.from(JSON.stringify(context)).toString('base64url');
+                !['authorization', 'cookie', 'host', 'connection', 'content-length', 'transfer-encoding', 'x-canvas-device-id'].includes(key.toLowerCase())));
+            headers.authorization = `Bearer ${credential}`;
             const response = await fetch(target, { method, headers, body: upload || undefined,
                 ...(upload ? { duplex: 'half' } : {}), signal: controller.signal, redirect: 'manual' });
             // fetch decodes compressed responses; forward the decoded representation.

@@ -6,6 +6,16 @@ import path from 'node:path';
 import { createAgentHost, privateJson } from '../src/runtime/host.js';
 import { main } from '../src/main.js';
 import { startModelService } from './model-service.js';
+import { generateKeyPairSync, createPublicKey } from 'node:crypto';
+import { keyId, signHubCredential } from '@augmentd-labs/canvas-api-client/hub-credential';
+
+/** A hub signing key: `public` as runtimes pin it, the rest as signHubCredential takes it. */
+function hubKey(iss) {
+    const { privateKey } = generateKeyPairSync('ed25519');
+    const key = createPublicKey(privateKey).export({ format: 'jwk' }).x;
+    const kid = keyId(key);
+    return { iss, kid, privateKey, public: { iss, kid, key } };
+}
 
 function folder(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canvas-agent-only-'));
@@ -35,11 +45,19 @@ test('standalone agent has stable file-backed identity, local auth, and no works
     assert.equal(list.payload[0].config.workingDirectory, root);
     assert.equal((await fetch(`${url}/rest/v2/agents`, { method: 'POST', headers, body: '{}' })).status, 409);
     assert.equal((await fetch(`${url}/rest/v2/agents/${host.config.agentId}?confirm=yes`, { method: 'DELETE', headers })).status, 409);
-    assert.equal((await fetch(`${url}/rest/v2/auth/me`, { headers: { ...headers, 'x-canvas-edge-context': 'forged' } })).status, 403);
-    const tunnel = { Authorization: `Bearer ${host.config.tunnelToken}`, 'x-canvas-edge-context': Buffer.from(JSON.stringify({ resourceType: 'agent', resourceId: host.config.agentId })).toString('base64url') };
-    assert.equal((await fetch(`${url}/rest/v2/agents/${host.config.agentId}`, { headers: tunnel })).status, 200);
-    assert.equal((await fetch(`${url}/rest/v2/auth/me`, { headers: tunnel })).status, 403);
-    assert.equal((await fetch(`${url}/rest/v2/agents/other`, { headers: tunnel })).status, 403);
+    // An attached hub's signed credential reaches this agent only; unpinned or misaddressed ones are refused.
+    const hub = hubKey('hub-1');
+    const credential = (claims, key = hub) => ({ Authorization: `Bearer ${signHubCredential({ aud: host.config.instanceId, res: { type: 'agent', id: host.config.agentId }, ...claims }, key)}` });
+    const route = `${url}/rest/v2/agents/${host.config.agentId}`;
+    assert.equal((await fetch(route, { headers: credential() })).status, 401);
+    host.config.remotes = [{ url: 'https://hub.example', token: 'device', hub: { iss: 'hub-1', keys: [hub.public] } }];
+    assert.equal((await fetch(route, { headers: credential() })).status, 200);
+    assert.equal((await fetch(`${url}/rest/v2/auth/me`, { headers: credential() })).status, 403);
+    assert.equal((await fetch(`${url}/rest/v2/agents/other`, { headers: credential() })).status, 403);
+    assert.equal((await fetch(route, { headers: credential({ aud: 'another-runtime' }) })).status, 401);
+    assert.equal((await fetch(route, { headers: credential({}, hubKey('hub-1')) })).status, 401);
+    assert.equal((await fetch(route, { headers: credential({ binding: { type: 'workspace' } }) })).status, 403);
+    host.config.remotes = [];
     await host.close();
     const reopened = await createAgentHost({ root, webRoot: false });
     t.after(() => reopened.close());

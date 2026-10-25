@@ -36,7 +36,7 @@ export async function runRuntime({ kind, createHost, exportsFor, script, version
       const userToken = flags['token-file'] ? fs.readFileSync(flags['token-file'], 'utf8').trim() : process.env.CANVAS_PAIRING_TOKEN;
       if (!userToken) throw new Error('Pairing requires --token-file or CANVAS_PAIRING_TOKEN');
       const pair = await EdgeClient.pair({ serverUrl: serverUrl.href, userToken, name: host.config.name, type: 'edge', deviceId: host.config.instanceId });
-      host.config.remotes = [{ url: serverUrl.href.replace(/\/$/, ''), token: pair.token, deviceId: pair.deviceId }];
+      host.config.remotes = [{ url: serverUrl.href.replace(/\/$/, ''), token: pair.token, deviceId: pair.deviceId, hub: pair.hub }];
       host.save();
     }
     delete process.env.CANVAS_PAIRING_TOKEN;
@@ -57,10 +57,17 @@ export async function runRuntime({ kind, createHost, exportsFor, script, version
     host.config.host = flags.host || host.config.host || '127.0.0.1';
     host.config.port = Number(new URL(address).port); host.save();
     const exports = await exportsFor(host);
+    // A hub's keys are learned on pairing and refreshed by every announce ack and
+    // rotation; a remote that answers as a different hub keeps the pinned keys.
+    const pinHub = (remote, hub) => {
+      if (!hub?.iss || !Array.isArray(hub.keys)) return;
+      if (remote.hub?.iss && remote.hub.iss !== hub.iss) { console.error(`Hub at ${remote.url} answered as ${hub.iss}, pinned ${remote.hub.iss}: its credentials stay rejected`); return; }
+      remote.hub = { iss: hub.iss, keys: hub.keys }; host.save();
+    };
     const remotes = host.config.remotes.filter(r => r.enabled !== false);
     clients = remotes.map(remote => {
       const client = new EdgeClient({ serverUrl: remote.url, token: remote.token, tls: remote.tls,
-        localUrl: address, localToken: host.config.tunnelToken,
+        localUrl: address, onHub: hub => pinHub(remote, hub),
         announce: { protocol: 2, instanceId: host.config.instanceId, runtime: host.config.kind, version, caps: ['proxy','stream-v2'], exports } });
       if (host.workspaceManager) client.forwardEvents(host.workspaceManager); if (host.agents) client.forwardEvents(host.agents); return client.connect();
     });

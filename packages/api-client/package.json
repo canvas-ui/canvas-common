@@ -13,7 +13,8 @@
       "types": "./types/tls.d.ts",
       "default": "./src/tls.js"
     },
-    "./edge": "./src/EdgeClient.js"
+    "./edge": "./src/EdgeClient.js",
+    "./hub-credential": "./src/hub-credential.js"
   },
   "files": [
     "src",
