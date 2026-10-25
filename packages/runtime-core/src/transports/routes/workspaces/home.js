@@ -5,7 +5,8 @@ import { pipeline } from 'stream/promises';
 import path from 'path';
 import ResponseObject from '../../ResponseObject.js';
 import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
-import { internalPathMatcher } from '../../../core/workspace/configuration/internal-paths.js';
+import { internalPathMatcher } from '../../../runtimes/workspace/config/internal-paths.js';
+import { env } from '../../../env.js';
 
 const MIME = {
   '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
@@ -43,9 +44,6 @@ async function statEntry(abs, name) {
     ctime: s.birthtime.toISOString(),
   };
 }
-
-// Upload ceiling for a single home file (2 GiB); the stream is not buffered.
-const HOME_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024;
 
 /**
  * Parse a `Range` header against a known size: null when there is nothing to
@@ -86,7 +84,7 @@ export default async function homeRoutes(fastify) {
   // never materializes in memory.
   fastify.addContentTypeParser(
     ['application/octet-stream', 'application/x-www-form-urlencoded', 'text/plain'],
-    { bodyLimit: HOME_UPLOAD_LIMIT },
+    { bodyLimit: env.uploads.maxBytes },
     (_req, payload, done) => done(null, payload),
   );
 
@@ -200,8 +198,8 @@ export default async function homeRoutes(fastify) {
   // Delete
   // ─────────────────────────────────────────────────────────────────────────
   // Mirrors can expose a directory before its children have downloaded.
-  // Keep POSIX rmdir separate from the recursive DELETE route: older hubs
-  // must reject an unsupported operation rather than erase unseen contents.
+  // Keep POSIX rmdir separate from the recursive DELETE route so an
+  // unsupported operation is rejected rather than erasing unseen contents.
   fastify.post('/rmdir', {
     onRequest: [fastify.authenticate, requireWorkspaceWrite()],
     schema: {

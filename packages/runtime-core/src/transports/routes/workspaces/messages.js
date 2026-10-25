@@ -1,5 +1,5 @@
 import { requireWorkspaceRead, requireWorkspaceWrite, requireWorkspaceAdmin } from '../../middleware/workspace-acl.js';
-import { emailListPreview } from '../../../core/workspace/services/mail/content.js';
+import { emailListPreview } from '../../../runtimes/workspace/connectors/imap/content.js';
 
 export default async function messageRoutes(app) {
     const fail = (reply, error) => reply.code(error.statusCode || 400).send({ status: 'error', message: error.message });

@@ -1,13 +1,12 @@
-import { emailListPreview } from '../../../core/workspace/services/mail/content.js';
+import { emailListPreview } from '../../../runtimes/workspace/connectors/imap/content.js';
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
-import { normalizeQueryOptions } from '../../../core/context/lib/query.js';
-import { localDocumentIds, PLACEMENT_BUDGET, stampPlacement, treeOf } from '../../lib/placement.js';
+import { normalizeQueryOptions } from '../../../runtimes/workspace/contexts/lib/query.js';
 import { parseDocumentId } from '../../../utils/documentId.js';
 import { validateUser } from '../../auth/strategies.js';
 import { stripDeviceFeatureTags } from '../../../utils/device-features.js';
-import { normalizeSchemaId } from '../../../core/workspace/documents/classifier.js';
+import { normalizeSchemaId } from '../../../runtimes/workspace/db/classifier.js';
 
 export default async function documentRoutes(fastify, _options) {
   function buildAttributes(query) {
@@ -74,6 +73,9 @@ export default async function documentRoutes(fastify, _options) {
           // driving filters itself (web live-preview). Bound clients omit it and
           // inherit the context's saved view. Default true.
           applyContextSpec: { type: 'boolean', default: true },
+          // A context's path also lists what is filed at its deeper paths;
+          // `currentPathOnly` keeps only the documents filed at the path itself.
+          currentPathOnly: { type: 'boolean', default: false },
         },
       },
     },
@@ -113,7 +115,7 @@ export default async function documentRoutes(fastify, _options) {
       };
 
       const searchQuery = request.query.q || request.query.search;
-      const spec = { attributes, filters, options, applyContextSpec: request.query.applyContextSpec };
+      const spec = { attributes, filters, options, applyContextSpec: request.query.applyContextSpec, currentPathOnly: request.query.currentPathOnly };
 
       const dbResult = searchQuery
         ? await context.search(request.user.id, { query: searchQuery, mode: request.query.mode, ...spec })
@@ -125,24 +127,7 @@ export default async function documentRoutes(fastify, _options) {
         return reply.code(response.statusCode).send(response.getResponse());
       }
 
-      // A context URL is a path into a tree, and a path lists its whole
-      // subtree — so a context at mbag://dc-migration shows what is filed there
-      // AND what is filed below it. `linkedHere` says which is which, so a
-      // client rendering documents as files (canvas-fuse) gives the plain
-      // filename to the document actually filed at this context's path.
-      const payload = (searchQuery || request.query.idsOnly)
-        ? dbResult
-        : stampPlacement(dbResult, await localDocumentIds(
-          (not) => context.list(request.user.id, {
-            ...spec,
-            paths: { not },
-            options: { ...options, idsOnly: true, limit: PLACEMENT_BUDGET, offset: 0, page: undefined },
-          }),
-          treeOf(context.workspace, { tree: context.treeId }),
-          context.path || '/',
-        ));
-
-      const response = new ResponseObject().success(payload.map(emailListPreview), searchQuery ? 'Search results retrieved successfully' : 'Documents retrieved successfully', 200, dbResult.count, dbResult.totalCount);
+      const response = new ResponseObject().success(dbResult.map(emailListPreview), searchQuery ? 'Search results retrieved successfully' : 'Documents retrieved successfully', 200, dbResult.count, dbResult.totalCount);
       return reply.code(response.statusCode).send(response.getResponse());
     } catch (error) {
       fastify.log.error(error);

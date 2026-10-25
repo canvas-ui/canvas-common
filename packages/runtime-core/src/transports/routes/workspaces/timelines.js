@@ -334,9 +334,8 @@ export default async function workspaceTimelineRoutes(fastify, _options) {
   }
 
   // POST /workspaces/:id/timelines/:name/entries
-  // Insert manual timeline positions for a document. Two forms:
-  // - single (back-compat): { id, start, end?, scale? } — the PRIMARY interval.
-  // - multi-position:       { id, entries: [{ start, end?, scale?, primary? }] }
+  // Insert manual timeline positions for a document:
+  //   { id, entries: [{ start, end?, scale?, primary? }] }
   //   The entry flagged `primary: true` (or the first) becomes the sortable
   //   primary interval; the rest land in the tiled membership plane — bounded
   //   ones as cell coverings, open-ended ones in its open-interval sidecar
@@ -346,12 +345,9 @@ export default async function workspaceTimelineRoutes(fastify, _options) {
     schema: {
       body: {
         type: 'object',
-        required: ['id'],
+        required: ['id', 'entries'],
         properties: {
           id: {},
-          start: {},
-          end: {},
-          scale: { type: 'string' },
           entries: {
             type: 'array',
             minItems: 1,
@@ -368,7 +364,6 @@ export default async function workspaceTimelineRoutes(fastify, _options) {
             },
           },
         },
-        anyOf: [{ required: ['start'] }, { required: ['entries'] }],
       },
     },
   }, async (request, reply) => {
@@ -379,24 +374,18 @@ export default async function workspaceTimelineRoutes(fastify, _options) {
       const { name } = request.params;
       const { id, entries } = request.body;
 
-      if (Array.isArray(entries)) {
-        let primaryIndex = entries.findIndex((e) => e.primary === true);
-        if (primaryIndex === -1) primaryIndex = 0;
-        const extras = entries.filter((_, i) => i !== primaryIndex);
+      let primaryIndex = entries.findIndex((e) => e.primary === true);
+      if (primaryIndex === -1) primaryIndex = 0;
+      const extras = entries.filter((_, i) => i !== primaryIndex);
 
-        await workspace.insertTimelineEntry(name, id, entryInterval(entries[primaryIndex]));
-        if (extras.length > 0) {
-          await workspace.insertTimelineEntries(name, id, extras.map(entryInterval));
-        }
-        const ro = new ResponseObject().created(
-          { timelineName: name, id, entries: entries.length },
-          'Timeline entries inserted',
-        );
-        return reply.code(ro.statusCode).send(ro.getResponse());
+      await workspace.insertTimelineEntry(name, id, entryInterval(entries[primaryIndex]));
+      if (extras.length > 0) {
+        await workspace.insertTimelineEntries(name, id, extras.map(entryInterval));
       }
-
-      await workspace.insertTimelineEntry(name, id, entryInterval(request.body));
-      const ro = new ResponseObject().created({ timelineName: name, id }, 'Timeline entry inserted');
+      const ro = new ResponseObject().created(
+        { timelineName: name, id, entries: entries.length },
+        'Timeline entries inserted',
+      );
       return reply.code(ro.statusCode).send(ro.getResponse());
     } catch (err) {
       fastify.log.error(err);

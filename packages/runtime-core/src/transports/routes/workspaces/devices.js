@@ -3,24 +3,12 @@
 import ResponseObject from '../../ResponseObject.js';
 import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
 
-const DEVICE_SCHEMA = 'data/schema/device';
-
+// The workspace's own device records (see runtime db/WorkspaceDevices.js).
 function serializeDeviceDocument(document) {
   return {
     id: document.id,
     ...(document.data || {}),
   };
-}
-
-async function findWorkspaceDeviceDoc(workspace, deviceId) {
-  const docs = await workspace.list({
-    context: workspace.getContextTreeSelector('/'),
-    attributes: { allOf: [DEVICE_SCHEMA] },
-    limit: 500,
-  });
-  return Array.isArray(docs)
-    ? docs.find((document) => document?.data?.deviceId === deviceId) || null
-    : null;
 }
 
 export default async function workspaceDeviceRoutes(fastify, _options) {
@@ -45,9 +33,7 @@ export default async function workspaceDeviceRoutes(fastify, _options) {
     }
   }, async (request, reply) => {
     try {
-      const documents = await request.workspace.list({
-        context: request.workspace.getContextTreeSelector('/'),
-        attributes: { allOf: [DEVICE_SCHEMA] },
+      const documents = await request.workspace.devices.list({
         limit: request.query.limit,
         offset: request.query.offset,
         page: request.query.page,
@@ -83,7 +69,7 @@ export default async function workspaceDeviceRoutes(fastify, _options) {
     }
   }, async (request, reply) => {
     try {
-      const document = await findWorkspaceDeviceDoc(request.workspace, request.params.deviceId);
+      const document = await request.workspace.devices.find(request.params.deviceId);
       if (!document) {
         const response = new ResponseObject().notFound('Workspace device not found');
         return reply.code(response.statusCode).send(response.getResponse());
@@ -113,46 +99,34 @@ export default async function workspaceDeviceRoutes(fastify, _options) {
       },
       body: {
         type: 'object',
+        required: ['devices'],
         properties: {
-          deviceId: { type: 'string' },
-          deviceIds: {
+          devices: {
             type: 'array',
-            items: { type: 'string' }
+            minItems: 1,
+            maxItems: 100,
+            items: {
+              type: 'object',
+              required: ['deviceId'],
+              properties: {
+                deviceId: { type: 'string', minLength: 1 },
+                name: { type: 'string' },
+                description: { type: 'string' },
+                platform: { type: 'string' },
+                arch: { type: 'string' },
+                type: { type: 'string' },
+              }
+            }
           }
         }
       }
     }
   }, async (request, reply) => {
     try {
-      if (!fastify.deviceRegistry) {
-        throw new Error('Device registry not available');
-      }
-
-      const rawIds = [
-        ...(Array.isArray(request.body?.deviceIds) ? request.body.deviceIds : []),
-        ...(request.body?.deviceId ? [request.body.deviceId] : []),
-      ];
-      const deviceIds = Array.from(new Set(rawIds.map((value) => String(value || '').trim()).filter(Boolean)));
-
-      if (!deviceIds.length) {
-        const response = new ResponseObject().badRequest('deviceId or deviceIds is required');
-        return reply.code(response.statusCode).send(response.getResponse());
-      }
-
       const linked = [];
-      for (const deviceId of deviceIds) {
-        const device = await fastify.deviceRegistry.getDevice(request.user.id, deviceId);
-        if (!device) {
-          const response = new ResponseObject().notFound(`Device "${deviceId}" not found in server registry`);
-          return reply.code(response.statusCode).send(response.getResponse());
-        }
-
-        const result = await fastify.deviceRegistry.ensureWorkspaceBinding(request.workspace, device);
-        linked.push({
-          id: result.id,
-          created: result.created,
-          ...result.data,
-        });
+      for (const device of request.body.devices) {
+        const result = await request.workspace.devices.ensure(device);
+        linked.push({ id: result.id, created: result.created, ...result.data });
       }
 
       const response = new ResponseObject().created(linked, 'Workspace devices linked successfully');
@@ -184,23 +158,14 @@ export default async function workspaceDeviceRoutes(fastify, _options) {
         return reply.code(response.statusCode).send(response.getResponse());
       }
 
-      const docs = await request.workspace.list({
-        context: request.workspace.getContextTreeSelector('/'),
-        attributes: { allOf: [DEVICE_SCHEMA] },
-        limit: 500,
-      });
-      const matches = Array.isArray(docs)
-        ? docs.filter((document) => document?.data?.deviceId === deviceId)
-        : [];
-      if (!matches.length) {
+      const deleted = await request.workspace.devices.remove(deviceId);
+      if (!deleted) {
         const response = new ResponseObject().notFound('Workspace device not found');
         return reply.code(response.statusCode).send(response.getResponse());
       }
 
-      const result = await request.workspace.deleteMany(matches.map((document) => document.id));
-
       const response = new ResponseObject().success(
-        { deviceId, deleted: result?.successful?.length ?? matches.length, result },
+        { deviceId, deleted },
         'Workspace device unlinked successfully'
       );
       return reply.code(response.statusCode).send(response.getResponse());

@@ -1,10 +1,10 @@
-import { emailListPreview } from '../../../core/workspace/services/mail/content.js';
+import { emailListPreview } from '../../../runtimes/workspace/connectors/imap/content.js';
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
 import { requireWorkspaceRead, requireWorkspaceWrite, requireWorkspaceAdmin } from '../../middleware/workspace-acl.js';
-import { getServerDevice } from '../../../core/device/ServerDevice.js';
-import { describeConnectorDrivers } from '../../../core/workspace/services/connectors/index.js';
+import { getServerDevice } from '../../../utils/host-device.js';
+import { describeConnectorDrivers } from '../../../runtimes/workspace/connectors/index.js';
 
 // Unified backend/connector API — mirrors the backends tree's
 // /<driver>/<address> nodes. One surface over storage backends
@@ -76,30 +76,15 @@ export default async function workspaceBackendRoutes(fastify) {
         try {
             const driver = drv(request.params.driver);
             const backend = await request.workspace.addBackend(driver, request.body || {});
-            // A local-folder mount pins content to THIS server's device — make
-            // sure that device exists in the user's registry (named,
-            // re-associable) and is bound into the workspace like any client
-            // device. Best-effort: the mount works without it.
-            if ((driver === 'file' || driver === 'fs') && backend?.config?.device?.id && fastify.deviceRegistry) {
+            // A local-folder mount pins content to the device this runtime
+            // runs on: record it in the workspace so its file:// locations
+            // have a name. Best-effort: the mount works without it.
+            if ((driver === 'file' || driver === 'fs') && backend?.config?.device?.id) {
                 try {
-                    const serverDevice = getServerDevice();
-                    const existing = await fastify.deviceRegistry.getDevice(request.user.id, serverDevice.deviceId);
-                    const record = existing
-                        ? await fastify.deviceRegistry.touchDevice(request.user.id, serverDevice.deviceId, {})
-                        : await fastify.deviceRegistry.upsertDevice(request.user.id, {
-                            deviceId: serverDevice.deviceId,
-                            name: serverDevice.name,
-                            description: serverDevice.description,
-                            hostname: serverDevice.hostname,
-                            fqdn: serverDevice.fqdn,
-                            platform: serverDevice.platform,
-                            arch: serverDevice.arch,
-                            type: serverDevice.type,
-                            username: serverDevice.username,
-                        });
-                    await fastify.deviceRegistry.ensureWorkspaceBinding(request.workspace, record);
+                    const { deviceId, name, description, hostname, fqdn, platform, arch, type, username } = getServerDevice();
+                    await request.workspace.devices.ensure({ deviceId, name, description, hostname, fqdn, platform, arch, type, username });
                 } catch (deviceError) {
-                    request.log.warn({ err: deviceError }, 'Failed to register server device for local-folder backend');
+                    request.log.warn({ err: deviceError }, 'Failed to record the host device for a local-folder backend');
                 }
             }
             const response = new ResponseObject().created(backend);
@@ -312,6 +297,36 @@ export default async function workspaceBackendRoutes(fastify) {
                 },
             );
             return ok(reply, result);
+        } catch (error) { return fail(request, reply, error); }
+    });
+
+    // Move messages between folders of one mail account on the server (the
+    // mail-client drag onto a folder). Body: { documentIds, targetPath } where
+    // targetPath is the backends-tree path of a subscribed folder
+    // (/imap/<account>/<folder…>).
+    fastify.post('/:driver/:address/messages/move', {
+        onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+        schema: {
+            body: {
+                type: 'object',
+                required: ['documentIds', 'targetPath'],
+                properties: {
+                    documentIds: { type: 'array', minItems: 1, maxItems: 1000, items: { type: 'integer' } },
+                    targetPath: { type: 'string', minLength: 1, maxLength: 1024 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            if (drv(request.params.driver) !== 'imap') {
+                return fail(request, reply, Object.assign(new Error(`Backend "${drv(request.params.driver)}" does not support moving messages`), { statusCode: 400 }));
+            }
+            const targetPath = String(request.body.targetPath);
+            const accountRoot = `/imap/${arg(request.params.address).toLowerCase()}/`;
+            if (!targetPath.toLowerCase().startsWith(accountRoot)) {
+                return fail(request, reply, Object.assign(new Error('Target folder belongs to another account'), { statusCode: 400 }));
+            }
+            return ok(reply, await request.workspace.moveImapMessages(request.body.documentIds, targetPath));
         } catch (error) { return fail(request, reply, error); }
     });
 

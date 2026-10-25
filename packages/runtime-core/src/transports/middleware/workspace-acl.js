@@ -1,4 +1,4 @@
-import { workspaceStopped, workspaceErrorResponse } from '../../core/workspace/runtime/errors.js';
+import { workspaceStopped, workspaceNotReady, workspaceErrorResponse } from '../../runtimes/workspace/runtime/errors.js';
 'use strict';
 
 import crypto from 'crypto';
@@ -12,7 +12,11 @@ export function allowsStoppedWorkspace(request) {
   return /\/workspaces\/[^/]+(?:\/(?:start|stop|status|protection|db\/backups|export|exports(?:\/[^/]+)?))?$/.test(url);
 }
 async function ensureStarted(request, workspace) {
-  if (workspace?.isActive === false && !allowsStoppedWorkspace(request)) throw workspaceStopped(workspace);
+  if (workspace?.isActive === false && !allowsStoppedWorkspace(request)) {
+    // Offline (a restarting child, an unreachable remote) is transient, not stopped.
+    if (workspace.isOnline === false) throw workspaceNotReady(`Workspace ${workspace.name} is offline: ${workspace.statusMessage || 'restarting'}`);
+    throw workspaceStopped(workspace);
+  }
   return workspace;
 }
 
@@ -48,8 +52,8 @@ const logger = createLogger('canvas-server:middleware:workspace-acl');
  * @param {string} requiredPermission - Required permission ('read', 'write', 'admin')
  * @param {Object} [options]
  * @param {boolean} [options.allowIndexFallback=false] - Grant owner access from
- *   the workspace index when the workspace cannot be instantiated (missing or
- *   legacy directory). Only for config-level routes (PATCH/DELETE /:id) whose
+ *   the workspace index when the workspace cannot be instantiated (missing
+ *   directory). Only for config-level routes (PATCH/DELETE /:id) whose
  *   handlers never call Workspace instance methods — request.workspace is the
  *   plain index entry in that case.
  * @returns {Function} Fastify middleware function
@@ -199,7 +203,7 @@ export function createWorkspaceACLMiddleware(requiredPermission = 'read', { allo
       }
 
       // 4b. Config-level fallback: the owner check above instantiates the
-      // workspace, which throws for broken/legacy dirs (status not_found).
+      // workspace, which throws for broken dirs (status not_found).
       // Ownership is still provable from the index, and config routes only
       // need the index entry.
       if (allowIndexFallback && userId) {
@@ -274,6 +278,7 @@ export function createWorkspaceACLMiddleware(requiredPermission = 'read', { allo
 
     } catch (error) {
       if (error?.code === 'WORKSPACE_STOPPED') return reply.code(423).send(workspaceErrorResponse(error));
+      if (error?.code === 'WORKSPACE_NOT_READY') return reply.code(503).send(workspaceErrorResponse(error));
       logger.debug(`Workspace ACL validation error: ${error.message}`);
       const response = new ResponseObject().serverError(`Workspace access validation failed: ${error.message}`);
       return reply.code(response.statusCode).send(response.getResponse());
@@ -525,10 +530,3 @@ export async function enforceWorkspaceTokenScope(request, reply) {
 export const requireWorkspaceRead = (options) => createWorkspaceACLMiddleware('read', options);
 export const requireWorkspaceWrite = (options) => createWorkspaceACLMiddleware('write', options);
 export const requireWorkspaceAdmin = (options) => createWorkspaceACLMiddleware('admin', options);
-
-export default {
-  createWorkspaceACLMiddleware,
-  requireWorkspaceRead,
-  requireWorkspaceWrite,
-  requireWorkspaceAdmin
-};

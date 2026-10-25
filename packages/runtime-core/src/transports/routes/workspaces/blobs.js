@@ -1,6 +1,7 @@
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import { env } from '../../../env.js';
 
 // Raw-bytes upload into the workspace blob store (workspace:data). Two-step
 // ingest: client POSTs bytes here → gets a stored://workspace:data/<key> URL,
@@ -8,7 +9,6 @@ import ResponseObject from '../../ResponseObject.js';
 // bytes become server-resident and therefore inferdable (unlike `ws add`, which
 // only records a device file:// pointer).
 
-const BLOB_BODY_LIMIT = 21474836480; // 20 GiB — streamed to disk, never buffered in RAM
 
 export default async function blobRoutes(fastify) {
   // Scoped to this plugin: hand the RAW request stream to the handler (no
@@ -17,7 +17,7 @@ export default async function blobRoutes(fastify) {
   // application/json on sibling routes is unaffected.
   fastify.addContentTypeParser(
     'application/octet-stream',
-    { bodyLimit: BLOB_BODY_LIMIT },
+    { bodyLimit: env.uploads.maxBytes },
     (_req, payload, done) => done(null, payload),
   );
 

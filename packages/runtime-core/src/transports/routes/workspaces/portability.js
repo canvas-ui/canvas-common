@@ -14,8 +14,9 @@ import {
   importWorkspaceFromRemote,
   saveUploadedArchive,
   resolveRemoteToken,
-} from '../../../core/workspace/portability/archive.js';
-import { importJobs } from '../../../core/workspace/portability/import-jobs.js';
+} from '../../../runtimes/workspace/portability/archive.js';
+import { importJobs } from '../../../runtimes/workspace/portability/import-jobs.js';
+import { validateImportPresentation } from '../../../runtimes/workspace/config/portable-config.js';
 
 /**
  * Workspace export/import.
@@ -61,10 +62,6 @@ function readCookie(request, name) {
   return null;
 }
 
-// Ceiling for a single uploaded archive (4 GiB). The body is streamed straight
-// to disk, never buffered, so this bounds disk use rather than memory.
-const ARCHIVE_UPLOAD_LIMIT = 4 * 1024 * 1024 * 1024;
-
 export default async function portabilityRoutes(fastify) {
   // Archive uploads arrive as a raw binary body (not multipart): the global
   // multipart limit is sized for small attachments, and a workspace export is
@@ -73,7 +70,7 @@ export default async function portabilityRoutes(fastify) {
   // JSON on the sibling workspace routes is unaffected.
   fastify.addContentTypeParser(
     ['application/gzip', 'application/x-gzip', 'application/x-bzip2', 'application/x-tar', 'application/octet-stream'],
-    { bodyLimit: ARCHIVE_UPLOAD_LIMIT },
+    { bodyLimit: env.uploads.maxBytes },
     (_req, payload, done) => done(null, payload),
   );
 
@@ -396,6 +393,7 @@ export default async function portabilityRoutes(fastify) {
   fastify.get('/import/jobs/:jobId', {
     onRequest: [fastify.authenticate],
   }, async (request, reply) => {
+    reply.header('Cache-Control', 'private, no-store');
     const job = importJobs.get(request.user.id, request.params.jobId);
     if (!job) {
       const response = new ResponseObject().notFound(`Import job not found: ${request.params.jobId}`);
@@ -420,6 +418,7 @@ export default async function portabilityRoutes(fastify) {
   }, async (request, reply) => {
     let stored;
     try {
+      const presentation = validateImportPresentation({ name: request.query?.name, label: request.query?.label });
       const filename = request.query?.filename || 'upload.tar.gz';
       if (!request.body || typeof request.body.pipe !== 'function') {
         const response = new ResponseObject().badRequest('Send the archive as a binary request body');
@@ -449,6 +448,7 @@ export default async function portabilityRoutes(fastify) {
             userId,
             userEmail,
             source: exportFilePath(fastify.workspaceManager, userEmail, archiveName),
+            ...presentation,
             report,
           });
         } catch (err) {
@@ -478,12 +478,15 @@ export default async function portabilityRoutes(fastify) {
           export: { type: 'string' },
           url: { type: 'string' },
           token: { type: 'string' },
+          name: { type: 'string' },
+          label: { type: 'string' },
         },
       },
     },
   }, async (request, reply) => {
     try {
-      const { path: sourcePath, export: exportName, url, token } = request.body || {};
+      const { path: sourcePath, export: exportName, url, token, name, label } = request.body || {};
+      const presentation = validateImportPresentation({ name, label });
       const userId = request.user.id;
       const userEmail = request.user.email;
 
@@ -498,6 +501,7 @@ export default async function portabilityRoutes(fastify) {
           userEmail,
           url,
           token,
+          ...presentation,
           allowInsecure: env.workspace?.allowInsecureRemoteImport === true,
           report,
         }));
@@ -510,16 +514,23 @@ export default async function portabilityRoutes(fastify) {
       if (exportName) {
         const source = exportFilePath(fastify.workspaceManager, userEmail, exportName);
         const job = importJobs.start(userId, (report) => importWorkspace(fastify.workspaceManager, {
-          userId, userEmail, source, report,
+          userId, userEmail, source, report, ...presentation,
         }));
         const response = new ResponseObject().created(job, 'Import started', 202);
         return reply.code(response.statusCode).send(response.getResponse());
       }
 
-      // Registering an existing on-disk folder is just an index write: fast,
-      // so it stays synchronous and returns the workspace directly.
+      // Local archives need the same background extraction as uploads.
+      if (sourcePath && (await fsPromises.stat(sourcePath).catch(() => null))?.isFile()) {
+        const job = importJobs.start(userId, report => importWorkspace(fastify.workspaceManager, {
+          userId, userEmail, source: sourcePath, report, ...presentation,
+        }));
+        const response = new ResponseObject().created(job, 'Import started', 202);
+        return reply.code(response.statusCode).send(response.getResponse());
+      }
+
       const entry = await importWorkspace(fastify.workspaceManager, {
-        userId, userEmail, source: sourcePath,
+        userId, userEmail, source: sourcePath, ...presentation,
       });
       const response = new ResponseObject().created(entry, 'Workspace imported');
       return reply.code(response.statusCode).send(response.getResponse());

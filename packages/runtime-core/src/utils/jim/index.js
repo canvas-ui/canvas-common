@@ -57,6 +57,7 @@ class JsonIndexManager {
         }
 
         const index = new Conf({
+            configFileMode: 0o600,
             configName: name,
             cwd: scope ? path.join(this.rootPath, scope) : this.rootPath,
             ...this.driverOptions,

@@ -1,17 +1,5 @@
 # TODO
 
-## runtime-core: regenerate for hub-signed credentials (API 2.1)
-
-The hub (API 2.1) forwards requests with a hub-signed credential (Ed25519 JWT,
-`Authorization: Bearer <credential>`) instead of the runtime's `tunnelToken` +
-`x-canvas-edge-context` header, and EdgeClient now passes that credential
-through (no `localToken`). `packages/runtime-core/src/runtime/host.js` is a
-derived copy of canvas-server's `src/runtimes/workspace/runtime/host.js` and
-still checks `tunnelToken`, so a remote **workspaced** cannot serve tunnel
-requests until runtime-core is replaced from the canvas-server source (do not
-patch it by hand). The agent runtime is already on the new format. Spec:
-canvas-server `docs/workspace-runtime-modes.md` → Credentials.
-
 ## User workflows
 
 ### Ad-hoc problem(task) container 

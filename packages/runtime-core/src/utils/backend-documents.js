@@ -1,5 +1,7 @@
 'use strict';
 
+import { decodeGitSegment } from '../runtimes/workspace/services/git/GitRepositories.js';
+
 /**
  * Backend-mirror path helpers for the dedicated "backends" tree.
  *
@@ -16,6 +18,25 @@
 
 export const BACKENDS_TREE_NAME = 'backends';
 export const DIRECTORY_TREE_NAME = 'directory';
+
+// Presentation only: retain canonical folder names/paths for queries, rules
+// and IMAP operations. Existing custom labels take precedence.
+export function labelBackendTree(node, ancestors = []) {
+  const segments = node.name === '/' ? ancestors : [...ancestors, node.name];
+  const mailboxFolder = segments[0] === 'imap' && segments.length >= 3;
+  const gitNode = segments[0] === 'workspace' && segments[1] === 'git';
+  let label = node.label || node.name;
+  if (label === node.name && gitNode) {
+    try { label = segments.length === 2 ? 'Git' : decodeGitSegment(node.name); } catch { /* retain literal */ }
+  }
+  return {
+    ...node,
+    label: mailboxFolder && label === node.name
+      ? label.replace(/[-_]+/g, ' ').toLowerCase().replace(/(^|\s)(\p{L})/gu, (_, space, letter) => space + letter.toUpperCase())
+      : label,
+    children: node.children?.map(child => labelBackendTree(child, segments)),
+  };
+}
 
 export function normalizeSegment(value, fallback = 'unknown') {
   const segment = String(value || '')

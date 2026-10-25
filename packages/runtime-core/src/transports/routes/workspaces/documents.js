@@ -1,16 +1,15 @@
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
-import { deleteDocumentsInBatches } from '../../../core/workspace/documents/bulk-delete.js';
-import { copyDocumentOnce } from '../../../core/workspace/documents/copy.js';
+import { deleteDocumentsInBatches } from '../../../runtimes/workspace/db/bulk-delete.js';
 import { parseDocumentId, parseDocumentIdArray } from '../../../utils/documentId.js';
+import { parseDocumentIdQuery } from '../../lib/document-id-query.js';
 import { stripDeviceFeatureTags } from '../../../utils/device-features.js';
 import { parseByteRange } from '../../lib/http-range.js';
 import { resolveContentType } from '../../lib/mime.js';
-import { normalizeSchemaId } from '../../../core/workspace/documents/classifier.js';
+import { normalizeSchemaId } from '../../../runtimes/workspace/db/classifier.js';
 import { PREDICATES } from 'canvas-synapsd/src/indexes/edges/predicates.js';
-import { localDocumentIds, PLACEMENT_BUDGET, stampPlacement, treeOf } from '../../lib/placement.js';
-import { emailListPreview, resolveEmailBody } from '../../../core/workspace/services/mail/content.js';
+import { emailListPreview, resolveEmailBody } from '../../../runtimes/workspace/connectors/imap/content.js';
 
 // Human filename for a location URL: basename of the key after scheme://backend/.
 function locationFilename(url) {
@@ -398,6 +397,9 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     // read — the client is driving the filters itself (live canvas filter
     // preview via the toolbox). Default true = normal canvas behavior.
     applyCanvasSpec: { type: 'boolean', default: true },
+    // A context path also lists what is filed at its deeper paths;
+    // `currentPathOnly` keeps only the documents filed at the path itself.
+    currentPathOnly: { type: 'boolean', default: false },
   };
 
   // All server-side selection semantics live here: list and purge must agree.
@@ -405,12 +407,14 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     // Whole-workspace scope = no path selector. Backend mirrors live in their
     // own tree (linkContextRoot:false), so root/context queries never see
     // them unless a user filed them somewhere.
-    const { context: ctxSelector, directory: dirSelector } = query.scope === 'workspace' || query.layerId
+    const scoped = query.scope === 'workspace' || query.layerId
       ? { context: null, directory: null }
       : resolveScopeSelectors(workspace, query, '/');
+    const ctxSelector = scoped.context && query.currentPathOnly ? { ...scoped.context, currentPathOnly: true } : scoped.context;
+    const dirSelector = scoped.directory;
 
     // Collect the (possibly stacked) text queries. `q` may be a string or an
-    // array (repeated param); `search` is a legacy single alias.
+    // array (repeated param); `search` is the single-term form the CLI sends.
     const rawQ = query.q;
     const rawQueries = (Array.isArray(rawQ) ? rawQ : (rawQ ? [rawQ] : []))
       .concat(query.search ? [query.search] : [])
@@ -428,9 +432,18 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     // without the constraint would silently widen. A NEGATED one that
     // resolves to nothing excludes nothing, so it is simply dropped.
     const queries = [];
+    let queryIds = query.ids ?? null;
+    let hasIdQuery = false;
     for (const q of rawQueries) {
       if (query.layerId) { queries.push(q); continue; }
-      const { text, tokens } = parseInlineRelQuery(q);
+      let idQuery;
+      try { idQuery = parseDocumentIdQuery(q); }
+      catch (e) { const r = new ResponseObject().badRequest(e.message); reply.code(r.statusCode).send(r.getResponse()); return null; }
+      for (const id of idQuery.ids) {
+        hasIdQuery = true;
+        queryIds = queryIds === null ? [id] : queryIds.filter(existing => existing === id);
+      }
+      const { text, tokens } = parseInlineRelQuery(idQuery.text);
       if (text) { queries.push(text); }
       for (const token of tokens) {
         const anchors = await resolveRelAnchors(workspace, token.value);
@@ -441,7 +454,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
         relFilters.push({ op: token.negated ? 'noneOf' : 'allOf', p: token.p, of: anchors, dir: token.dir });
       }
     }
-    const isSearch = queries.length > 0;
+    const isSearch = queries.length > 0 || hasIdQuery;
 
     const spec = {
       context: ctxSelector,
@@ -453,7 +466,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       attributes: buildAttributes(query),
       filters: query.filters,
       ...(relFilters.length ? { rel: relFilters } : {}),
-      ...(query.ids !== undefined ? { ids: query.ids } : {}),
+      ...(queryIds !== null ? { ids: queryIds } : {}),
       limit: query.limit,
       offset: query.offset,
       page: query.page,
@@ -518,7 +531,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
       const selection = await resolveDocumentSelection(workspace, request.query, reply);
       if (!selection) return reply;
-      const { documents, ctxSelector, spec, isSearch } = selection;
+      const { documents, isSearch } = selection;
 
       if (documents.error) {
         fastify.log.error(`SynapsD error: ${documents.error}`);
@@ -526,19 +539,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
         return reply.code(responseObject.statusCode).send(responseObject.getResponse());
       }
 
-      // Which of these are FILED at the listed path, as opposed to showing
-      // through from below it (a context path lists its whole subtree). A
-      // client rendering documents as files needs it to decide which of two
-      // same-named documents is "the" one here — see transports/lib/placement.
-      const payload = (isSearch || request.query.idsOnly || !ctxSelector)
-        ? documents
-        : stampPlacement(documents, await localDocumentIds(
-          (not) => workspace.list({ ...spec, paths: { not }, idsOnly: true, limit: PLACEMENT_BUDGET, offset: 0, page: undefined }),
-          treeOf(workspace, ctxSelector),
-          ctxSelector.path,
-        ));
-
-      const responseObject = new ResponseObject().found(payload.map(emailListPreview), isSearch ? 'Search results retrieved successfully' : 'Documents retrieved successfully', 200, documents.count, documents.totalCount);
+      const responseObject = new ResponseObject().found(documents.map(emailListPreview), isSearch ? 'Search results retrieved successfully' : 'Documents retrieved successfully', 200, documents.count, documents.totalCount);
       // Arrays lose non-index props in JSON — lift the calibration debug across.
       if (documents.debug) { responseObject.debug = documents.debug; }
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
@@ -798,7 +799,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       }
       const spec = resolveScopeSelectors(destination, request.body);
       if (spec.directory && rejectBackendsWrite(reply, destination, spec.directory)) return reply;
-      const result = await copyDocumentOnce({ source, destination, documentId: request.body.documentId, spec, operationId: request.body.operationId, userId: request.user.id });
+      const result = await fastify.workspaceManager.copyDocument({ source, destination, documentId: request.body.documentId, spec, operationId: request.body.operationId, userId: request.user.id });
       return new ResponseObject().created(result, 'Document copied').getResponse();
     } catch (error) {
       const response = ResponseObject.fromError(error, 'Workspace copy failed');
@@ -1009,18 +1010,8 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
             minItems: 1,
             items: { type: 'object', properties: { id: { anyOf: [{ type: 'string' }, { type: 'number' }] } } },
           },
-          // Still declared so a caller on the old contract reaches the handler
-          // and gets told where membership moved, rather than a bare
-          // "must have required property 'documents'" from the schema.
-          documentIds: {
-            anyOf: [
-              { type: 'array', items: { anyOf: [{ type: 'string' }, { type: 'number' }] }, minItems: 1 },
-              { type: 'string' },
-              { type: 'number' },
-            ],
-          },
         },
-        anyOf: [{ required: ['documents'] }, { required: ['documentIds'] }],
+        required: ['documents'],
       },
     },
   }, async (request, reply) => {
@@ -1028,15 +1019,6 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       const workspace = await getWorkspaceInstance(request, reply);
       if (!workspace) return reply;
 
-      // `documentIds` used to be accepted here and handed straight to putMany,
-      // which needs parsed documents — it could only ever 500. Point callers at
-      // the route that actually does what they meant.
-      if (request.body.documentIds) {
-        const responseObject = new ResponseObject().badRequest(
-          'PUT updates document content and needs full document bodies in "documents". '
-          + 'To add existing documents to this path use POST with "documentIds"; to remove them use DELETE /documents/remove.');
-        return reply.code(responseObject.statusCode).send(responseObject.getResponse());
-      }
       const itemsToUpdate = Array.isArray(request.body.documents) ? request.body.documents : [request.body.documents];
 
       const { treeType: updateTreeType, selector: updateSelector } = resolveInsertTarget(workspace, request.body, false);
@@ -1121,13 +1103,6 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   });
 
   // ── Purge documents ─────────────────────────────────────────────────────
-
-  // Retire the unsafe querystring contract. Cached clients must fail closed;
-  // new clients use POST and cannot fall back to an older server's DELETE.
-  fastify.delete('/purge', { onRequest: [fastify.authenticate] }, async (_request, reply) => {
-    const r = new ResponseObject().error('Purge requires the updated client with an explicit selection and expected count. Reload the app.', null, 410);
-    return reply.code(r.statusCode).send(r.getResponse());
-  });
 
   const purgeSelectionProps = Object.fromEntries(Object.entries(documentQueryProps)
     .filter(([key]) => !['limit', 'offset', 'page', 'order', 'sortBy', 'debug', 'debugLimit', 'idsOnly'].includes(key))

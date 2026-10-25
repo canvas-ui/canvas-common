@@ -8,13 +8,11 @@ import path from 'path';
 import { EventEmitter } from 'events';
 import { Writable } from 'stream';
 import pino from 'pino';
-import pretty from 'pino-pretty';
 import debugModule from 'debug';
 import { env } from '../env.js';
 
 // Diagnostic mode: retain the last message even if native code crashes or blocks.
 const SYNC_LOGGING = process.env.CANVAS_LOG_SYNC === '1';
-const isDev = process.env.NODE_ENV !== 'production';
 const VALID_LEVELS = new Set(['trace', 'debug', 'info', 'warn', 'error', 'fatal']);
 const MAX_TAIL_LINES = 500;
 const MAX_TAIL_SCAN_LINES = 5000;
@@ -42,7 +40,8 @@ const DEFAULT_LOGGING_CONFIG = {
     console: {
         enabled: true,
         level: null,
-        pretty: null,
+        // 'line': one human-readable line per entry; 'json': raw pino records.
+        format: 'line',
     },
     captureConsole: true,
     captureDebug: true,
@@ -96,7 +95,9 @@ const LOG_LEVEL = normalizeLevel(process.env.LOG_LEVEL || loggingConfig.level ||
 const FILE_LOG_LEVEL = normalizeLevel(loggingConfig.fileLevel, 'trace');
 const CONSOLE_ENABLED = loggingConfig.console?.enabled !== false;
 const CONSOLE_LOG_LEVEL = normalizeLevel(loggingConfig.console?.level || LOG_LEVEL);
-const CONSOLE_PRETTY = loggingConfig.console?.pretty ?? isDev;
+const CONSOLE_FORMAT = loggingConfig.console?.format === 'json' ? 'json' : 'line';
+// A workspace child tags every entry with its workspace (WorkspaceProcess sets this).
+const PROCESS_WORKSPACE = process.env.CANVAS_WORKSPACE_NAME || null;
 
 /**
  * Level helpers
@@ -299,6 +300,90 @@ class BroadcastStream extends Writable {
     }
 }
 
+/**
+ * Console line format:
+ *   time | LEVEL | workspace | subsystem | message key=value …
+ * Request lines put the request first; errors add their stack below.
+ */
+
+const workspaceNames = new Map();
+
+/** Lets console lines name a workspace that is only referenced by id. */
+export function nameWorkspaceInLogs(id, name) {
+    if (id && name) { workspaceNames.set(id, name); }
+}
+
+const LINE_OMIT = new Set([
+    'time', 'level', 'msg', 'module', 'name', 'service', 'pid', 'hostname',
+    'workspace', 'workspaceName', 'workspaceId', 'reqId', 'req', 'res',
+    'responseTime', 'method', 'url', 'statusCode', 'durationMs', 'err',
+]);
+const LEVEL_COLORS = { trace: 90, debug: 36, info: 32, warn: 33, error: 31, fatal: 35 };
+
+function localTime(iso) {
+    const d = iso ? new Date(iso) : new Date();
+    const pad = (n, w = 2) => String(n).padStart(w, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+}
+
+function workspaceLabel(data) {
+    const named = data.workspace || data.workspaceName;
+    if (named) { return String(named); }
+    if (!data.workspaceId) { return '-'; }
+    return workspaceNames.get(data.workspaceId) || String(data.workspaceId).slice(0, 8);
+}
+
+function requestLabel(data) {
+    const method = data.method || data.req?.method;
+    const url = data.url || data.req?.url;
+    if (!method && !url) { return ''; }
+    const status = data.statusCode ?? data.res?.statusCode;
+    const ms = data.durationMs ?? data.responseTime;
+    return [data.reqId, method, url, status != null ? `→ ${status}` : null, ms != null ? `${Math.round(ms)}ms` : null]
+        .filter(Boolean).join(' ');
+}
+
+function formatValue(value) {
+    if (typeof value === 'string') { return /\s/.test(value) ? JSON.stringify(value) : value; }
+    return JSON.stringify(value);
+}
+
+export function formatConsoleLine(data, { color = false } = {}) {
+    const label = getLevelLabel(data.level);
+    const level = label.toUpperCase().padEnd(5);
+    const request = requestLabel(data);
+    const fields = Object.entries(data)
+        .filter(([key, value]) => !LINE_OMIT.has(key) && value !== undefined)
+        .map(([key, value]) => `${key}=${formatValue(value)}`);
+    const err = data.err;
+    const message = [request, data.msg, err?.message && err.message !== data.msg ? err.message : null, ...fields]
+        .filter(Boolean).join(' ');
+    const line = [
+        localTime(data.time),
+        color ? `\u001b[${LEVEL_COLORS[label] || 0}m${level}\u001b[0m` : level,
+        workspaceLabel(data),
+        data.module || data.name || '-',
+        message,
+    ].join(' | ');
+    const stack = err?.stack && getLevelValue(data.level) >= LOG_LEVEL_VALUES.error
+        ? `\n${String(err.stack).split('\n').map(l => `    ${l.trim()}`).join('\n')}` : '';
+    return line + stack;
+}
+
+class ConsoleLineStream extends Writable {
+    #color = Boolean(process.stdout.isTTY);
+
+    _write(chunk, encoding, callback) {
+        for (const raw of chunk.toString('utf8').split('\n')) {
+            if (!raw.trim()) { continue; }
+            let data;
+            try { data = JSON.parse(raw); } catch { process.stdout.write(`${raw}\n`); continue; }
+            process.stdout.write(`${formatConsoleLine(data, { color: this.#color })}\n`);
+        }
+        callback();
+    }
+}
+
 function buildStreams() {
     const streams = [
         { level: FILE_LOG_LEVEL, stream: new BroadcastStream() },
@@ -308,13 +393,8 @@ function buildStreams() {
     if (CONSOLE_ENABLED) {
         streams.push({
             level: CONSOLE_LOG_LEVEL,
-            stream: CONSOLE_PRETTY
-                ? pretty({
-                    colorize: true,
-                    translateTime: 'SYS:standard',
-                    ignore: 'pid,hostname,service',
-                    sync: SYNC_LOGGING,
-                })
+            stream: CONSOLE_FORMAT === 'line'
+                ? new ConsoleLineStream()
                 : pino.destination({ dest: 1, sync: SYNC_LOGGING }),
         });
     }
@@ -326,6 +406,7 @@ export const logger = pino({
     name: 'canvas-server',
     base: {
         service: 'canvas-server',
+        ...(PROCESS_WORKSPACE ? { workspace: PROCESS_WORKSPACE } : {}),
     },
     timestamp: pino.stdTimeFunctions.isoTime,
     level: LOG_LEVEL,
@@ -484,7 +565,7 @@ export function getLoggingConfig() {
         console: {
             enabled: CONSOLE_ENABLED,
             level: CONSOLE_LOG_LEVEL,
-            pretty: CONSOLE_PRETTY,
+            format: CONSOLE_FORMAT,
         },
         captureConsole: loggingConfig.captureConsole !== false,
         captureDebug: loggingConfig.captureDebug !== false,

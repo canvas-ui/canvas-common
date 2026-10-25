@@ -3,10 +3,10 @@
 import path from 'path';
 import {
     applyBodyToDoc, collectDocuments, docEntries, docName, fileDocumentFromBlob, fileEntry,
-    findDocumentByName, httpError, inferDocFromFile, LIST_BUDGET, localDocumentIds, norm,
+    findDocumentByName, httpError, inferDocFromFile, LIST_BUDGET, norm,
     renamedRecord, resolveDocContent,
 } from './vfs-shared.js';
-import Workspace from '../../core/workspace/Workspace.js';
+import Workspace from '../../runtimes/workspace/Workspace.js';
 import { createLogger } from '../../utils/log.js';
 
 const logger = createLogger('webdav');
@@ -270,20 +270,14 @@ export default class TreeFS {
     }
 
     // Which of the documents listed here are actually FILED here — the rest are
-    // showing through from paths below (a context path is AND(layers), so a
+    // showing through from deeper paths (a context path is AND(layers), so a
     // document at /a/b/c is listed at /a/b and /a too). Decides who keeps the
     // plain filename when two of them answer to the same name; see docEntries.
+    // Directory trees are node-exact already: everything listed is filed here.
     async #localIds(treePath) {
-        return localDocumentIds(
-            (not) => this.#ws.list({
-                context: { tree: this.#tree.id, path: norm(treePath) },
-                paths: { not },
-                idsOnly: true,
-                limit: LIST_BUDGET,
-            }),
-            this.#tree,
-            treePath,
-        );
+        if (this.#tree.type !== 'context') { return null; }
+        const ids = await this.#ws.list({ context: { tree: this.#tree.id, path: norm(treePath), currentPathOnly: true }, idsOnly: true, limit: LIST_BUDGET });
+        return new Set((Array.isArray(ids) ? ids : []).map(Number));
     }
 
     // Write target selector: context trees tick layer bitmaps, directory trees

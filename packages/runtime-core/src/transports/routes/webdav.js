@@ -1,4 +1,4 @@
-import { workspaceStopped, workspaceErrorResponse } from '../../core/workspace/runtime/errors.js';
+import { workspaceStopped, workspaceErrorResponse } from '../../runtimes/workspace/runtime/errors.js';
 'use strict';
 
 import { parseBasicAuth, looksLikeToken } from '../lib/basic-auth.js';
@@ -7,6 +7,7 @@ import { WebDAVHandler } from '../webdav/server.js';
 import ResponseObject from '../ResponseObject.js';
 import { createLogger } from '../../utils/log.js';
 import { throttleKey, isThrottled, recordFailure, clearFailures } from '../lib/basic-auth-throttle.js';
+import { env } from '../../env.js';
 
 const logger = createLogger('webdav:routes');
 
@@ -16,8 +17,17 @@ const DAV_METHODS = ['GET', 'HEAD', 'PUT', 'DELETE', 'PROPFIND', 'PROPPATCH', 'M
 /**
  * WebDAV Routes — provides DAV protocol access to workspace /home folders.
  * Route: /workspaces/:workspace/dav[/*]
+ *
+ * Options:
+ * - `identify(request, reply)`: sets `request.user` (and `request.resourceToken`
+ *   for a bound token). Defaults to the hub's Basic/Bearer authentication; a
+ *   workspace runtime passes its own token check.
+ * - `forward(request, reply, workspace, access)`: resolves true when it served
+ *   the request elsewhere (the hub streams it to a workspace child).
+ * - `trustPrefixHeader`: take the mount path the client sees from
+ *   `x-canvas-dav-prefix` (a runtime behind a hub that forwards to it).
  */
-export default async function webdavRoutes(fastify) {
+export default async function webdavRoutes(fastify, { identify = null, forward = null, trustPrefixHeader = false } = {}) {
   // ── WebDAV handler wired to workspace resolution ────────────────────────
 
   const handler = new WebDAVHandler(async (userId, workspace) => {
@@ -40,14 +50,12 @@ export default async function webdavRoutes(fastify) {
   // Keep request bodies as streams for all DAV methods. XML bodies are
   // explicitly drained/limited in the handler methods that use them.
 
-  const FILE_LIMIT = 8 * 1024 * 1024 * 1024; // 8GB
-
   fastify.removeAllContentTypeParsers();
-  fastify.addContentTypeParser('*', { bodyLimit: FILE_LIMIT }, (_req, payload, done) => done(null, payload));
+  fastify.addContentTypeParser('*', { bodyLimit: env.uploads.maxBytes }, (_req, payload, done) => done(null, payload));
 
   // ── Auth preHandler (shared by all DAV routes) ──────────────────────────
 
-  async function authenticate(request, reply) {
+  async function hubIdentify(request, reply) {
     const authHeader = request.headers.authorization;
 
     if (!authHeader) {
@@ -100,7 +108,11 @@ export default async function webdavRoutes(fastify) {
       }
       request.user = result.user;
     }
+  }
 
+  async function authenticate(request, reply) {
+    await (identify || hubIdentify)(request, reply);
+    if (reply.sent) return reply;
     if (!request.user) {
       return reply.code(401).send(new ResponseObject().unauthorized('Authentication failed').getResponse());
     }
@@ -117,13 +129,11 @@ export default async function webdavRoutes(fastify) {
       return reply.code(404).send(new ResponseObject().notFound('Workspace not found').getResponse());
     }
 
-    if (!ws.isServiceEnabled('home')) {
-      return reply.code(403).send(new ResponseObject().forbidden('WebDAV is not enabled for this workspace').getResponse());
-    }
-
-    // Owner, or an e-mail / group member (resolved by the manager); a
-    // read-only member may PROPFIND/GET but not write.
-    const access = await fastify.workspaceManager.resolveWorkspaceAccess(workspaceId, request.user.id);
+    // Owner, or an e-mail / group member (resolved by the manager), or a token
+    // bound to this workspace; a read-only grant may PROPFIND/GET but not write.
+    const access = request.resourceToken
+      ? { isOwner: false, permissions: request.resourceToken.permissions || [] }
+      : await fastify.workspaceManager.resolveWorkspaceAccess(workspaceId, request.user.id);
     if (!access) {
       return reply.code(403).send(new ResponseObject().forbidden('Access denied').getResponse());
     }
@@ -131,6 +141,8 @@ export default async function webdavRoutes(fastify) {
     if (!access.isOwner && !access.permissions.includes(required)) {
       return reply.code(403).send(new ResponseObject().forbidden('This workspace is shared with you read-only').getResponse());
     }
+    request.davWorkspace = ws;
+    request.davAccess = access;
   }
 
   // ── Route registration ──────────────────────────────────────────────────
@@ -153,20 +165,25 @@ export default async function webdavRoutes(fastify) {
     fastify.route({
       method: DAV_METHODS,
       url,
-      bodyLimit: 8589934592, // 8GB
+      bodyLimit: env.uploads.maxBytes,
       preHandler: authenticate,
       handler: async (request, reply) => {
-        const workspaceId = fastify.workspaceManager.resolveWorkspaceId(request.user.id, request.params.workspace);
-        const workspace = workspaceId && await fastify.workspaceManager.getWorkspace(workspaceId, request.user.id);
-        if (workspace?.isActive === false) return reply.code(423).send(workspaceErrorResponse(workspaceStopped(workspace)));
+        const workspace = request.davWorkspace;
+        if (workspace.isActive === false) return reply.code(423).send(workspaceErrorResponse(workspaceStopped(workspace)));
+        if (forward && await forward(request, reply, workspace, request.davAccess)) return reply;
+        if (!workspace.isServiceEnabled('webdav')) {
+          return reply.code(403).send(new ResponseObject().forbidden('WebDAV is not enabled for this workspace').getResponse());
+        }
+        const mountedAt = trustPrefixHeader ? request.headers['x-canvas-dav-prefix'] : null;
         reply.hijack();
         await handler.handle(reply.raw, {
           method: request.method,
-          url: request.url,
+          url: mountedAt ? request.url.replace(/^\/workspaces\/[^/?]+\/dav/, () => mountedAt) : request.url,
           headers: request.headers,
           body: request.body,
           userId: request.user.id,
           workspace: request.params.workspace,
+          prefix: mountedAt || undefined,
         });
       },
     });

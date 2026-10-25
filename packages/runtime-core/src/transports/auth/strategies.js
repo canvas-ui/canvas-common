@@ -1,4 +1,3 @@
-import { validateUser } from '@augmentd-labs/canvas-agent-runtime/transports/auth/validate-user.js';
 'use strict';
 
 import authService from './service.js';
@@ -20,6 +19,7 @@ export { authService, imapAuthStrategy, ldapAuthStrategy };
  */
 const InvalidTokenError = createError('ERR_INVALID_TOKEN', 'Invalid or expired token', 401);
 const InvalidCredentialsError = createError('ERR_INVALID_CREDENTIALS', 'Invalid credentials', 401);
+const UserValidationError = createError('ERR_USER_VALIDATION', 'User validation failed', 401);
 const logger = createLogger('auth');
 
 /**
@@ -29,7 +29,62 @@ const logger = createLogger('auth');
  * @returns {Object} - Validated user object
  * @throws {Error} - If validation fails
  */
-export { validateUser } from '@augmentd-labs/canvas-agent-runtime/transports/auth/validate-user.js';
+export function validateUser(user, requiredProps = ['id', 'name', 'email']) {
+  // Check if user exists
+  if (!user) {
+    throw new UserValidationError('User not found');
+  }
+
+  if (typeof user !== 'object') {
+    throw new UserValidationError(`User is not an object, received ${typeof user}`);
+  }
+
+  // Check required properties
+  const missingProps = [];
+  for (const prop of requiredProps) {
+    if (user[prop] === undefined || user[prop] === null || user[prop] === '') {
+      missingProps.push(prop);
+    }
+  }
+
+  if (missingProps.length > 0) {
+    throw new UserValidationError(`User missing required properties: ${missingProps.join(', ')}`);
+  }
+
+  // Don't attempt to modify the user object directly, as some properties may be read-only
+  // Instead, return a plain JavaScript object with the validated properties
+  const validatedUser = {};
+
+  // Copy all enumerable properties from the user object
+  for (const prop in user) {
+    if (Object.prototype.hasOwnProperty.call(user, prop)) {
+      // For email, store lowercase version
+      if (prop === 'email' && typeof user[prop] === 'string') {
+        validatedUser[prop] = user[prop].toLowerCase();
+      } else {
+        validatedUser[prop] = user[prop];
+      }
+    }
+  }
+
+  // Ensure all required properties are copied
+  for (const prop of requiredProps) {
+    if (!(prop in validatedUser)) {
+      validatedUser[prop] = user[prop];
+    }
+  }
+
+  // If the original object is a class instance with methods, preserve important non-enumerable methods
+  // by attaching them to our plain object (if accessible via getters)
+  const methodsToPreserve = ['save', 'delete', 'update', 'toJSON'];
+  for (const method of methodsToPreserve) {
+    if (typeof user[method] === 'function') {
+      validatedUser[method] = user[method].bind(user);
+    }
+  }
+
+  return validatedUser;
+}
 
 function getAppKey(request, fallback = 'unknown') {
   return String(request.headers['x-app-name'] || '').trim() || fallback;
@@ -68,19 +123,35 @@ function buildClientIdentity(request, options = {}) {
   };
 }
 
+// A device's lastSeen is refreshed at most this often (it is a file write).
+const LAST_SEEN_MS = 60_000;
+
+/**
+ * Add what the account's device registry knows about the calling device
+ * (name, os, type) and keep its lastSeen fresh. A device token whose record
+ * is missing gets one. `deviceName` is set only for devices the registry knows.
+ */
 async function enrichClientIdentity(request, userId, client = {}) {
-  if (!client?.deviceId || !client.registeredDevice || !request.server?.deviceRegistry || !userId) {
+  const registry = request.server?.deviceRegistry;
+  if (!client?.deviceId || !client.registeredDevice || !registry || !userId) {
     return client;
   }
 
   try {
-    const device = await request.server.deviceRegistry.getDevice(userId, client.deviceId);
+    let device = await registry.getDevice(userId, client.deviceId);
+    if (!device && client.authMode === 'device') {
+      device = await registry.upsertDevice(userId, { deviceId: client.deviceId, name: client.deviceId, platform: client.deviceOs, type: client.deviceType || 'device' });
+    }
     if (!device) {
       return client;
+    }
+    if (!device.lastSeen || Date.now() - Date.parse(device.lastSeen) > LAST_SEEN_MS) {
+      await registry.touchDevice(userId, client.deviceId, {});
     }
 
     return {
       ...client,
+      deviceName: device.name,
       ...(normalizeDeviceOs(device.platform || device.os) ? { deviceOs: normalizeDeviceOs(device.platform || device.os) } : {}),
       ...(normalizeDeviceType(device.type) ? { deviceType: normalizeDeviceType(device.type) } : {}),
     };
@@ -600,6 +671,10 @@ export async function login(email, password, userManager, strategy = 'auto') {
 
     logger.info({ userId: user.id, email, strategy: 'local' }, 'Login succeeded');
     return { user, authMethod: 'local' };
+  }
+
+  if (strategy === 'google') {
+    throw new InvalidCredentialsError('This account signs in with Google — use the "Sign in with Google" button');
   }
 
   throw new InvalidCredentialsError('No valid authentication method found');

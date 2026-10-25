@@ -1,4 +1,4 @@
-import { workspaceErrorResponse } from '../../../core/workspace/runtime/errors.js';
+import { workspaceErrorResponse } from '../../../runtimes/workspace/runtime/errors.js';
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
@@ -212,6 +212,56 @@ export default async function workspaceLifecycleRoutes(fastify, _options) {
       const responseObject = new ResponseObject().serverError('Failed to get database stats');
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     }
+  });
+
+  // Index maintenance, owner/admin only. All idempotent and safe on the live
+  // workspace: rebuild crud timelines or per-MIME bitmaps from stored
+  // documents, backfill the full-text (BM25) index (`?rebuild=true` wipes the
+  // table and its coverage bitmap first, for a drifted index), or compact and
+  // prune Lance tables and rebuild their ANN indexes (`space`: 'fts', a vector
+  // space, or omitted for all). Embeddings are /inferd/reindex.
+  const maintenance = (path, schema, run) => fastify.post(path, {
+    onRequest: [fastify.authenticate, requireWorkspaceAdmin()],
+    schema: { params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } }, ...schema },
+  }, async (request, reply) => {
+    try {
+      const workspace = request.workspace;
+      if (!workspace.isActive) {
+        const r = new ResponseObject().workspaceNotActive();
+        return reply.code(r.statusCode).send(r.getResponse());
+      }
+      const [result, message] = await run(workspace.db, request);
+      const r = new ResponseObject().success(result, message);
+      return reply.code(r.statusCode).send(r.getResponse());
+    } catch (error) {
+      fastify.log.error(error);
+      const r = new ResponseObject().serverError(error.message || 'Index maintenance failed');
+      return reply.code(r.statusCode).send(r.getResponse());
+    }
+  });
+  maintenance('/db/reindex/timelines', {}, async (db) => {
+    const result = await db.reindexCrudTimelines();
+    return [result, `Timelines reindexed: ${result.created} created, ${result.updated} updated (${result.scanned} scanned)`];
+  });
+  maintenance('/db/reindex/mime', {}, async (db) => {
+    const result = await db.reindexMimeBitmaps();
+    return [result, `MIME bitmaps rebuilt: ${result.ticked}/${result.scanned} docs across ${result.keys} type(s)`];
+  });
+  maintenance('/db/reindex/search', {
+    querystring: { type: 'object', properties: { rebuild: { type: 'boolean', default: false } } },
+  }, async (db, request) => {
+    const result = await db.reindexSearchIndex({ rebuild: request.query.rebuild === true });
+    return [result, `FTS reindex complete: ${result.indexed} newly indexed (${result.alreadyIndexed}/${result.totalDocs} total)`];
+  });
+  maintenance('/db/optimize', {
+    body: { type: 'object', properties: { space: { type: 'string' } }, additionalProperties: false },
+  }, async (db, request) => {
+    const { space = null } = request.body || {};
+    const result = {};
+    if (!space || space === 'fts') result.fts = await db.optimizeLance();
+    if (!space) result.vectors = await db.optimizeVectors();
+    else if (space !== 'fts') result.vectors = await db.optimizeVectors(space);
+    return [result, `Optimize complete${space ? ` (${space})` : ''}`];
   });
 
   // Live-tune search knobs (image relevance floor + hybrid RRF fusion weights).

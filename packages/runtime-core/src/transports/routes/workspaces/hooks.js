@@ -1,16 +1,17 @@
+import { isRuleFile, transformRuleFile, mapRulePaths, rulePathMapper } from '../../../runtimes/workspace/services/hooks/rule-paths.js';
 'use strict';
 
-import { discoverBackfillDocuments } from '../../../core/workspace/services/hook/backfill.js';
+import { discoverBackfillDocuments } from '../../../runtimes/workspace/services/hooks/backfill.js';
 
 import path from 'path';
 import crypto from 'crypto';
 import { promises as fs } from 'fs';
 import ResponseObject from '../../ResponseObject.js';
 import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
-import { HOOK_EVENTS, HOOK_ACTIONS, CLASSIFIER_SURFACE, HOOK_CONTEXT_API, generateHookSkeleton } from '../../../core/workspace/services/hook/meta.js';
-import { resolveRuleFiles, loadRuleFile, explainRule } from '../../../core/workspace/services/hook/rules.js';
-import { resolveHookFiles } from '../../../core/workspace/services/hook/files.js';
-import { classifyDocument, normalizeSchemaId } from '../../../core/workspace/documents/classifier.js';
+import { HOOK_EVENTS, HOOK_ACTIONS, CLASSIFIER_SURFACE, HOOK_CONTEXT_API, generateHookSkeleton } from '../../../runtimes/workspace/services/hooks/meta.js';
+import { resolveRuleFiles, loadRuleFile, explainRule } from '../../../runtimes/workspace/services/hooks/rules.js';
+import { resolveHookFiles } from '../../../runtimes/workspace/services/hooks/files.js';
+import { classifyDocument, normalizeSchemaId } from '../../../runtimes/workspace/db/classifier.js';
 
 // Hard ceiling on one backfill request; the webui's "Batch size" knob goes up to this.
 const BACKFILL_MAX_LIMIT = 10000;
@@ -103,9 +104,8 @@ async function listHookFiles(basePath) {
 }
 
 async function commitHooks(fastify, request, message) {
-  if (!fastify.dotfileManager?.commitHooks) { return; }
   try {
-    await fastify.dotfileManager.commitHooks(request.workspace, message, request.user?.id);
+    await request.workspace.dotfiles.commitHooks(message);
   } catch (error) {
     request.log.debug(`Hook git commit skipped: ${error.message}`);
   }
@@ -117,10 +117,9 @@ export default async function workspaceHooksRoutes(fastify) {
   }, async (request, reply) => {
     try {
       await fs.mkdir(request.workspace.hooksPath, { recursive: true });
-      // Lazily backfill seed examples a pre-existing workspace never received
-      // (seeding otherwise only happens on git-repo initialization).
-      await fastify.dotfileManager?.backfillSeed?.(request.workspace, request.user?.id)
-        ?.catch((error) => request.log.debug(`Seed backfill skipped: ${error.message}`));
+      // Lazily sync seed examples shipped after the repo was initialized.
+      await request.workspace.dotfiles.backfillSeed()
+        .catch((error) => request.log.debug(`Seed backfill skipped: ${error.message}`));
       const files = await listHookFiles(request.workspace.hooksPath);
       const response = new ResponseObject().found(files, 'Workspace hooks retrieved successfully', 200, files.length);
       return reply.code(response.statusCode).send(response.getResponse());
@@ -220,7 +219,7 @@ export default async function workspaceHooksRoutes(fastify) {
     },
   }, async (request, reply) => {
     try {
-      const runLog = fastify.workspaceManager?.hookService?.runLogFor(request.workspace);
+      const runLog = request.workspace.hooks.runLog;
       if (!runLog) {
         const response = new ResponseObject().serverError('Hook service unavailable');
         return reply.code(response.statusCode).send(response.getResponse());
@@ -245,7 +244,7 @@ export default async function workspaceHooksRoutes(fastify) {
     schema: { params: { type: 'object', required: ['runId'], properties: { runId: { type: 'string' } } } },
   }, async (request, reply) => {
     try {
-      const runLog = fastify.workspaceManager?.hookService?.runLogFor(request.workspace);
+      const runLog = request.workspace.hooks.runLog;
       if (!runLog) {
         const response = new ResponseObject().serverError('Hook service unavailable');
         return reply.code(response.statusCode).send(response.getResponse());
@@ -280,13 +279,15 @@ export default async function workspaceHooksRoutes(fastify) {
     },
   }, async (request, reply) => {
     try {
-      const store = fastify.workspaceManager?.hookService?.pendingFor(request.workspace);
+      const store = request.workspace.hooks.pending;
       if (!store) {
         const response = new ResponseObject().serverError('Hook service unavailable');
         return reply.code(response.statusCode).send(response.getResponse());
       }
       const { status, handler, limit } = request.query || {};
-      const actions = await store.query({ status, handler, limit });
+      const storedActions = await store.query({ status, handler, limit });
+      const transform = rulePathMapper(request.workspace, 'decode');
+      const actions = storedActions.map(record => ({ ...record, actions: mapRulePaths({ then: record.actions }, transform).then }));
       const response = new ResponseObject().found(actions, 'Pending actions retrieved successfully', 200, actions.length);
       return reply.code(response.statusCode).send(response.getResponse());
     } catch (error) {
@@ -300,8 +301,9 @@ export default async function workspaceHooksRoutes(fastify) {
     onRequest: [fastify.authenticate, requireWorkspaceRead()],
   }, async (request, reply) => {
     try {
-      const store = fastify.workspaceManager?.hookService?.pendingFor(request.workspace);
-      const record = await store?.get(request.params.actionId);
+      const store = request.workspace.hooks.pending;
+      const stored = await store?.get(request.params.actionId);
+      const record = stored ? { ...stored, actions: mapRulePaths({ then: stored.actions }, rulePathMapper(request.workspace, 'decode')).then } : null;
       if (!record) {
         const response = new ResponseObject().notFound(`Pending action ${request.params.actionId} not found`);
         return reply.code(response.statusCode).send(response.getResponse());
@@ -344,11 +346,7 @@ export default async function workspaceHooksRoutes(fastify) {
     },
   }, async (request, reply) => {
     try {
-      const hookService = fastify.workspaceManager?.hookService;
-      if (!hookService) {
-        const response = new ResponseObject().serverError('Hook service unavailable');
-        return reply.code(response.statusCode).send(response.getResponse());
-      }
+      const hookService = request.workspace.hooks;
 
       const { approve = [], decline = [] } = request.body || {};
       const decidedBy = request.user?.id ?? null;
@@ -358,7 +356,7 @@ export default async function workspaceHooksRoutes(fastify) {
         const actionId = typeof entry === 'string' ? entry : entry.actionId;
         const amend = typeof entry === 'object' && entry.amend ? entry.amend : null;
         try {
-          const record = await hookService.decidePending(request.workspace, actionId, { decision: 'approve', amend, decidedBy });
+          const record = await hookService.decidePending(actionId, { decision: 'approve', amend, decidedBy });
           results.push({ actionId, status: record?.status ?? 'approved', result: record?.result ?? null });
         } catch (error) {
           results.push({ actionId, status: 'error', error: error.message });
@@ -366,7 +364,7 @@ export default async function workspaceHooksRoutes(fastify) {
       }
       for (const actionId of decline) {
         try {
-          const record = await hookService.decidePending(request.workspace, actionId, { decision: 'decline', decidedBy });
+          const record = await hookService.decidePending(actionId, { decision: 'decline', decidedBy });
           results.push({ actionId, status: record?.status ?? 'declined' });
         } catch (error) {
           results.push({ actionId, status: 'error', error: error.message });
@@ -433,7 +431,7 @@ export default async function workspaceHooksRoutes(fastify) {
 
       const rules = [];
       for (const filePath of resolveRuleFiles(request.workspace.hooksPath)) {
-        for (const rule of loadRuleFile(filePath, null, request.log)) {
+        for (const rule of loadRuleFile(filePath, null, request.log, request.workspace)) {
           const explained = explainRule(rule, event, classification);
           rules.push({ id: rule.id || '?', description: rule.description, cascade: rule.cascade === true, ...explained });
         }
@@ -485,11 +483,7 @@ export default async function workspaceHooksRoutes(fastify) {
   }, async (request, reply) => {
     try {
       const { hookFile, event, payload = {} } = request.body || {};
-      const hookService = fastify.workspaceManager?.hookService;
-      if (!hookService) {
-        const response = new ResponseObject().serverError('Hook service unavailable');
-        return reply.code(response.statusCode).send(response.getResponse());
-      }
+      const hookService = request.workspace.hooks;
       const boundEvent = hookFile.includes('/') ? hookFile.split('/')[0] : hookFile.replace(/\.js$/, '');
       const eventName = event || boundEvent || 'manual';
       const envelope = {
@@ -502,11 +496,11 @@ export default async function workspaceHooksRoutes(fastify) {
       };
       const t0 = Date.now();
       const outcome = await hookService.runTargeted(
-        request.workspace, { hookFile }, eventName, envelope, { trigger: 'manual' },
+        { hookFile }, eventName, envelope, { trigger: 'manual' },
       );
       // runTargeted swallows hook errors into the run log; surface the latest
       // record so the caller gets ok/error without a second round trip.
-      const runs = await hookService.runLogFor(request.workspace)?.query({ limit: 1, handler: hookFile }).catch(() => []);
+      const runs = await hookService.runLog?.query({ limit: 1, handler: hookFile }).catch(() => []);
       const run = Array.isArray(runs) && runs[0] && new Date(runs[0].ts).getTime() >= t0 - 1000 ? runs[0] : null;
       const response = new ResponseObject().success({
         target: { hookFile }, event: eventName, ...outcome,
@@ -552,15 +546,11 @@ export default async function workspaceHooksRoutes(fastify) {
         return reply.code(response.statusCode).send(response.getResponse());
       }
 
-      const hookService = fastify.workspaceManager?.hookService;
-      if (!hookService) {
-        const response = new ResponseObject().serverError('Hook service unavailable');
-        return reply.code(response.statusCode).send(response.getResponse());
-      }
+      const hookService = request.workspace.hooks;
 
       let rule = null;
       if (ruleId) {
-        rule = hookService.findRule(request.workspace, ruleId);
+        rule = hookService.findRule(ruleId);
         if (!rule) {
           const response = new ResponseObject().notFound(`Rule "${ruleId}" not found`);
           return reply.code(response.statusCode).send(response.getResponse());
@@ -649,7 +639,6 @@ export default async function workspaceHooksRoutes(fastify) {
         }
 
         const outcome = await hookService.runTargeted(
-          request.workspace,
           ruleId ? { ruleId } : { hookFile },
           event,
           payload,
@@ -686,7 +675,7 @@ export default async function workspaceHooksRoutes(fastify) {
     onRequest: [fastify.authenticate, requireWorkspaceWrite()],
   }, async (request, reply) => {
     try {
-      const hookService = fastify.workspaceManager?.hookService;
+      const hookService = request.workspace.hooks;
       const runLog = hookService?.runLogFor(request.workspace);
       if (!runLog) {
         const response = new ResponseObject().serverError('Hook service unavailable');
@@ -726,7 +715,7 @@ export default async function workspaceHooksRoutes(fastify) {
 
       const target = record.handlerType === 'rule' ? { ruleId: record.handler } : { hookFile: record.handler };
       const outcome = await hookService.runTargeted(
-        request.workspace, target, record.replayEnvelope.event, payload, { trigger: 'replay' },
+        target, record.replayEnvelope.event, payload, { trigger: 'replay' },
       );
 
       const response = new ResponseObject().success({
@@ -769,6 +758,10 @@ export default async function workspaceHooksRoutes(fastify) {
           throw error;
         }
       }
+      if (isRuleFile(result.path)) {
+        try { content = transformRuleFile(content, request.workspace, 'decode'); }
+        catch (error) { request.log.debug(`Rule file cannot be rendered: ${error.message}`); }
+      }
       const response = new ResponseObject().found({ path: result.path, content }, 'Workspace hook retrieved successfully');
       return reply.code(response.statusCode).send(response.getResponse());
     } catch (error) {
@@ -801,7 +794,16 @@ export default async function workspaceHooksRoutes(fastify) {
 
       const filePath = path.join(request.workspace.hooksPath, result.path);
       await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.writeFile(filePath, request.body?.content || '', 'utf-8');
+      const content = request.body?.content || '';
+      let stored = content;
+      if (isRuleFile(result.path)) {
+        try { stored = transformRuleFile(content, request.workspace, 'encode'); }
+        catch (error) {
+          const response = new ResponseObject().badRequest(error.message);
+          return reply.code(response.statusCode).send(response.getResponse());
+        }
+      }
+      await fs.writeFile(filePath, stored, 'utf-8');
       await commitHooks(fastify, request, `Update hook ${result.path}`);
 
       const response = new ResponseObject().success({ path: result.path }, 'Workspace hook saved successfully');

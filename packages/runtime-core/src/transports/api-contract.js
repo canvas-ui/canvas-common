@@ -10,12 +10,20 @@ import contextRoutes from './routes/contexts/index.js';
  * a bare canvas-edge instance that provides its own implementations.
  */
 
+/**
+ * Version of the REST/ws contract, reported on /rest/v2/ping by the hub and
+ * by every runtime host. `major` is the URL prefix (/rest/v2). `minor` goes up
+ * whenever a route, field or meaning changes, so a client (web, CLI, fuse, a
+ * runtime attaching to a hub) can check `major === 2 && minor >= N` instead of
+ * guessing from package versions. Bump it in the change that alters the contract.
+ */
+export const API_VERSION = Object.freeze({ major: 2, minor: 2 });
+
 // Service option keys decorated verbatim onto the instance when present.
 export const SERVICE_DECORATIONS = [
   'users',
   'workspaceManager',
   'contextManager',
-  'dotfileManager',
   'roles',
   'agents',
   'authService',
@@ -24,6 +32,7 @@ export const SERVICE_DECORATIONS = [
   'messaging',
   'chatRouter',
   'voice',
+  'hubKeys',
 ];
 
 // Decorations the workspaces route group requires on its instance.
@@ -33,8 +42,6 @@ export const WORKSPACES_CONTRACT = [
   'authenticate',
   'authenticateClient',
   'workspaceManager',
-  'deviceRegistry',
-  'dotfileManager',
   'contextManager',
   'users',
   'authService',

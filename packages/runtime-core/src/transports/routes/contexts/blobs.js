@@ -1,6 +1,7 @@
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import { env } from '../../../env.js';
 
 // Raw-bytes upload scoped to a context: persists into the backing workspace's
 // blob store (workspace:data), returning a stored://workspace:data/<key>
@@ -11,12 +12,11 @@ import ResponseObject from '../../ResponseObject.js';
 // Goes through Context.persistBlob, not the workspace directly: writing bytes
 // is a write, and it answers to the same ACL the documents route does.
 
-const BLOB_BODY_LIMIT = 21474836480; // 20 GiB — streamed to disk, never buffered
 
 export default async function contextBlobRoutes(fastify) {
   fastify.addContentTypeParser(
     'application/octet-stream',
-    { bodyLimit: BLOB_BODY_LIMIT },
+    { bodyLimit: env.uploads.maxBytes },
     (_req, payload, done) => done(null, payload),
   );
 

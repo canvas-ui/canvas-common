@@ -3,6 +3,7 @@
 import ResponseObject from '../../ResponseObject.js';
 import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
 import { parseByteRange } from '../../lib/http-range.js';
+import { env } from '../../../env.js';
 
 /**
  * Keyed objects on a path-addressed storage backend — the hub side of a
@@ -30,9 +31,6 @@ import { parseByteRange } from '../../lib/http-range.js';
  * the change log with the caller's `X-Canvas-Origin` — the mirror's own
  * device id — so it can tell its echoes from other writers' changes.
  */
-
-// 20 GiB, streamed to disk — never buffered (matches blobs.js).
-const OBJECT_BODY_LIMIT = 21474836480;
 
 const REASON_STATUS = {
     'precondition-failed': [412, 'PRECONDITION_FAILED'],
@@ -347,7 +345,7 @@ async function byteRoutes(fastify) {
     // Whatever the client labels the bytes (image/jpeg, text/plain, json…),
     // hand the RAW stream to the handler: nothing here is a request document.
     fastify.removeAllContentTypeParsers();
-    fastify.addContentTypeParser('*', { bodyLimit: OBJECT_BODY_LIMIT }, (_req, payload, done) => done(null, payload));
+    fastify.addContentTypeParser('*', { bodyLimit: env.uploads.maxBytes }, (_req, payload, done) => done(null, payload));
 
     fastify.put('/:driver/:address/objects/*', {
         onRequest: [fastify.authenticate, requireWorkspaceWrite()],

@@ -3,7 +3,7 @@
 import schemaRegistry from 'canvas-synapsd/src/schemas/SchemaRegistry.js';
 import {
     applyBodyToDoc, collectDocuments, docEntries, docName, fileDocumentFromBlob, fileEntry,
-    findDocumentByName, httpError, inferDocFromFile, LIST_BUDGET, localDocumentIds, norm,
+    findDocumentByName, httpError, inferDocFromFile, LIST_BUDGET, norm,
     renamedRecord, resolveDocContent,
 } from './vfs-shared.js';
 import { createLogger } from '../../utils/log.js';
@@ -226,15 +226,8 @@ export default class VirtualNamedContextFS {
     // Walking from mbag:// to mbag://dc-migration therefore hands the plain
     // name to a different document at each stop, which is what the path means.
     async #localIds() {
-        const tree = this.#ctx.workspace?.getTree?.(this.#ctx.treeId);
-        return localDocumentIds(
-            (not) => this.#ctx.list(this.#ctx.userId, {
-                paths: { not },
-                options: { idsOnly: true, limit: LIST_BUDGET },
-            }),
-            tree,
-            this.#ctx.path || '/',
-        );
+        const ids = await this.#ctx.list(this.#ctx.userId, { currentPathOnly: true, options: { idsOnly: true, limit: LIST_BUDGET } });
+        return new Set((Array.isArray(ids) ? ids : []).map(Number));
     }
 
     #page(schema = null) {

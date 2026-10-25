@@ -5,7 +5,7 @@ import { pipeline } from 'stream/promises';
 import path from 'path';
 import crypto from 'crypto';
 import { createLogger } from '../../utils/log.js';
-import { internalPathMatcher } from '../../core/workspace/configuration/internal-paths.js';
+import { internalPathMatcher } from '../../runtimes/workspace/config/internal-paths.js';
 import TreeFS from './TreeFS.js';
 import { entryIdentity, isClientAbort, matchesEtag, parseRange, streamTo } from './dav-http.js';
 import { collectionIdentity, isClientDropping, norm } from './vfs-shared.js';
@@ -61,7 +61,11 @@ export class WebDAVHandler {
     this._resolve = resolvePath;
   }
 
-  async handle(res, { method, url, headers, body, userId, workspace: workspaceName }) {
+  /**
+   * `prefix` is the mount path the client sees (default
+   * `/workspaces/<workspace>/dav`); `url` and Destination headers are under it.
+   */
+  async handle(res, { method, url, headers, body, userId, workspace: workspaceName, prefix = `/workspaces/${encodeURIComponent(workspaceName)}/dav` }) {
     const resolved = await this._resolve(userId, workspaceName);
     if (!resolved) return send(res, 404, 'Workspace not found');
 
@@ -69,7 +73,6 @@ export class WebDAVHandler {
     const workspace = typeof resolved === 'string' ? null : (resolved.workspace || null);
     const contextManager = typeof resolved === 'string' ? null : (resolved.contextManager || null);
 
-    const prefix = `/workspaces/${encodeURIComponent(workspaceName)}/dav`;
     const decoded = decodeURIComponent(url.split('?')[0]);
     const rel = decoded.startsWith(prefix) ? (decoded.slice(prefix.length) || '/') : '/';
 

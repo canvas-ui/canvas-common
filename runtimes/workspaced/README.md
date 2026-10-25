@@ -55,3 +55,13 @@ canvas runtime detach ./workspace --kind workspace
 The CLI defaults to PM2 background supervision; direct invocation requires PM2 on PATH unless `--foreground` is used. `--no-start` initializes without starting. FUSE can connect directly using the local API URL/token. Detaching removes the hub registration and revokes its device credentials while preserving local data. Hub outages do not interrupt local access.
 
 The Docker template builds from Git using an SSH agent forwarded by BuildKit; it does not copy credentials into the image. Agent/GPU deployment templates live in [the agent package](../agent/deploy/).
+
+## Refreshing the generated runtime
+
+From the sibling canvas-common checkout, run `npm run runtime:refresh` after
+changing canvas-server. `npm run runtime:check` verifies byte-for-byte parity
+and package dependencies. The generator copies the production workspace host's
+module graph and dotfile seeds; edit canvas-server, never the generated files.
+`../canvas-release.sh` runs regeneration with version bumps before releasing apps
+and updates the lockfile. Commit the refreshed private Git runtime separately;
+this step does not publish it to npm or push canvas-common.

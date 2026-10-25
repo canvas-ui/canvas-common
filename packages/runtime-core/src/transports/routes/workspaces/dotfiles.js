@@ -13,7 +13,6 @@ export default async function workspaceDotfilesRoutes(fastify, _options) {
     // Workspace should be resolved by middleware and available at request.workspace
     const workspace = request.workspace;
     const userId = request.user?.id;
-    const requestingUserId = request.user?.id;
 
     if (!workspace) {
       throw new Error('Workspace not resolved by middleware. This indicates a configuration issue.');
@@ -23,7 +22,7 @@ export default async function workspaceDotfilesRoutes(fastify, _options) {
       throw new Error('User not authenticated. This indicates an authentication issue.');
     }
 
-    return { workspace, userId, requestingUserId };
+    return { workspace, userId };
   };
 
   const getContextTreeSelector = (workspace, source = {}, fallbackPath = '/') =>
@@ -243,13 +242,9 @@ export default async function workspaceDotfilesRoutes(fastify, _options) {
     }
     }, async (request, reply) => {
     try {
-      const { workspace, userId, requestingUserId } = extractRequestInfo(request);
+      const { workspace } = extractRequestInfo(request);
 
-      const status = await fastify.dotfileManager.getRepositoryStatus(
-        userId,
-        workspace,
-        requestingUserId
-      );
+      const status = await workspace.dotfiles.status();
 
       const responseObject = new ResponseObject().found(
         status,
@@ -280,13 +275,9 @@ export default async function workspaceDotfilesRoutes(fastify, _options) {
     }
     }, async (request, reply) => {
     try {
-      const { workspace, userId, requestingUserId } = extractRequestInfo(request);
+      const { workspace } = extractRequestInfo(request);
 
-      const result = await fastify.dotfileManager.initializeRepository(
-        userId,
-        workspace,
-        requestingUserId
-      );
+      const result = await workspace.dotfiles.initialize();
 
       const responseObject = new ResponseObject().created(
         result,

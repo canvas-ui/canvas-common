@@ -71,7 +71,7 @@ export default function registerWorkspaceWebSocket(fastify, socket) {
       }
 
       // Every workspace-originated event is stamped with a workspaceId by the
-      // manager (core/workspace/index.js), so a genuinely untagged event can
+      // manager (hub/workspaces/index.js), so a genuinely untagged event can
       // only come from a direct workspaceManager.emit — i.e. the edge relay.
       // Broadcasting it to this socket would bypass the subscription + ACL
       // checks below, so drop it rather than fan it out unconditionally.
@@ -113,11 +113,22 @@ export default function registerWorkspaceWebSocket(fastify, socket) {
 
   // Listen to *all* events.
   workspaceManager.on('**', wildcardListener);
-  listeners.set('workspaceWildcard', wildcardListener);
+  listeners.set('**', wildcardListener);
+
+  // Workspace-list events are scoped to a user, not a workspace. Share-token
+  // sockets are bound to one workspace and never see the list.
+  const scannedListener = (payload) => {
+    if (socket.workspaceBinding || payload?.userId !== socket.user?.id) return;
+    if (!socket.subscriptions?.has?.('workspace')) return;
+    socket.emit('workspaces.scanned', payload);
+    recordSocketEvent('workspaces.scanned');
+  };
+  workspaceManager.on('workspaces.scanned', scannedListener);
+  listeners.set('workspaces.scanned', scannedListener);
 
   // Clean-up on disconnect.
   socket.on('disconnect', () => {
-    listeners.forEach((listener) => workspaceManager.off('**', listener));
+    listeners.forEach((listener, event) => workspaceManager.off(event, listener));
     listeners.clear();
     logger.debug(`Cleaned workspace WS listeners for socket ${socket.id}`);
   });

@@ -4,8 +4,9 @@ import ResponseObject from '../../ResponseObject.js';
 import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
 
 // Device mirrors of this workspace, as reported by the devices themselves.
-// The registry is per user (a device belongs to the account that paired it),
-// so a listing shows the caller's own devices mirroring this workspace.
+// The report lands on the device's Device document in the workspace
+// (runtime db/WorkspaceDevices.js), so every device with access to the
+// workspace (the owner's or a member's) is listed.
 //
 // Replicas (docs/durable-workspaces.md): a status report may carry `applied`
 // — `[[docId, version], …]` the device has verified and fsynced since its last
@@ -24,10 +25,6 @@ export default async function workspaceMirrorRoutes(fastify) {
         if (statusCode >= 500) request.log.error(error);
         return send(reply, new ResponseObject().error(error?.message || 'Internal error', null, statusCode), error?.code || undefined);
     };
-    const registry = () => {
-        if (!fastify.deviceRegistry) throw Object.assign(new Error('Device registry not available'), { statusCode: 503, code: 'NO_DEVICE_REGISTRY' });
-        return fastify.deviceRegistry;
-    };
     const workspaceIdOf = (request) => request.workspace?.id || request.params.id;
 
     const replicaPolicy = (workspace) => {
@@ -39,7 +36,7 @@ export default async function workspaceMirrorRoutes(fastify) {
         onRequest: [fastify.authenticate, requireWorkspaceRead()],
     }, async (request, reply) => {
         try {
-            const mirrors = await registry().listMirrorsForWorkspace(request.user.id, workspaceIdOf(request));
+            const mirrors = await request.workspace.devices.listMirrors();
             const policy = replicaPolicy(request.workspace);
             // Per-replica "versions behind" from the protection walk (bounded;
             // absent when the workspace cannot walk, e.g. a stopped one).
@@ -117,12 +114,7 @@ export default async function workspaceMirrorRoutes(fastify) {
             }
             const { applied, full, ...body } = request.body || {};
             const backend = body.backend || 'workspace:home';
-            const record = await registry().updateMirrorStatus(request.user.id, deviceId, workspaceIdOf(request), {
-                ...body,
-                backend,
-                workspaceName: request.workspace?.name,
-                reportedAt: new Date().toISOString(),
-            });
+            const record = await request.workspace.devices.reportMirror(deviceId, { ...body, backend, reportedAt: new Date().toISOString() });
             // The pairs never land on the device record (thousands of rows):
             // they go to the workspace's replica table.
             let replica = null;
@@ -170,7 +162,7 @@ export default async function workspaceMirrorRoutes(fastify) {
             }
             const sample = Math.min(200, Math.max(0, Number.parseInt(String(request.query?.sample ?? '20'), 10) || 0));
             const backend = String(request.query?.backend || 'workspace:home');
-            const mirrors = await registry().listMirrorsForWorkspace(request.user.id, workspaceIdOf(request)).catch(() => []);
+            const mirrors = await request.workspace.devices.listMirrors().catch(() => []);
             const summary = await request.workspace.replicaProtection(backend, { devices: mirrors.map((m) => m.deviceId), sample });
             return send(reply, new ResponseObject().found({ ...summary, policy: request.workspace.replicas || [] }, 'OK'));
         } catch (error) { return fail(request, reply, error); }
@@ -181,7 +173,7 @@ export default async function workspaceMirrorRoutes(fastify) {
     }, async (request, reply) => {
         try {
             const deviceId = String(request.params.deviceId || '').trim();
-            const removed = await registry().removeMirror(request.user.id, deviceId, workspaceIdOf(request));
+            const removed = await request.workspace.devices.forgetMirror(deviceId);
             // Forgetting the record also drops its evidence and its policy entry.
             if (typeof request.workspace.forgetReplica === 'function') await request.workspace.forgetReplica(deviceId).catch(() => null);
             if (typeof request.workspace.removeReplica === 'function') { try { request.workspace.removeReplica(deviceId); } catch { /* config may be read-only */ } }

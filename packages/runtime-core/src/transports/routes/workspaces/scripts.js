@@ -59,9 +59,8 @@ async function listScriptFiles(basePath) {
 }
 
 async function commitScripts(fastify, request, message) {
-  if (!fastify.dotfileManager?.commitScripts) { return; }
   try {
-    await fastify.dotfileManager.commitScripts(request.workspace, message, request.user?.id);
+    await request.workspace.dotfiles.commitScripts(message);
   } catch (error) {
     request.log.debug(`Script git commit skipped: ${error.message}`);
   }

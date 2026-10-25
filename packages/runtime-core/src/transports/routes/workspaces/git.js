@@ -1,7 +1,7 @@
 'use strict';
 
-import GitRepositories from '../../../core/workspace/services/git/GitRepositories.js';
-import WorkspaceGitRepo from '../../../core/workspace/services/git/WorkspaceGitRepo.js';
+import GitRepositories from '../../../runtimes/workspace/services/git/GitRepositories.js';
+import WorkspaceGitRepo from '../../../runtimes/workspace/services/git/WorkspaceGitRepo.js';
 import { parseBasicAuth } from '../../lib/basic-auth.js';
 import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
 

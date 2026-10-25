@@ -8,7 +8,8 @@ import fs from 'fs';
 import path from 'path';
 import nodemailer from 'nodemailer';
 import { env } from '../../env.js';
-import { userStatePath } from '../../core/user/lib/paths.js';
+import { writePrivateJsonSync } from '../../utils/private-file.js';
+import { userStatePath } from '../../hub/users/lib/paths.js';
 
 import Jim from '../../utils/jim/index.js';
 
@@ -75,15 +76,8 @@ class TokenManager {
    */
   writeTokens(userId, tokens) {
     const tokensPath = this.#getTokensFilePath(userId);
-    const configDir = path.dirname(tokensPath);
-
-    // Ensure config directory exists
-    if (!fs.existsSync(configDir)) {
-      fs.mkdirSync(configDir, { recursive: true });
-    }
-
     try {
-      fs.writeFileSync(tokensPath, JSON.stringify(tokens, null, 2), 'utf8');
+      writePrivateJsonSync(tokensPath, tokens);
     } catch (error) {
       console.error(`[TokenManager] Failed to write tokens for ${userId}:`, error.message);
       throw error;
@@ -212,12 +206,11 @@ class AuthService {
           }
         },
         jwt: {
-          secret: 'your-secure-jwt-secret-here',
           expiresIn: '1d'
         }
       };
 
-      fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), 'utf8');
+      writePrivateJsonSync(configPath, defaultConfig);
       console.log('[AuthService] Default auth configuration created at:', configPath);
     }
 
@@ -260,7 +253,7 @@ class AuthService {
         from: { name: 'Canvas Server', email: 'noreply@example.com' },
         tlsOptions: {}
       };
-      fs.writeFileSync(smtpPath, JSON.stringify(defaultSmtp, null, 2), 'utf8');
+      writePrivateJsonSync(smtpPath, defaultSmtp);
       console.log('[AuthService] Default SMTP configuration created at:', smtpPath);
     }
     try {
@@ -899,11 +892,6 @@ class AuthService {
   generateJWT(user, options = {}) {
     if (!env.auth.jwtSecret) {
       throw new Error('JWT secret key is not configured');
-    }
-
-    // Warn loudly if using the insecure default secret
-    if (env.auth.jwtSecret === 'canvas-jwt-secret-change-in-production') {
-      console.warn('[Security] Insecure default JWT secret is in use. Please set CANVAS_JWT_SECRET or server/config/auth.json');
     }
 
     const payload = {

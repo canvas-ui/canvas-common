@@ -7,12 +7,13 @@ import argv from 'node:process';
 import os from 'os';
 import _crypto from 'crypto';
 import dotenv from 'dotenv';
+import { parseByteSize } from './utils/byte-size.js';
 
 // Runtime
 const SERVER_MODE = argv.argv.slice(2).includes('--user') ? 'user' : 'standalone';
 
 // Root paths
-const SERVER_ROOT = process.env.CANVAS_SERVER_ROOT || process.cwd();
+const SERVER_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 // <repo>/.env, if present. Plain dotenv semantics: variables already in the
 // environment (the shell, the npm script's cross-env, install-local.sh, the
@@ -110,6 +111,17 @@ export const env = {
         // through it, so the container ships with it (see docker-compose.yml).
         defaultLayout: process.env.CANVAS_WORKSPACE_LAYOUT === 'home' ? 'home' : 'full',
 
+        // Every local workspace runs in its own child process
+        // (docs/workspace-runtime-modes.md).
+        process: {
+            // How long a child may take to open its database and report ready.
+            readyMs: Number(process.env.CANVAS_WORKSPACE_PROCESS_READY_MS) || 120_000,
+            // Concurrent child spawns (start storms after a restart).
+            startConcurrency: Number(process.env.CANVAS_WORKSPACE_PROCESS_START_CONCURRENCY) || 2,
+            // Socket directory; see hub/workspaces/process/socket.js.
+            runtimeDir: process.env.CANVAS_RUNTIME_DIR || null,
+        },
+
         // Pulling a workspace from another canvas-server makes THIS server issue
         // requests to a user-supplied URL, so by default only public https hosts
         // are allowed (see utils/ssrf-guard.js). That rules out exactly the case
@@ -122,6 +134,15 @@ export const env = {
         // Shared pull-through cache for bytes read through remote workspace
         // references (content/thumbnails, keyed per remote, deduped by content).
         remoteCacheRoot: process.env.CANVAS_REMOTE_WORKSPACE_CACHE || null,
+    },
+    uploads: {
+        // Largest file one upload may carry (blobs, backend objects, Home,
+        // WebDAV, resumable sessions, archive imports). Bodies stream to disk,
+        // so this caps disk use per request, not memory.
+        // CANVAS_MAX_UPLOAD_SIZE takes bytes or 50G / 500M style units.
+        maxBytes: parseByteSize(process.env.CANVAS_MAX_UPLOAD_SIZE, 50 * 1024 ** 3),
+        // An unfinished resumable upload is dropped after this long untouched.
+        resumableTtlMs: (Number(process.env.CANVAS_RESUMABLE_UPLOAD_TTL_HOURS) || 168) * 3_600_000,
     },
     inferd: {
         // Server-managed embedding service (shared model runtimes, one queue per
@@ -207,8 +228,7 @@ export const env = {
         },
     },
     auth: {
-        // TODO: Use SERVER_HOME/config/auth.json for jwtSecret and tokenExpiry
-        jwtSecret: process.env.CANVAS_JWT_SECRET || 'canvas-jwt-secret-change-in-production', //generateJwtSecret(),
+        jwtSecret: process.env.CANVAS_JWT_SECRET || serverSecret('jwt.secret'),
         tokenExpiry: process.env.CANVAS_JWT_TOKEN_EXPIRY || '7d'
     },
     admin: {
@@ -273,6 +293,30 @@ function readGitCommit() {
         return packed.split('\n').find((line) => line.endsWith(` ${ref}`))?.split(' ')[0] || null;
     } catch {
         return null;
+    }
+}
+
+/**
+ * A secret generated once into `<server home>/config/<name>` (0600) and read
+ * from there afterwards, so sessions survive restarts without a configured
+ * value. Exclusive create keeps one secret when processes race on first boot.
+ */
+function serverSecret(name) {
+    const file = path.join(SERVER_HOME, 'config', name);
+    try {
+        const existing = fs.readFileSync(file, 'utf8').trim();
+        if (existing) return existing;
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+    }
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const secret = _crypto.randomBytes(48).toString('base64');
+    try {
+        fs.writeFileSync(file, secret, { mode: 0o600, flag: 'wx' });
+        return secret;
+    } catch (error) {
+        if (error.code === 'EEXIST') return fs.readFileSync(file, 'utf8').trim();
+        throw error;
     }
 }
 

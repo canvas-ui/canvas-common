@@ -2,7 +2,6 @@
 
 import path from 'path';
 import { createHash } from 'crypto';
-import { localDocumentIds, subtreeExclusions } from '../lib/placement.js';
 
 // ── Schema ↔ extension mapping (writable abstractions) ──────────────────────
 
@@ -541,16 +540,12 @@ export function collectionIdentity(children) {
     return { mtime: new Date(newest), etag: `"c-${hash.digest('hex').slice(0, 20)}"` };
 }
 
-// Placement arithmetic lives in transports/lib/placement.js — the REST
-// listings need the same answer these views do. Re-exported so a virtual FS
-// has one import site for "documents as files".
-export { localDocumentIds, subtreeExclusions };
-
 /**
  * Turn a list of docs into deduplicated file entries (see fileEntry). Name
  * collisions get the doc id appended before the extension.
  *
- * `localIds` (see localDocumentIds) decides WHO KEEPS THE PLAIN NAME when a
+ * `localIds` (the ids filed at this path: a `currentPathOnly` context selector) decides
+ * WHO KEEPS THE PLAIN NAME when a
  * name collides: the document filed at this path, never whichever one the
  * listing happened to reach first. Three `CLAUDE.md` filed at /, /dc-migration
  * and /dc-migration/tasks/foo are all listed at /, and which one was "the"

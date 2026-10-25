@@ -1,4 +1,4 @@
-import { workspaceStopped, workspaceErrorResponse } from '../../../core/workspace/runtime/errors.js';
+import { workspaceStopped, workspaceErrorResponse } from '../../../runtimes/workspace/runtime/errors.js';
 import { allowsStoppedWorkspace } from '../../middleware/workspace-acl.js';
 'use strict';
 
@@ -7,7 +7,7 @@ import { requireWorkspaceRead, requireWorkspaceWrite as _requireWorkspaceWrite, 
 import { enforceAgentBinding } from '../../middleware/agent-acl.js';
 import { validateUser } from '../../auth/strategies.js';
 import { resolveWorkspaceAddress } from '../../middleware/address-resolver.js';
-import { permissionForMethod } from '../../../core/workspace/security/access.js';
+import { requiredPermission } from '../../../runtimes/workspace/security/access.js';
 
 /**
  * Main workspace routes handler for the API
@@ -77,11 +77,9 @@ export default async function workspaceRoutes(fastify, _options) {
   // be stopped here before an unsafe method reaches the handler. Routes
   // guarded by the ACL middleware already carry request.workspaceAccess with
   // the permission checked and are skipped. Search-style POSTs are reads.
-  const READ_POSTS = /\/(search(\/image)?|query|resolve|preview|exports\/ticket|copy-to-workspace)(\/|$)/;
   fastify.addHook('preHandler', async (request, reply) => {
     if (request.workspaceAccess || request.resourceToken || !request.user?.id || !request.params?.id) return;
-    const url = (request.raw?.url || request.url || '').split('?')[0];
-    const required = request.method === 'POST' && READ_POSTS.test(url) ? 'read' : permissionForMethod(request.method);
+    const required = requiredPermission(request.method, request.raw?.url || request.url);
     if (required === 'read') return;
     const identifier = request.params.id;
     const workspaceId = isUuid(identifier) ? identifier : fastify.workspaceManager.resolveWorkspaceId(request.user.id, identifier);
@@ -95,32 +93,16 @@ export default async function workspaceRoutes(fastify, _options) {
     request.workspaceAccess = { permissions: access.permissions, isOwner: false, isMember: true, description: access.description };
   });
 
+  // A known device working with a workspace gets (or refreshes) its Device
+  // document there: it names the device for file:// locations and carries its
+  // device/* bitmaps. `deviceName` is set by the hub's auth (or the hub's
+  // forwarded context) only for devices registered to the account.
   fastify.addHook('preHandler', async (request) => {
     const client = request.client;
-    if (!client?.registeredDevice || !client.deviceId || !request.user?.id || !request.params?.id || !fastify.deviceRegistry) {
-      return;
-    }
-
+    if (!client?.deviceId || !client.deviceName || !request.params?.id) return;
     try {
       const workspace = await resolveWorkspaceForBinding(request);
-      if (!workspace) {
-        return;
-      }
-
-      let device = await fastify.deviceRegistry.touchDevice(request.user.id, client.deviceId);
-      if (!device && client.authMode === 'device') {
-        device = await fastify.deviceRegistry.upsertDevice(request.user.id, {
-          deviceId: client.deviceId,
-          name: client.deviceId,
-          platform: client.deviceOs,
-          type: client.deviceType || 'device',
-        });
-      }
-      if (!device) {
-        return;
-      }
-
-      await fastify.deviceRegistry.ensureWorkspaceBinding(workspace, device);
+      await workspace?.devices?.touch({ deviceId: client.deviceId, name: client.deviceName, platform: client.deviceOs, type: client.deviceType });
     } catch (error) {
       fastify.log.warn({ err: error, deviceId: client.deviceId, workspaceId: request.params?.id }, 'Failed to sync workspace device');
     }
@@ -134,6 +116,10 @@ export default async function workspaceRoutes(fastify, _options) {
   });
   fastify.register(import('./blobs.js'), {
     prefix: '/:id/blobs',
+    onRequest: [resolveWorkspaceAddress]
+  });
+  fastify.register(import('./uploads.js'), {
+    prefix: '/:id/uploads',
     onRequest: [resolveWorkspaceAddress]
   });
   fastify.register(import('./trees.js'), {
@@ -173,6 +159,10 @@ export default async function workspaceRoutes(fastify, _options) {
   });
   fastify.register(import('./hooks.js'), {
     prefix: '/:id/hooks',
+    onRequest: [resolveWorkspaceAddress]
+  });
+  fastify.register(import('./storage-policies.js'), {
+    prefix: '/:id/storage-policies',
     onRequest: [resolveWorkspaceAddress]
   });
   fastify.register(import('./scripts.js'), {
@@ -368,11 +358,8 @@ export default async function workspaceRoutes(fastify, _options) {
       return;
     }
     try {
-      // Adoption rewrites a foreign on-disk workspace's owner to the caller —
-      // a cross-tenant takeover primitive if any authenticated user may do it.
-      // Restrict it to admins; a normal user may only (re)register a path whose
-      // config.owner already matches them (enforced by registerWorkspacePath
-      // when adopt is false).
+      // Adoption outside the caller's Workspaces directory requires an admin.
+      // Normal users may register folders placed in their own Workspaces.
       const isAdmin = (await fastify.users.get(request.user.id))?.userType === 'admin';
       const adopt = isAdmin && request.body.adopt !== false;
       const entry = await fastify.workspaceManager.registerWorkspacePath(
@@ -460,7 +447,7 @@ export default async function workspaceRoutes(fastify, _options) {
   // Update workspace
   fastify.patch('/:id', {
     // allowIndexFallback: config PATCH must work for workspaces that can't be
-    // instantiated (broken/legacy dir) — ownership is checked via the index.
+    // instantiated (broken dir) — ownership is checked via the index.
     onRequest: [fastify.authenticate, resolveWorkspaceAddress, requireWorkspaceAdmin({ allowIndexFallback: true })],
     schema: {
       params: {

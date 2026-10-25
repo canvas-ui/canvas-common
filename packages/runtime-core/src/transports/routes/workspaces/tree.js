@@ -1,8 +1,13 @@
-import { emailListPreview } from '../../../core/workspace/services/mail/content.js';
+import { emailListPreview } from '../../../runtimes/workspace/connectors/imap/content.js';
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
-import { requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
+import { labelBackendTree } from '../../../utils/backend-documents.js';
+import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
+import { ImportJobs } from '../../../runtimes/workspace/portability/import-jobs.js';
+
+const subtreeJobs = new ImportJobs();
+const subtreeImports = new Set();
 
 // The dedicated backends tree mirrors backend storage 1:1. Folder moves must
 // go through storage; purely structural writes cannot create backend folders.
@@ -60,6 +65,68 @@ export default async function workspaceTreeRoutes(fastify) {
     const splat = request.params['*'] || '';
     return `/${splat}`.replace(/\/+/g, '/');
   }
+
+  // A scoped agent cannot export supporting records outside its path binding.
+  // Ordinary owner/member/workspace-token ACLs are checked on every request.
+  function checkSubtreeAccess(request) {
+    if (request.resourceToken?.type === 'agent' && request.resourceToken.basePath && request.resourceToken.basePath !== '/') {
+      throw Object.assign(new Error('Subtree transfers require an unscoped workspace token'), { statusCode: 403 });
+    }
+  }
+
+  function subtreeJobOwner(request, resolved) {
+    return `${request.user.id}:${resolved.workspace.id}:${resolved.tree.id}`;
+  }
+
+  fastify.post('/subtree/export', {
+    onRequest: [fastify.authenticate], preHandler: [requireWorkspaceRead()],
+    schema: { body: { type: 'object', properties: { path: { type: 'string', default: '/' }, dependencies: { type: 'string', enum: ['none', 'related'], default: 'related' } } } },
+  }, async (request, reply) => {
+    try {
+      checkSubtreeAccess(request);
+      const resolved = await getTreeInstance(request, reply);
+      if (!resolved) return;
+      const job = subtreeJobs.start(subtreeJobOwner(request, resolved), report =>
+        resolved.workspace.exportSubtree(resolved.tree.id, request.body.path, { dependencies: request.body.dependencies, report }));
+      return reply.code(202).send(new ResponseObject().success(job, 'Subtree export started').getResponse());
+    } catch (error) {
+      return reply.code(error.statusCode || 500).send({ error: error.message });
+    }
+  });
+
+  fastify.post('/subtree/import', {
+    onRequest: [fastify.authenticate], preHandler: [requireWorkspaceWrite()], bodyLimit: 128 * 1024 * 1024,
+    schema: { body: { type: 'object', required: ['archive'], properties: { archive: { type: 'object', additionalProperties: true }, parentPath: { type: 'string', default: '/' }, name: { type: 'string' } } } },
+  }, async (request, reply) => {
+    try {
+      checkSubtreeAccess(request);
+      const resolved = await getTreeInstance(request, reply);
+      if (!resolved) return;
+      if (isBackendsTree(resolved.workspace, resolved.tree)) return reply.code(400).send({ error: 'Import into a virtual tree, not the backends mirror' });
+      const key = `${resolved.workspace.id}:${resolved.tree.id}`;
+      if (subtreeImports.has(key)) return reply.code(409).send({ error: 'A subtree import is already running in this tree' });
+      subtreeImports.add(key);
+      const job = subtreeJobs.start(subtreeJobOwner(request, resolved), async report => {
+        try { return await resolved.workspace.importSubtree(resolved.tree.id, request.body.archive, { parentPath: request.body.parentPath, name: request.body.name, report }); }
+        finally { subtreeImports.delete(key); }
+      });
+      return reply.code(202).send(new ResponseObject().success(job, 'Subtree import started').getResponse());
+    } catch (error) {
+      return reply.code(error.statusCode || 500).send({ error: error.message });
+    }
+  });
+
+  fastify.get('/subtree/jobs/:jobId', {
+    onRequest: [fastify.authenticate], preHandler: [requireWorkspaceRead()],
+  }, async (request, reply) => {
+    reply.header('Cache-Control', 'private, no-store');
+    checkSubtreeAccess(request);
+    const resolved = await getTreeInstance(request, reply);
+    if (!resolved) return;
+    const job = subtreeJobs.get(subtreeJobOwner(request, resolved), request.params.jobId);
+    if (!job) return reply.code(404).send({ error: 'Subtree job not found' });
+    return new ResponseObject().success(job).getResponse();
+  });
 
   function normalizeTreePath(path) {
     return `/${String(path || '').replace(/^\/+/, '')}`.replace(/\/+/g, '/').replace(/\/$/, '') || '/';
@@ -313,9 +380,14 @@ export default async function workspaceTreeRoutes(fastify) {
       if (!resolved) return;
       const treeView = resolved.tree.buildJsonTree();
       if (isBackendsTree(resolved.workspace, resolved.tree) && typeof resolved.workspace.getBackendTrashTree === 'function') {
+        // A read-only virtual mount. Never insert recovery blobs as ordinary
+        // documents or persist Trash into the physical backend mirror tree.
         treeView.children = [...(treeView.children || []), resolved.workspace.getBackendTrashTree()];
       }
-      const responseObject = new ResponseObject().found(treeView, 'Workspace tree retrieved successfully');
+      const responseObject = new ResponseObject().found(
+        isBackendsTree(resolved.workspace, resolved.tree) ? labelBackendTree(treeView) : treeView,
+        'Workspace tree retrieved successfully',
+      );
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     } catch (error) {
       fastify.log.error(`Get workspace tree error for ID ${request.params.id}: ${error.message}`);
