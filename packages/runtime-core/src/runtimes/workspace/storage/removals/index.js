@@ -1,3 +1,4 @@
+import { availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
 import { randomUUID } from 'node:crypto';
 import { backendIdentity, normalizeRemovalPolicy } from '../removal-policy.js';
 
@@ -86,7 +87,7 @@ export default class WorkspaceTrashOperations {
             if (op.automaticTargets) op.approvedTargets = op.targets.map(address);
             if (op.orphan && op.approvedMembership && !op.membershipApplied) {
                 const doc = await this.#ws.get(op.documentId);
-                if (!doc || identity(doc) !== op.identity || !this.#ownsHold(op) || doc.locations?.length) {
+                if (!doc || identity(doc) !== op.identity || !this.#ownsHold(op) || availableLocations(doc).length) {
                     op.state = 'failed'; op.error = 'The item changed before removal completed; review the current item';
                     await this.#save(op); continue;
                 }
@@ -159,7 +160,7 @@ export default class WorkspaceTrashOperations {
                         const doc = await this.#ws.get(op.documentId);
                         if (!doc || identity(doc) !== op.identity) throw fail('Document identity changed; review the current item');
                         if ((op.membership !== 'keep' || op.targets.length) && !this.#ownsHold(op)) throw fail('A newer filing decision superseded this removal');
-                        if ((doc.locations || []).some(l => op.removedLocations.some(old => old.url === l.url))) {
+                        if (availableLocations(doc).some(l => op.removedLocations.some(old => old.url === l.url))) {
                             await this.#ws.verifyRemovalSource(op);
                             await this.#ws.finishRemovalObservation(op, doc);
                         }
@@ -176,7 +177,7 @@ export default class WorkspaceTrashOperations {
             const doc = await this.#ws.get(op.documentId);
             if (!doc || identity(doc) !== op.identity) throw fail('Document identity changed; review the current item');
             if (!this.#ownsHold(op)) throw fail('The item was explicitly restored, refiled or has a newer removal; this older removal is paused');
-            if ((doc.locations || []).some(l => op.removedLocations.some(old => old.url === l.url))) throw fail('Source location has returned; review the current item');
+            if (availableLocations(doc).some(l => op.removedLocations.some(old => old.url === l.url))) throw fail('Source location has returned; review the current item');
             if (this.#ws.verifyRemovalSource && (!op.orphan || op.approvedTargets?.length)) await this.#ws.verifyRemovalSource(op);
             op.state = 'running'; op.error = null; await this.#save(op);
             if (op.approvedMembership && !op.membershipApplied) {
@@ -193,7 +194,7 @@ export default class WorkspaceTrashOperations {
                 await this.#save(op);
             }
             const remaining = await this.#ws.get(op.documentId);
-            if (remaining && !remaining.locations?.length && !op.membershipApplied && this.#ownsHold(op)) {
+            if (remaining && !availableLocations(remaining).length && !op.membershipApplied && this.#ownsHold(op)) {
                 await this.#ws.trashFromSourceLoss(op.documentId, op.placements, op.id);
                 op.membershipApplied = true; op.orphan = true;
             }

@@ -1,3 +1,4 @@
+import { availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
 import { normalizeBackendsTreePath } from '../../../utils/backend-documents.js';
 import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
 import { deleteDocumentsInBatches } from './bulk-delete.js';
@@ -158,7 +159,7 @@ export default class WorkspaceTrees {
             try {
                 const doc = await this.#workspace.get(id).catch(() => null);
                 if (!doc) { continue; }
-                const urls = (doc.locations || [])
+                const urls = availableLocations(doc)
                     .map((l) => l?.url)
                     .filter((url) => WorkspaceTrees.#locationMatchesBackendScope(url, scope));
                 const res = urls.length > 0

@@ -1,3 +1,4 @@
+import { availableLocations, isAvailableLocation } from 'canvas-synapsd/src/utils/document-locations.js';
 import path from 'path';
 import fs from 'fs/promises';
 import { createReadStream } from 'fs';
@@ -148,7 +149,7 @@ export default class Content {
      */
     async describeLocations(doc) {
         const out = [];
-        for (const loc of (doc?.locations || [])) {
+        for (const loc of availableLocations(doc)) {
             const p = parseLocationUrl(loc?.url);
             let kind = p?.scheme || 'unknown';
             let deletable = false;
@@ -204,7 +205,8 @@ export default class Content {
     async destroy(doc, options = {}) {
         if (!this.#runtime.state.stored) throw new Error('WorkspaceStoredIndex is not running');
         const db = this.#runtime.state.getDb();
-        const locations = Array.isArray(doc?.locations) ? [...doc.locations] : [];
+        const locations = availableLocations(doc);
+        const history = (doc?.locations || []).filter(l => !isAvailableLocation(l));
         const targets = Array.isArray(options.urls) ? new Set(options.urls) : new Set(locations.map((l) => l.url));
 
         const result = { deleted: [], droppedRefs: [], kept: [], docDeleted: false };
@@ -252,7 +254,8 @@ export default class Content {
             }
         }
 
-        doc.locations = kept;
+        const removed = new Set([...result.deleted, ...result.droppedRefs]);
+        doc.locations = [...kept, ...history, ...locations.filter(l => removed.has(l.url)).map(l => ({ ...l, status: 'deleted', statusChangedAt: new Date().toISOString() }))];
         result.kept = kept.map((l) => l.url);
 
         // Bytes were removed (or the doc is about to go) — the cached thumbnails

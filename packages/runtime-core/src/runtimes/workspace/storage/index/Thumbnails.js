@@ -1,3 +1,4 @@
+import { availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
 import { WorkspaceStoredIndex } from '../WorkspaceStoredIndex.js';
 import path from 'path';
 
@@ -42,7 +43,7 @@ export default class Thumbnails {
         // bytes to sharp, not the wrapper object (else sharp throws and the
         // thumbnail 500s for every not-yet-cached image).
         let original = null;
-        for (const loc of (doc.locations || [])) {
+        for (const loc of availableLocations(doc)) {
             if (!loc?.url) continue;
             try { const res = await this.#index.resolve(loc.url); if (res?.data) { original = res.data; break; } } catch { /* next */ }
         }

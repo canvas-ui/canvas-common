@@ -1,3 +1,4 @@
+import { availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
 import { readMessageThread } from '../connectors/messaging/thread.js';
 
 import { parseDocumentId, parseDocumentIdArray } from '../../../utils/documentId.js';
@@ -468,7 +469,7 @@ export default class WorkspaceDocuments {
             if (Array.isArray(doc.checksumArray) && doc.checksumArray[0]) {
                 checksums.set(doc.id, doc.checksumArray[0]);
             }
-            const urls = (doc.locations || []).map((l) => l?.url).filter(Boolean);
+            const urls = availableLocations(doc).map((l) => l?.url).filter(Boolean);
             if (urls.length === 0 || managedBackends.size === 0) { continue; }
             const allManaged = urls.every((url) => {
                 const parsed = parseLocationUrl(url);

@@ -1,3 +1,4 @@
+import { isAvailableLocation, availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
 import path from 'path';
 import { isDeepStrictEqual } from 'node:util';
 import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
@@ -30,7 +31,7 @@ export default class DocumentProjection {
                 const separator = value.indexOf('/');
                 return [value.slice(0, separator), value.slice(separator + 1)];
             }));
-            for (const location of document.locations || []) {
+            for (const location of availableLocations(document)) {
                 const key = this.backendLocationKey(backendName, location);
                 if (key != null) previous.set(key, { checksums });
             }
@@ -48,7 +49,7 @@ export default class DocumentProjection {
      *     placements to the successor doc, then apply the last-location policy
      *   - path under an unreadable subtree→ carry forward (stale, not deleted)
      *   - path hashed-failed              → present-but-unverified, carry forward
-     *   - path gone                       → drop this backend's locations; doc
+     *   - path gone                       → mark this backend's locations not-found; doc
      *     follows the configured orphan policy if none survive
      * Returns the number of docs that lost locations here.
      */
@@ -80,7 +81,7 @@ export default class DocumentProjection {
             const primaryChecksum = doc.checksumArray?.[0];
             if (!primaryChecksum) continue;
 
-            const ownedLocations = (doc.locations || [])
+            const ownedLocations = availableLocations(doc)
                 .filter((l) => parseLocationUrl(l.url)?.backend === backendName || l.metadata?.backend === backendName);
             if (ownedLocations.length === 0) continue;
 
@@ -176,7 +177,8 @@ export default class DocumentProjection {
         const removed = [`stored://${file.backend}/${file.key}`];
         const twin = this.#runtime.backends.deviceFileLocationUrl(file.backend, file.key);
         if (twin) removed.push(twin);
-        const remaining = (predecessor.locations || []).filter(l => !removed.includes(l.url));
+        const remaining = availableLocations(predecessor).filter(l => !removed.includes(l.url));
+        const history = (predecessor.locations || []).map(l => removed.includes(l.url) && isAvailableLocation(l) ? { ...l, status: 'deleted', statusChangedAt: new Date().toISOString() } : l);
         const currentPaths = await db.listDocumentTreePaths(predecessor.id, BACKENDS_TREE_NAME);
         const root = this.#runtime.backends.getBackendRootPath(file.backend);
         const preserved = currentPaths.filter(p => !(p === root || p.startsWith(`${root}/`)));
@@ -190,7 +192,7 @@ export default class DocumentProjection {
                 // With independent copies, retiring this location is part of
                 // the divergence commit. Last-location convergence retains the
                 // existing workspace removal policy after curation is safe.
-                ...(remaining.length ? { changes: { locations: remaining }, unlink: removedPaths.map(unlinkSpec) } : {}),
+                ...(remaining.length ? { changes: { locations: history }, unlink: removedPaths.map(unlinkSpec) } : {}),
             },
             successorVersion,
             successorUnlinks: stalePaths.map(unlinkSpec),
@@ -225,7 +227,7 @@ export default class DocumentProjection {
         for (const doc of fileDocs) {
             if (!Array.isArray(doc.locations) || doc.locations.length === 0) { continue; }
             const deadUrls = [];
-            for (const loc of doc.locations) {
+            for (const loc of availableLocations(doc)) {
                 const parsed = parseLocationUrl(loc.url);
                 if (!parsed) { continue; }
                 let backend;
@@ -308,7 +310,7 @@ export default class DocumentProjection {
             // break open readers/links and incorrectly send the old row to Trash.
             // Multiple independent locations mean a divergence: a new revision
             // gets its own ID and the original continues to identify old bytes.
-            const locations = predecessor?.locations || [];
+            const locations = availableLocations(predecessor);
             if (locations.length && locations.every(location =>
                 this.backendLocationKey(storedFile.backend, location) === storedFile.key)) {
                 existingDocument = predecessor;
@@ -401,7 +403,7 @@ export default class DocumentProjection {
         if (!doc?.id) return null;
 
         const locations = this.#mergeDocumentLocations(doc, Array.isArray(payload.locations) ? payload.locations : []);
-        if (locations.length === 0) {
+        if (!locations.some(isAvailableLocation)) {
             // Nothing left to point at — hand over to the orphan path so the
             // orphanedAt stamp and retention semantics stay in one place.
             return this.#reconcileRemovedLocationsNow(doc, (doc.locations || []).map((l) => l.url), { notify: !String(payload.origin || '').startsWith('trash:') });
@@ -432,7 +434,7 @@ export default class DocumentProjection {
         const removedUrls = [`stored://${storedFile.backend}/${storedFile.key}`];
         const twin = this.#runtime.backends.deviceFileLocationUrl(storedFile.backend, storedFile.key);
         if (twin) removedUrls.push(twin);
-        return this.#reconcileRemovedLocationsNow(existingDocument, removedUrls, { suppressPolicy: Boolean(storedFile.origin), manualRemoval: String(storedFile.origin || '').startsWith('backend-delete:'), keepDocument: String(storedFile.origin || '').startsWith('backend-delete:keep:'), notify: !/^(trash:|replica:|workspace-directory:)/.test(storedFile.origin || '') });
+        return this.#reconcileRemovedLocationsNow(existingDocument, removedUrls, { status: String(storedFile.origin || '').startsWith('backend-delete:') || /^(trash:|replica:|workspace-directory:)/.test(storedFile.origin || '') ? 'deleted' : 'not-found', suppressPolicy: Boolean(storedFile.origin), manualRemoval: String(storedFile.origin || '').startsWith('backend-delete:'), keepDocument: String(storedFile.origin || '').startsWith('backend-delete:keep:'), notify: !/^(trash:|replica:|workspace-directory:)/.test(storedFile.origin || '') });
     }
 
     /**
@@ -445,7 +447,7 @@ export default class DocumentProjection {
     }
 
     /**
-     * A backing blob vanished from one or more locations. Drop those locations;
+     * A backing blob vanished from one or more locations. Retain their URLs with an unavailable status;
      * the doc keeps its survivors and unticks only the backends-tree path(s) the
      * dead locations backed. With no survivors, remove the index row by default.
      * With onLocationsRemoved, durable Workspace Trash owns source-loss
@@ -464,14 +466,17 @@ export default class DocumentProjection {
             if (!doc) return null;
         }
         const removed = new Set(removedUrls);
-        const remaining = (Array.isArray(doc.locations) ? doc.locations : []).filter((l) => !removed.has(l.url));
-        if (remaining.length === (doc.locations || []).length) return doc.id;
+        const active = availableLocations(doc);
+        const remaining = active.filter(l => !removed.has(l.url));
+        if (remaining.length === active.length) return doc.id;
+        const locations = (doc.locations || []).map(l => removed.has(l.url) && isAvailableLocation(l)
+            ? { ...l, status: options.status || (options.manualRemoval ? 'deleted' : 'not-found'), statusChangedAt: new Date().toISOString() } : l);
         const currentBackendPaths = await db.listDocumentTreePaths(doc.id, BACKENDS_TREE_NAME).catch(() => []);
 
         // Persist removal intent before changing locations, so restart can finish
         // an interrupted observation without losing its provenance.
         const operations = options.notify === false ? [] : await this.#runtime.state.onLocationsRemoved?.({
-            document: doc, removedLocations: doc.locations.filter(l => removed.has(l.url)),
+            document: doc, removedLocations: active.filter(l => removed.has(l.url)),
             remainingLocations: remaining, ...options,
         }) || [];
         const ready = async () => { await this.#runtime.state.onRemovalReady?.(operations); return doc.id; };
@@ -484,7 +489,7 @@ export default class DocumentProjection {
             }
             await this.#runtime.state.put({
                 id: doc.id,
-                locations: [],
+                locations,
                 orphanedAt: doc.orphanedAt || new Date().toISOString(),
                 metadata: { ...(doc.metadata || {}) },
             }, { context: null, emitEvent: false });
@@ -500,7 +505,7 @@ export default class DocumentProjection {
         // document instance in place, replacing its locations array.
         const affectedRoots = [...new Set(doc.locations.filter(l => removed.has(l.url))
             .map(l => this.#runtime.backends.getBackendRootPath(l.metadata?.backend || parseLocationUrl(l.url)?.backend)).filter(Boolean))];
-        await this.#runtime.state.put({ id: doc.id, locations: remaining }, { context: null, emitEvent: false });
+        await this.#runtime.state.put({ id: doc.id, locations }, { context: null, emitEvent: false });
         const preserved = currentBackendPaths.filter(p => !affectedRoots.some(root => p === root || p.startsWith(`${root}/`)));
         await this.#removeStalePaths(doc.id, currentBackendPaths, [...preserved, ...this.#buildBackendPaths(survivors)]);
         return ready();
@@ -534,7 +539,7 @@ export default class DocumentProjection {
             const orphanedAt = doc.orphanedAt ? Date.parse(doc.orphanedAt) : NaN;
             if (!Number.isFinite(orphanedAt) || orphanedAt > cutoff) continue;
             // Belt-and-braces: never GC a doc that somehow regained locations.
-            if (Array.isArray(doc.locations) && doc.locations.length > 0) continue;
+            if (availableLocations(doc).length > 0) continue;
             await db.delete(doc.id);
             await this.#index.purgeThumbnails([doc]).catch(() => {});
             purged += 1;
@@ -721,11 +726,19 @@ export default class DocumentProjection {
         const next = this.#buildDocumentLocations(backends);
         const urls = new Set(next.map((l) => l.url));
         for (const location of doc?.locations || []) {
+            if (urls.has(location.url)) {
+                const index = next.findIndex(item => item.url === location.url);
+                const { status: _status, statusChangedAt: _changed, ...details } = location;
+                next[index] = { ...details, ...next[index], metadata: { ...details.metadata, ...next[index].metadata } };
+                if (!Object.keys(next[index].metadata).length) delete next[index].metadata;
+                continue;
+            }
             const endpoint = this.#runtime.transfers.locationEndpoint(location);
             // Stored's canonical list only describes its enabled backends.
             // It cannot retract IMAP/web/foreign-device or disabled locations.
-            if ((!endpoint || !this.#runtime.state.stored.getBackend(endpoint.backend)) && !urls.has(location.url)) {
-                next.push(location);
+            if (!urls.has(location.url)) {
+                next.push(!isAvailableLocation(location) || !endpoint || !this.#runtime.state.stored.getBackend(endpoint.backend)
+                    ? location : { ...location, status: 'not-found', statusChangedAt: new Date().toISOString() });
                 urls.add(location.url);
             }
         }

@@ -1,3 +1,4 @@
+import { isAvailableLocation } from 'canvas-synapsd/src/utils/document-locations.js';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
 import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
@@ -41,6 +42,7 @@ export default class Transfers {
      * imap://, https://, foreign devices.
      */
     locationEndpoint(location) {
+        if (!isAvailableLocation(location)) return null;
         const parsed = parseLocationUrl(location?.url);
         if (!parsed) return null;
         if (parsed.scheme === 'stored') return { backend: parsed.backend, key: parsed.key, url: location.url };

@@ -1,3 +1,4 @@
+import { availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
 import { parseDocumentId, parseDocumentIdArray } from '../../../utils/documentId.js';
 import { normalizeSegment } from '../../../utils/backend-documents.js';
 import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
@@ -271,13 +272,13 @@ export default class WorkspaceTrash {
         for (const id of ids) {
             const doc = await this.#workspace.get(id);
             const provenance = db.internalStore.get(this.#trashProvenanceKey(id));
-            if (provenance?.reason === 'source-missing' && doc?.locations?.length) {
+            if (provenance?.reason === 'source-missing' && availableLocations(doc).length) {
                 await db.unlink(id, { context: null, directory: this.#workspace.getTrashSelector(), emitEvent: false });
                 await db.internalStore.remove(this.#trashProvenanceKey(id));
                 this.#trashedIds?.delete(id);
                 preserved.push(id);
             } else {
-                if (!doc?.locations?.length) await this.#workspace.storageOperations?.retireOwner?.(`workspace-document:${id}`);
+                if (!availableLocations(doc).length) await this.#workspace.storageOperations?.retireOwner?.(`workspace-document:${id}`);
                 purgeIds.push(id);
             }
         }
