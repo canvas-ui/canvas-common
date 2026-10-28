@@ -7,6 +7,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { simpleParser } from 'mailparser';
 import ImapBackend from './ImapBackend.js';
+import { closeImapSessions } from './sessions.js';
 import { normalizeRemovalPolicy } from '../../storage/removal-policy.js';
 import { normalizeSmtp, emailAddresses } from '../messaging/email.js';
 import Email from 'canvas-synapsd/src/schemas/core/Email.js';
@@ -171,6 +172,7 @@ export class WorkspaceMailIndex extends EventEmitter {
     async stop() {
         for (const name of [...this.#backends.keys()]) await this.#removeBackend(name);
         this.#backendStatus.clear();
+        closeImapSessions();
         this.#started = false;
     }
 
