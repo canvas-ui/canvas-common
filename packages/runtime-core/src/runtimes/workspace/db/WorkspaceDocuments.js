@@ -56,24 +56,12 @@ export default class WorkspaceDocuments {
     }
 
     normalizeQuerySpec(spec = {}) {
-        const { attributes, features = null, context, directory, limit = 200, ...rest } = spec;
-        // Tree-qualified selectors survive as selector objects (parseSpec keeps
-        // the tree id per entry); the paths string grammar targets default trees.
-        if (WorkspaceDocuments.#isTreeQualified(context) || WorkspaceDocuments.#isTreeQualified(directory)) {
-            return {
-                limit,
-                ...rest,
-                ...(context != null ? { context } : {}),
-                ...(directory != null ? { directory } : {}),
-                ...(features != null ? { features } : {}),
-                ...(features == null && attributes != null ? { features: attributes } : {}),
-            };
-        }
-        const paths = WorkspaceDocuments.#buildPaths(context, directory);
+        const { attributes, features = null, limit = 200, ...rest } = { ...spec.options, ...spec };
+        // Keep native selectors intact: flattening to strings loses recursion,
+        // named-tree exclusions and combinations with explicit paths.
         return {
             limit,
             ...rest,
-            ...(paths.length ? { paths } : {}),
             ...(features != null ? { features } : {}),
             ...(features == null && attributes != null ? { features: attributes } : {}),
         };

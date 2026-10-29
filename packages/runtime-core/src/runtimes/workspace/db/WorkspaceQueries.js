@@ -1,5 +1,6 @@
 import { parseDocumentId } from '../../../utils/documentId.js';
 import Workspace from '../Workspace.js';
+import { parseSpec } from 'canvas-synapsd/src/utils/spec.js';
 
 export default class WorkspaceQueries {
     #workspace;
@@ -28,7 +29,7 @@ export default class WorkspaceQueries {
     async searchRefined(queries = [], spec = {}, options = {}) {
         const baseSpec = this.#runtime.docs.normalizeQuerySpec(this.composeCanvasQuerySpec(spec));
         delete baseSpec.query; delete baseSpec.search; delete baseSpec.q;
-        const opts = { ...options };
+        const opts = { ...parseSpec(baseSpec).options, ...options };
         if (opts.maxDistance === undefined) { opts.maxDistance = Workspace.DEFAULT_MAX_COSINE_DISTANCE; }
         return await this.#runtime.getActiveDb().searchRefined(queries, baseSpec, opts);
     }
@@ -39,7 +40,7 @@ export default class WorkspaceQueries {
     async searchCompound(lines = [], spec = {}, options = {}) {
         const baseSpec = this.#runtime.docs.normalizeQuerySpec(this.composeCanvasQuerySpec(spec));
         delete baseSpec.query; delete baseSpec.search; delete baseSpec.q;
-        const opts = { ...options, baseSpec };
+        const opts = { ...parseSpec(baseSpec).options, ...options, baseSpec };
         if (opts.maxDistance === undefined) { opts.maxDistance = Workspace.DEFAULT_MAX_COSINE_DISTANCE; }
         return await this.#runtime.getActiveDb().searchCompound(lines, opts);
     }
@@ -235,6 +236,7 @@ export default class WorkspaceQueries {
      */
     composeCanvasQuerySpec(spec) {
         if (!spec || typeof spec !== 'object') { return spec; }
+        spec = { ...spec.options, ...spec };
         // Live canvas filter preview: when the client fully drives the filters
         // (toolbox-on-canvas), it opts out of folding the canvas's STORED
         // querySpec so its edits — including REMOVING a saved filter — take

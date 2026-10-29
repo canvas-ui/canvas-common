@@ -22,7 +22,7 @@
     "globals": "^16.5.0",
     "prettier": "^3.6.2"
   },
-  "version": "0.3.26",
+  "version": "0.3.27",
   "exports": {
     "./*": "./packages/runtime-core/src/*",
     "./host": "./packages/runtime-core/src/runtimes/workspace/runtime/host.js"
@@ -48,6 +48,7 @@
     "@fastify/static": "^6.12.0",
     "@napi-rs/canvas": "^1.0.6",
     "@whiskeysockets/baileys": "7.0.0-rc14",
+    "ajv": "^8.20.0",
     "bcryptjs": "^3.0.3",
     "canvas-stored": "github:canvas-ui/canvas-stored#main",
     "canvas-synapsd": "github:canvas-ui/canvas-synapsd#main",

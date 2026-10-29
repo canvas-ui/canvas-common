@@ -35,6 +35,9 @@ importers:
       '@whiskeysockets/baileys':
         specifier: 7.0.0-rc14
         version: 7.0.0-rc14(sharp@0.35.5(@types/node@26.6.4))
+      ajv:
+        specifier: ^8.20.0
+        version: 8.20.0
       bcryptjs:
         specifier: ^3.0.3
         version: 3.0.3
@@ -43,7 +46,7 @@ importers:
         version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/5f2dd3e9f2b182480b1a3d1365ea565012083887
       canvas-synapsd:
         specifier: github:canvas-ui/canvas-synapsd#main
-        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#ac8ec468b099db9b4799dd7dbf44f95084b97570(@types/node@26.6.4)
+        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#48924d69c3847285572ca2afe4c575699a53bdb7(@types/node@26.6.4)
       conf:
         specifier: ^14.0.0
         version: 14.0.0
@@ -168,6 +171,9 @@ importers:
       '@whiskeysockets/baileys':
         specifier: 7.0.0-rc14
         version: 7.0.0-rc14(sharp@0.35.5(@types/node@26.6.4))
+      ajv:
+        specifier: ^8.20.0
+        version: 8.20.0
       bcryptjs:
         specifier: ^3.0.3
         version: 3.0.3
@@ -176,7 +182,7 @@ importers:
         version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/5f2dd3e9f2b182480b1a3d1365ea565012083887
       canvas-synapsd:
         specifier: github:canvas-ui/canvas-synapsd#main
-        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#ac8ec468b099db9b4799dd7dbf44f95084b97570(@types/node@26.6.4)
+        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#48924d69c3847285572ca2afe4c575699a53bdb7(@types/node@26.6.4)
       conf:
         specifier: ^14.0.0
         version: 14.0.0
@@ -1583,9 +1589,9 @@ packages:
     version: 1.17.0
     engines: {node: '>=22.0.0'}
 
-  canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#ac8ec468b099db9b4799dd7dbf44f95084b97570:
-    resolution: {commit: ac8ec468b099db9b4799dd7dbf44f95084b97570, repo: git@github.com:canvas-ui/canvas-synapsd.git, type: git}
-    version: 3.25.1
+  canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#48924d69c3847285572ca2afe4c575699a53bdb7:
+    resolution: {commit: 48924d69c3847285572ca2afe4c575699a53bdb7, repo: git@github.com:canvas-ui/canvas-synapsd.git, type: git}
+    version: 3.25.2
     engines: {node: '>=22.0.0'}
 
   chalk-template@0.4.0:
@@ -4561,7 +4567,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#ac8ec468b099db9b4799dd7dbf44f95084b97570(@types/node@26.6.4):
+  canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#48924d69c3847285572ca2afe4c575699a53bdb7(@types/node@26.6.4):
     dependencies:
       '@lancedb/lancedb': 0.40.0(@types/node@26.6.4)(apache-arrow@18.1.0)
       apache-arrow: 18.1.0

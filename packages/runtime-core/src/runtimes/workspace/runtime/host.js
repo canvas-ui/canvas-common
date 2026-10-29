@@ -16,6 +16,7 @@ import Jim from '../../../utils/jim/index.js';
 import SingleWorkspaceManager from './SingleWorkspaceManager.js';
 import ContextManager from '../contexts/index.js';
 import { mountWorkspacesApi, mountContextsApi, API_VERSION } from '../../../transports/api-contract.js';
+import { installMcp } from '../../../transports/mcp/index.js';
 import schemaRoutes from '../../../transports/routes/schemas.js';
 import webdavRoutes from '../../../transports/routes/webdav.js';
 import registerWorkspace from '../../../transports/websocket/channels/workspace.js';
@@ -98,8 +99,10 @@ export async function createWorkspaceHost({ root, name, ownerId = null, inferd =
   const policyListeners = new Set();
   const https = httpsOptions(config.tls);
   const app = Fastify({ logger, disableRequestLogging: !requestLogging, bodyLimit: 1024 * 1024 * 1024, ignoreTrailingSlash: true, ...(https ? { https } : {}) });
+  const mcp = installMcp(app);
   await app.register(jwt, { secret: config.jwtSecret });
   await app.register(socketIO, { transports: ['websocket'], maxHttpBufferSize: 1024 * 1024 });
+  mcp.attachSocketIo(app.io);
   for (const [key, value] of Object.entries({ users, workspaceManager, contextManager,
     authService: { verifyApiToken: async value => equals(value, config.token) ? { userId: user.id } : null },
   })) app.decorate(key, value);
