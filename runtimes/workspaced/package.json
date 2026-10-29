@@ -1,6 +1,6 @@
 {
   "name": "@augmentd-labs/canvas-workspaced",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "type": "module",
   "description": "Canvas workspace runtime with outbound hub registration",
   "license": "AGPL-3.0-or-later",

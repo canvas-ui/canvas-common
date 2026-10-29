@@ -1,3 +1,4 @@
+import { renderVideoThumbnail, VIDEO_THUMBNAIL_MAX_BYTES } from './video-thumbnail.js';
 import { availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
 import { WorkspaceStoredIndex } from '../WorkspaceStoredIndex.js';
 import path from 'path';
@@ -9,7 +10,7 @@ export default class Thumbnails {
 
 
     /**
-     * On-demand thumbnail for an image document, cached in Stored's internal
+     * On-demand thumbnail for an image, PDF or video document, cached in Stored's internal
      * cacache store ({WORKSPACE_ROOT}/cache — services.stored.cache)
      * keyed `thumb:<checksum>:<size>` — derived artifacts never touch the main
      * index and the cache is purgeable at any time (purgeThumbnails on
@@ -24,7 +25,8 @@ export default class Thumbnails {
         if (!this.#runtime.state.stored) throw new Error('WorkspaceStoredIndex is not running');
         const contentType = String(doc?.metadata?.contentType || '');
         const isPdf = contentType === 'application/pdf';
-        if (!contentType.startsWith('image/') && !isPdf) return null;
+        const isVideo = contentType.startsWith('video/');
+        if (!contentType.startsWith('image/') && !isPdf && !isVideo) return null;
         const checksum = Array.isArray(doc?.checksumArray) ? doc.checksumArray[0] : null;
         if (!checksum) return null;
 
@@ -38,6 +40,8 @@ export default class Thumbnails {
         const hit = await cache.get(cacheKey).catch(() => null);
         if (hit?.data) return { buffer: hit.data, mime: 'image/webp' };
 
+        if (isVideo && Number(doc?.metadata?.size) > VIDEO_THUMBNAIL_MAX_BYTES) return null;
+
         // Miss → resolve original bytes from the first reachable location.
         // resolve() returns { data, ranged }, not the raw buffer — pass the
         // bytes to sharp, not the wrapper object (else sharp throws and the
@@ -49,7 +53,8 @@ export default class Thumbnails {
         }
         if (!original) return null;
 
-        const source = isPdf ? await this.#renderPdfFirstPage(original, edge) : original;
+        const source = isPdf ? await this.#renderPdfFirstPage(original, edge)
+            : isVideo ? await renderVideoThumbnail(original, edge) : original;
         if (!source) return null;
 
         const { default: sharp } = await import('sharp');

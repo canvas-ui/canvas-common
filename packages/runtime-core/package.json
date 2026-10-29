@@ -1,6 +1,6 @@
 {
   "name": "@augmentd-labs/canvas-runtime-core",
-  "version": "0.3.27",
+  "version": "0.3.28",
   "description": "Generated production Canvas workspace runtime",
   "type": "module",
   "license": "AGPL-3.0-or-later",

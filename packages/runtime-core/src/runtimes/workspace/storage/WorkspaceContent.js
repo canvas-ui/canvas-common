@@ -88,7 +88,7 @@ export default class WorkspaceContent {
     }
 
     /**
-     * On-demand cached thumbnail for an image or PDF document (see
+     * On-demand cached thumbnail for an image, PDF or video document (see
      * WorkspaceStoredIndex.getThumbnail). Returns {buffer, mime} or null.
      */
     async getDocumentThumbnail(doc, size = 256) {
