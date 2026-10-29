@@ -504,6 +504,8 @@ export async function enforceWorkspaceTokenScope(request, reply) {
   if (binding?.type !== 'workspace') return;
 
   const url = (request.raw?.url || request.url || '').split('?')[0];
+  // MCP only dispatches to routes that re-run this guard with the same bearer.
+  if (url === '/rest/v2/mcp') return;
   const workspaceId = request.params?.id;
   const inWorkspacesApi = url.startsWith('/rest/v2/workspaces/');
   const matchesBinding = workspaceId === binding.workspaceId
