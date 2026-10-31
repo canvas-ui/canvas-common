@@ -1,5 +1,6 @@
 'use strict';
 
+import { downloadLink } from '../../../runtimes/workspace/services/download-link.js';
 import ResponseObject from '../../ResponseObject.js';
 import Ajv from 'ajv';
 import { querySpecSchema, candidateSpecSchema } from 'canvas-synapsd/src/query/schema.js';
@@ -1225,6 +1226,29 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     }
   });
 
+  fastify.post('/:docId/download', {
+    onRequest: [fastify.authenticateClient],
+    schema: { params: { type: 'object', required: ['id', 'docId'], properties: { id: { type: 'string' }, docId: { type: 'string' } } } },
+  }, async (request, reply) => {
+    const workspace = await getWorkspaceInstance(request, reply);
+    if (!workspace) return reply;
+    try {
+      const id = parseDocumentId(request.params.docId, 'Document ID');
+      const doc = await workspace.get(id);
+      if (!doc) {
+        const r = new ResponseObject().notFound('Document not found');
+        return reply.code(r.statusCode).send(r.getResponse());
+      }
+      const result = await downloadLink(workspace, doc);
+      const r = new ResponseObject().success(result, 'File downloaded to workspace');
+      return reply.code(r.statusCode).send(r.getResponse());
+    } catch (error) {
+      fastify.log.error(error);
+      const r = ResponseObject.fromError(error, error.message || 'Download failed');
+      return reply.code(r.statusCode).send(r.getResponse());
+    }
+  });
+
   // ── Backend transfer (copy / move / delete-from-backend) ────────────────
   //
   // Batch counterpart of the per-object backends route: addressed by document
@@ -1531,7 +1555,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
         reply.header('Cache-Control', 'private, no-cache');
       }
 
-      const filename = attachment?.filename || attachment?.name || locationFilename(resolved.url) || `document-${documentId}`;
+      const filename = attachment?.filename || attachment?.name || (!attachment && (doc.metadata?.filename || doc.locations?.find(location => location.url === resolved.url)?.metadata?.filename)) || locationFilename(resolved.url) || `document-${documentId}`;
       const mime = resolveContentType(attachment ? (attachment.contentType || attachment.mimeType) : doc.metadata?.contentType, filename);
       reply.header('Content-Type', mime);
       if (request.query.download !== undefined) {

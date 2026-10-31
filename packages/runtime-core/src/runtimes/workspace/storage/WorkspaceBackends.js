@@ -234,6 +234,7 @@ export default class WorkspaceBackends {
                 removalPolicy: normalizeRemovalPolicy(m.removalPolicy),
                 name: m.folder || 'INBOX',
                 mailboxId: m.id,
+                treePath: m.treePath,
                 enabled: m.enabled !== false,
                 status: m.runtime?.status || (m.enabled === false ? 'stopped' : 'idle'),
                 lastSyncAt: m.lastSyncAt || null,

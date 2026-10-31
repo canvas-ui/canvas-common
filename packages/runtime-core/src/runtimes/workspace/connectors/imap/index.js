@@ -1102,6 +1102,7 @@ export class WorkspaceMailIndex extends EventEmitter {
             id,
             enabled: config.enabled !== false,
             host: config.host, port: config.port, tls: config.tls, allowSelfSigned: config.allowSelfSigned,
+            treePath: this.#treePathOf(config.account || config.user, config.folder, backend),
             user: config.user, folder: config.folder, mode: config.mode || 'poll',
             readOnly: config.readOnly === true,
             removalPolicy: normalizeRemovalPolicy(config.removalPolicy),
@@ -1219,7 +1220,7 @@ export class WorkspaceMailIndex extends EventEmitter {
         }
         if (!ids.length) throw new Error(`No IMAP mailbox found for account "${accountSegment}"`);
         const results = [];
-        for (const id of ids) results.push(await this.syncMailbox(id, { full: true }));
+        for (const id of ids) results.push(await this.syncMailbox(id));
         return { account: wanted, mailboxes: results.length, syncing: results.some(result => result.syncing), results };
     }
 
