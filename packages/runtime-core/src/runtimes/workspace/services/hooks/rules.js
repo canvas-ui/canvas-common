@@ -615,13 +615,20 @@ const ACTIONS = {
             return;
         }
 
-        const res = await workspace.transferDocumentBytes(doc, {
-            to,
-            mode,
-            key,
-            onConflict: action.onConflict || 'rename',
-            from: source,
-        });
+        let res;
+        try {
+            res = await workspace.transferDocumentBytes(doc, {
+                to,
+                mode,
+                key,
+                onConflict: action.onConflict || 'rename',
+                from: source,
+            });
+        } catch (error) {
+            // A backfill reconciles: an occupied destination is left as it is.
+            if (scope.payload?.backfill === true && TARGET_OCCUPIED.has(error.reason)) return { status: 'skipped', error: `${to}:${key} already exists` };
+            throw error;
+        }
         const landed = res?.to?.url || res?.added?.[0] || `stored://${to}/${key ?? source.key}`;
         logger.debug(`rule store: ${doc.id} ${mode}d ${source.backend}:${source.key} -> ${landed}${res?.state === 'pending' ? ' (pending sync)' : ''}`);
     },
@@ -959,6 +966,8 @@ function matchedPath(rule, context) {
  * @param {Object} logger
  * @returns {Promise<Array<{ action: string, status: 'ok'|'error'|'skipped', error?: string }>>}
  */
+const TARGET_OCCUPIED = new Set(['target-exists', 'TARGET_CONFLICT']);
+
 export async function executeRuleActions(rule, context, logger) {
     const { workspace, payload, eventName } = context;
     rule = mapRulePaths(rule, rulePathMapper(workspace, 'decode'));

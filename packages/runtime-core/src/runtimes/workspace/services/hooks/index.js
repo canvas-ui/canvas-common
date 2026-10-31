@@ -1,5 +1,6 @@
 'use strict';
 
+import BackfillJobs from './backfill-jobs.js';
 import EventEmitter from 'eventemitter2';
 import fs from 'fs';
 import path from 'path';
@@ -43,6 +44,7 @@ class HookService extends EventEmitter {
     #pending = null;
     #paused = false;
     #inflight = new Set();
+    #backfillJobs = null;
 
     /**
      * @param {Object} options
@@ -75,6 +77,7 @@ class HookService extends EventEmitter {
      */
     async pause({ timeoutMs = 5_000 } = {}) {
         this.#paused = true;
+        this.backfillJobs.stop();
         if (!this.#inflight.size) return;
         let timer;
         await Promise.race([Promise.allSettled([...this.#inflight]), new Promise(r => { timer = setTimeout(r, timeoutMs); })]);
@@ -290,6 +293,13 @@ class HookService extends EventEmitter {
     // resolved var/hooks dir (`.workspace/var/hooks` in the `home` layout).
     // Public so the REST layer reads through the same instances (sharing the
     // run log's size cache used for rotation).
+    get backfillJobs() {
+        return this.#backfillJobs ??= new BackfillJobs(this.#workspace, (run) => {
+            this.#inflight.add(run);
+            void run.finally(() => this.#inflight.delete(run));
+        });
+    }
+
     get runLog() {
         if (!this.#workspace.varHooksPath) { return null; }
         return this.#runLog ??= new HookRunLog(this.#workspace.varHooksPath);

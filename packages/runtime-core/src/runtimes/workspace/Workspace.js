@@ -308,6 +308,7 @@ class Workspace extends EventEmitter {
             this.backups.schedule();
             stage('ready');
             this.emit('started', { id: this.id });
+            this.#runtime.hooks.backfillJobs.resume().catch((err) => this.#runtime.state.logger.warn({ workspaceId: this.id, error: err.message }, 'Backfill resume failed'));
             return this;
         } catch (err) {
             this.#runtime.state.logger.error({ workspaceId: this.id, stage: startupStage, err }, 'Failed to start workspace');

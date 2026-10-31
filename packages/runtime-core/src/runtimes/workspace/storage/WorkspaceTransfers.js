@@ -45,7 +45,7 @@ export default class WorkspaceTransfers {
         if (!res?.ok) {
             const detail = res?.detail ? ` (${res.detail})` : '';
             const source = res?.source || (from ? `stored://${from.backend}/${from.key}` : null);
-            throw new Error(`${mode} failed: ${res?.reason || 'unknown error'}${source ? ` (source: ${source}, target: ${to}/${key || ''})` : ''}${detail}`);
+            throw Object.assign(new Error(`${mode} failed: ${res?.reason || 'unknown error'}${source ? ` (source: ${source}, target: ${to}/${key || ''})` : ''}${detail}`), { reason: res?.reason });
         }
         return res;
     }

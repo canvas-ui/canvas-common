@@ -1,7 +1,7 @@
 import { isRuleFile, transformRuleFile, mapRulePaths, rulePathMapper } from '../../../runtimes/workspace/services/hooks/rule-paths.js';
 'use strict';
 
-import { discoverBackfillDocuments } from '../../../runtimes/workspace/services/hooks/backfill.js';
+import { runBackfillBatch, BackfillRequestError, BACKFILL_MAX_LIMIT, BACKFILL_JOB_LIMIT } from '../../../runtimes/workspace/services/hooks/backfill.js';
 
 import path from 'path';
 import crypto from 'crypto';
@@ -13,8 +13,17 @@ import { resolveRuleFiles, loadRuleFile, explainRule } from '../../../runtimes/w
 import { resolveHookFiles } from '../../../runtimes/workspace/services/hooks/files.js';
 import { classifyDocument, normalizeSchemaId } from '../../../runtimes/workspace/db/classifier.js';
 
-// Hard ceiling on one backfill request; the webui's "Batch size" knob goes up to this.
-const BACKFILL_MAX_LIMIT = 10000;
+function sendBackfillError(request, reply, error) {
+  const response = new ResponseObject();
+  if (error instanceof BackfillRequestError) {
+    if (error.statusCode === 404) response.notFound(error.message);
+    else response.badRequest(error.message);
+  } else {
+    request.log.error(error);
+    response.serverError(`Backfill failed: ${error.message}`);
+  }
+  return reply.code(response.statusCode).send(response.getResponse());
+}
 
 function normalizePathSegments(inputPath = '') {
   return String(inputPath || '')
@@ -540,132 +549,61 @@ export default async function workspaceHooksRoutes(fastify) {
     },
   }, async (request, reply) => {
     try {
-      const { ruleId, hookFile, event = 'document.inserted', schema, limit = 100, offset = 0, dryRun = false } = request.body || {};
-      if ((ruleId ? 1 : 0) + (hookFile ? 1 : 0) !== 1) {
-        const response = new ResponseObject().badRequest('Pass exactly one of ruleId or hookFile');
-        return reply.code(response.statusCode).send(response.getResponse());
-      }
-
-      const hookService = request.workspace.hooks;
-
-      let rule = null;
-      if (ruleId) {
-        rule = hookService.findRule(ruleId);
-        if (!rule) {
-          const response = new ResponseObject().notFound(`Rule "${ruleId}" not found`);
-          return reply.code(response.statusCode).send(response.getResponse());
-        }
-        if (rule.when?.eventPathExact !== undefined) {
-          const response = new ResponseObject().badRequest('This rule requires the original insert/link destination. Current Context membership cannot reconstruct it; replay an original event instead.');
-          return reply.code(response.statusCode).send(response.getResponse());
-        }
-      }
-
-      // Discovery: schema filter from the request, else from the rule's own
-      // matcher (short names → full ids via the classifier map — plain prefix
-      // concat cannot reach hierarchical ids like data/schema/message/email).
-      const ruleSchemas = rule?.when?.schema ? (Array.isArray(rule.when.schema) ? rule.when.schema : [rule.when.schema]) : [];
-      const requested = (schema ? [schema] : ruleSchemas)
-        .map((s) => normalizeSchemaId(s))
-        .filter(Boolean);
-
-      // Hierarchical expansion against the schema bitmaps actually present:
-      // a parent-schema rule ('message') must discover sub-schema docs
-      // ('message/email'), mirroring the matcher's segment-bounded semantics.
-      let schemas = requested;
-      if (requested.length) {
-        const available = await request.workspace.listBitmaps('data/schema/')
-          .then((bitmaps) => bitmaps.map((b) => b.key))
-          .catch(() => null);
-        if (available) {
-          schemas = [...new Set(requested.flatMap((id) => {
-            const matches = available.filter((key) => key === id || key.startsWith(`${id}/`));
-            return matches.length ? matches : [id];
-          }))];
-        }
-      }
-
-      // A `path` condition scopes discovery to the documents actually filed
-      // under those prefixes — without this a rule on `/To Read` walked the
-      // whole index oldest-first and, past the batch limit, never even saw
-      // its own folder ("matches 0 of 2000"). Same qualifier grammar as the
-      // matcher: bare / ctx: = context tree, dir: = directory tree, any other
-      // `name:` = that tree.
-      const sourcePaths = rule?.when?.pathExact ?? rule?.when?.path;
-      const rulePaths = sourcePaths ? (Array.isArray(sourcePaths) ? sourcePaths : [sourcePaths]) : [];
-      let docs;
-      let nextOffset;
-      let total;
-      try {
-        ({ docs, nextOffset, total } = await discoverBackfillDocuments(request.workspace, { paths: rulePaths, recursive: rule?.when?.pathExact === undefined, schemas, limit, offset }));
-      } catch (error) {
-        const response = new ResponseObject().serverError(`Document discovery failed (workspace active?): ${error.message}`);
-        return reply.code(response.statusCode).send(response.getResponse());
-      }
-
-      const results = [];
-      let matched = 0;
-      let failed = 0;
-      for (const document of docs) {
-        if (!document?.id) { continue; }
-        // Live placements ({ treeName: [paths] }; context-type trees merged
-        // under 'context' to mirror live-event payload shape).
-        const treePaths = {};
-        const placements = await request.workspace.listDocumentPlacements(document.id).catch(() => []);
-        for (const placement of placements) {
-          if (!placement?.paths?.length) { continue; }
-          const key = placement.type === 'context' ? 'context' : placement.tree;
-          treePaths[key] = [...new Set([...(treePaths[key] || []), ...placement.paths])];
-        }
-        const payload = {
-          id: document.id,
-          document,
-          context: null,
-          directory: null,
-          treePaths,
-          eventId: crypto.randomUUID(),
-          origin: 'backfill',
-          depth: 0,
-          backfill: true,
-        };
-
-        if (dryRun) {
-          const explained = rule
-            ? explainRule(rule, event, classifyDocument(document, payload))
-            : { matched: null, checks: [] }; // JS hooks decide in code
-          if (explained.matched) { matched++; }
-          results.push({ docId: document.id, schema: document.schema, matched: explained.matched, checks: explained.checks });
-          continue;
-        }
-
-        const outcome = await hookService.runTargeted(
-          ruleId ? { ruleId } : { hookFile },
-          event,
-          payload,
-          { trigger: 'backfill' },
-        );
-        if (outcome.status !== 'skipped') { matched++; }
-        if (outcome.status === 'error') { failed++; }
-        results.push({ docId: document.id, schema: document.schema, ...outcome });
-      }
-
-      const response = new ResponseObject().success({
-        target: ruleId ? { ruleId } : { hookFile },
-        event,
-        dryRun,
-        processed: docs.length,
-        total,
-        nextOffset,
-        matched,
-        failed,
-        results,
-      }, dryRun ? 'Backfill dry-run evaluated' : 'Backfill executed');
+      const { dryRun = false } = request.body || {};
+      const response = new ResponseObject().success(await runBackfillBatch(request.workspace, request.body || {}),
+        dryRun ? 'Backfill dry-run evaluated' : 'Backfill executed');
       return reply.code(response.statusCode).send(response.getResponse());
     } catch (error) {
-      request.log.error(error);
-      const response = new ResponseObject().serverError(`Backfill failed: ${error.message}`);
-      return reply.code(response.statusCode).send(response.getResponse());
+      return sendBackfillError(request, reply, error);
     }
+  });
+
+  // Whole-rule runs: the workspace walks every matching document itself, so
+  // a run does not depend on the client that started it. Poll for progress.
+  fastify.post('/backfill/jobs', {
+    onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['ruleIds'],
+        properties: {
+          ruleIds: { type: 'array', items: { type: 'string' }, minItems: 1 },
+          limit: { type: 'integer', minimum: 1, maximum: BACKFILL_MAX_LIMIT, default: BACKFILL_JOB_LIMIT },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const response = new ResponseObject().success(request.workspace.hooks.backfillJobs.start(request.body), 'Backfill started');
+      return reply.code(response.statusCode).send(response.getResponse());
+    } catch (error) {
+      return sendBackfillError(request, reply, error);
+    }
+  });
+
+  fastify.get('/backfill/jobs', {
+    onRequest: [fastify.authenticate, requireWorkspaceRead()],
+  }, async (request, reply) => {
+    const jobs = request.workspace.hooks.backfillJobs.list();
+    const response = new ResponseObject().found(jobs, 'Backfill jobs retrieved', 200, jobs.length);
+    return reply.code(response.statusCode).send(response.getResponse());
+  });
+
+  // Ends between documents; job.finished reports `cancelled`.
+  fastify.delete('/backfill/jobs/:jobId', {
+    onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+  }, async (request, reply) => {
+    const job = request.workspace.hooks.backfillJobs.cancel(request.params.jobId);
+    const response = job ? new ResponseObject().found(job, 'Backfill job cancelling') : new ResponseObject().notFound('Backfill job not found');
+    return reply.code(response.statusCode).send(response.getResponse());
+  });
+
+  fastify.get('/backfill/jobs/:jobId', {
+    onRequest: [fastify.authenticate, requireWorkspaceRead()],
+  }, async (request, reply) => {
+    const job = request.workspace.hooks.backfillJobs.get(request.params.jobId);
+    const response = job ? new ResponseObject().found(job, 'Backfill job retrieved') : new ResponseObject().notFound('Backfill job not found');
+    return reply.code(response.statusCode).send(response.getResponse());
   });
 
   // Replay one logged run: reload the document(s) by id, rebuild the envelope

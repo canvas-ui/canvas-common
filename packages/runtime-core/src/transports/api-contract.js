@@ -17,7 +17,7 @@ import contextRoutes from './routes/contexts/index.js';
  * runtime attaching to a hub) can check `major === 2 && minor >= N` instead of
  * guessing from package versions. Bump it in the change that alters the contract.
  */
-export const API_VERSION = Object.freeze({ major: 2, minor: 9 });
+export const API_VERSION = Object.freeze({ major: 2, minor: 10 });
 
 // Service option keys decorated verbatim onto the instance when present.
 export const SERVICE_DECORATIONS = [
