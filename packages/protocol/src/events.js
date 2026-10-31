@@ -34,6 +34,11 @@ export const WORKSPACE_TREE_PATH_REMOVED = 'workspace.tree.path.removed';
 export const WORKSPACE_TREE_PATH_MOVED = 'workspace.tree.path.moved';
 export const WORKSPACE_TREE_PATH_COPIED = 'workspace.tree.path.copied';
 
+// Long-running workspace jobs: { workspaceId, workspaceName, job: { id, kind, status, … } }
+export const JOB_STARTED = 'job.started';
+export const JOB_PROGRESS = 'job.progress';
+export const JOB_FINISHED = 'job.finished';
+
 // Context events
 export const CONTEXT_URL_SET = 'context.url.set';
 export const CONTEXT_UPDATED = 'context.updated';
