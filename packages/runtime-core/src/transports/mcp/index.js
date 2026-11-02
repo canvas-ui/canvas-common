@@ -28,7 +28,7 @@ export function installMcp(app) {
                             query: route.schema?.querystring ? schemas.query : { type: 'object', additionalProperties: true },
                             body: schemas.body,
                             bodyBase64: { type: 'string', description: 'Raw request bytes, including multipart bodies. Set content-type with boundary in headers.' },
-                            headers: { type: 'object', properties: Object.fromEntries(['content-type', 'accept', 'range', 'if-match', 'if-none-match'].map(h => [h, { type: 'string' }])), additionalProperties: false },
+                            headers: { type: 'object', properties: Object.fromEntries(['content-type', 'accept', 'range', 'if-match', 'if-none-match', 'upload-offset', 'x-canvas-mtime'].map(h => [h, { type: 'string' }])), additionalProperties: false },
                         },
                         ...(params.length ? { required: ['params'] } : {}),
                     },
@@ -62,7 +62,7 @@ export function installMcp(app) {
             for (const entry of Array.isArray(value) ? value : [value]) query.append(key, String(entry));
         }
         const headers = { authorization };
-        for (const key of ['content-type', 'accept', 'range', 'if-match', 'if-none-match']) {
+        for (const key of ['content-type', 'accept', 'range', 'if-match', 'if-none-match', 'upload-offset', 'x-canvas-mtime']) {
             if (typeof args.headers?.[key] === 'string') headers[key] = args.headers[key];
         }
         try {

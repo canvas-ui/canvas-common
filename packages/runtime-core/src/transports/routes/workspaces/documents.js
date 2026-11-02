@@ -3,7 +3,7 @@
 import { downloadLink } from '../../../runtimes/workspace/services/download-link.js';
 import ResponseObject from '../../ResponseObject.js';
 import Ajv from 'ajv';
-import { querySpecSchema, candidateSpecSchema } from 'canvas-synapsd/src/query/schema.js';
+import { documentQuerySchema } from '../../document-query-schema.js';
 import { parseSpec } from 'canvas-synapsd/src/utils/spec.js';
 import { deleteDocumentsInBatches } from '../../../runtimes/workspace/db/bulk-delete.js';
 import { parseDocumentId, parseDocumentIdArray } from '../../../utils/documentId.js';
@@ -223,6 +223,43 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     return workspace;
   }
 
+  function readOptions(workspace, request) {
+    const binding = request.resourceToken;
+    return binding?.type === 'agent' && binding.basePath && binding.basePath !== '/'
+      ? { scope: { context: workspace.getContextTreeSelector(binding.basePath) } } : {};
+  }
+
+  // Authorize every explicitly addressed document before any batch mutation.
+  fastify.addHook('preHandler', async (request, reply) => {
+    const binding = request.resourceToken;
+    if (binding?.type !== 'agent' || !binding.basePath || binding.basePath === '/') return;
+    const workspace = await getWorkspaceInstance(request, reply);
+    if (!workspace) return reply;
+    const scope = readOptions(workspace, request).scope;
+    const ids = [request.params?.docId, request.body?.similarTo];
+    const body = request.body;
+    if (Array.isArray(body)) ids.push(...body);
+    if (body?.documentIds) ids.push(...(Array.isArray(body.documentIds) ? body.documentIds : [body.documentIds]));
+    for (const doc of [body?.documents || []].flat()) if (doc?.id !== undefined) ids.push(doc.id);
+    for (const spec of [body, body?.options, ...(body?.lines || [])]) {
+      const relations = Array.isArray(spec?.rel) ? spec.rel : spec?.rel ? [spec.rel] : [];
+      for (const rel of relations) ids.push(...(Array.isArray(rel.of) ? rel.of : [rel.of]));
+    }
+    if (request.params?.hash) {
+      const doc = await workspace.getByChecksumString(`${request.params.algo}/${request.params.hash}`);
+      if (!doc) return reply.code(404).send(new ResponseObject().notFound('Document not found in the agent bound scope').getResponse());
+      ids.push(doc.id);
+    }
+    for (const id of new Set(ids.filter(value => value !== undefined))) {
+      if (!await workspace.has(id, scope)) {
+        const response = ['GET', 'HEAD'].includes(request.method)
+          ? new ResponseObject().notFound('Document not found in the agent bound scope')
+          : new ResponseObject().forbidden('Document is outside the agent bound scope');
+        return reply.code(response.statusCode).send(response.getResponse());
+      }
+    }
+  });
+
   function buildAttributes(query) {
     const { allOf, noneOf, anyOf } = query;
     if (!allOf?.length && !noneOf?.length && !anyOf?.length) return undefined;
@@ -377,6 +414,11 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     q: { type: ['string', 'array'], items: { type: 'string' } },
     search: { type: 'string' },
     mode: { type: 'string', enum: ['fts', 'vector', 'hybrid'] },
+    // Search text grammar: bare words match in any order (all required,
+    // widening to any when nothing matches every word); a double-quoted
+    // segment is a verbatim phrase. 'exact' treats the whole text as one
+    // phrase. Any phrase ranks on FTS alone.
+    match: { type: 'string', enum: ['any', 'exact'] },
     // Optional cosine-distance floor for the dense side of vector/hybrid
     // search — drops weak (far) kNN hits before fusion. 0..2 (0 = identical).
     minDistance: { type: 'number' },
@@ -499,18 +541,20 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     if (queries.length > 1) {
       // Stacked queries → stateless multi-query refinement (AND-narrow, last ranks).
       documents = await workspace.searchRefined(queries, spec, {
+        ...readOptions(workspace, reply.request),
         limit: query.limit,
         offset: query.offset,
         mode: query.mode,
+        match: query.match,
         minDistance,
         maxDistance,
         debug: query.debug,
         debugLimit: query.debugLimit,
       });
     } else if (queries.length === 1) {
-      documents = await workspace.search({ query: queries[0], mode: query.mode, minDistance, maxDistance, debug: query.debug, debugLimit: query.debugLimit, ...spec });
+      documents = await workspace.search({ query: queries[0], mode: query.mode, match: query.match, minDistance, maxDistance, debug: query.debug, debugLimit: query.debugLimit, ...spec }, readOptions(workspace, reply.request));
     } else {
-      documents = await workspace.list(spec);
+      documents = await workspace.list(spec, readOptions(workspace, reply.request));
     }
     return { documents, ctxSelector, dirSelector, spec, isSearch };
   }
@@ -551,7 +595,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     } catch (error) {
       fastify.log.error(error);
-      const responseObject = new ResponseObject().serverError('Failed to list documents');
+      const responseObject = ResponseObject.fromError(error, 'Failed to list documents');
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     }
   });
@@ -565,27 +609,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     schema: {
       description: 'Query workspace documents with the native Synapsd spec: bitmap paths/features/timelines/relations, text ranking, IDs or countOnly. Empty spec selects the workspace. Compound lines intersect the shared spec, then combine by op. PDF MIME matches attachments; use includes relations to select their emails.',
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
-      body: {
-        ...querySpecSchema,
-        not: { required: ['query', 'lines'] },
-        dependencies: { op: ['lines'] },
-        properties: {
-          ...querySpecSchema.properties,
-          applyCanvasQuerySpec: { type: 'boolean', description: 'Apply saved canvas filters (default true) when selecting a canvas path.' },
-          lines: {
-            type: 'array', minItems: 1, maxItems: 16,
-            description: 'Independent candidate specs and optional text refinement chains. Each line ANDs with the shared spec; op combines the resulting sets.',
-            items: {
-              ...candidateSpecSchema,
-              properties: {
-                ...candidateSpecSchema.properties,
-                queries: { type: 'array', maxItems: 32, items: { type: 'string', minLength: 1 }, description: 'Text queries narrow sequentially; the last ranks survivors.' },
-              },
-            },
-          },
-          op: { type: 'string', enum: ['or', 'and'], description: 'Combine compound lines by union (default) or intersection.' },
-        },
-      },
+      body: documentQuerySchema,
     },
   }, async (request, reply) => {
     try {
@@ -598,9 +622,12 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       } catch (error) {
         return reply.code(400).send(new ResponseObject().badRequest(error.message).getResponse());
       }
+      const binding = request.resourceToken;
+      const scope = binding?.type === 'agent' && binding.basePath && binding.basePath !== '/'
+        ? { context: workspace.getContextTreeSelector(binding.basePath) } : undefined;
       const documents = lines
-        ? await workspace.searchCompound(lines, spec, { op })
-        : spec.query !== undefined ? await workspace.search(spec) : await workspace.list(spec);
+        ? await workspace.searchCompound(lines, spec, { op, scope })
+        : spec.query !== undefined ? await workspace.search(spec, { scope }) : await workspace.list(spec, { scope });
 
       if (documents.error) {
         fastify.log.error(`SynapsD error: ${documents.error}`);
@@ -614,7 +641,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     } catch (error) {
       fastify.log.error(error);
-      const responseObject = new ResponseObject().serverError('Failed to search documents');
+      const responseObject = ResponseObject.fromError(error, 'Failed to search documents');
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     }
   });
@@ -693,6 +720,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
         : resolveScopeSelectors(workspace, body, '/');
 
       const documents = await workspace.searchByImage({
+        authorizationScope: readOptions(workspace, request).scope,
         imageBytes,
         contentType,
         similarTo: body.similarTo ?? null,
@@ -723,7 +751,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     } catch (error) {
       fastify.log.error(error);
-      const responseObject = new ResponseObject().serverError('Failed to search by image');
+      const responseObject = ResponseObject.fromError(error, 'Failed to search by image');
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     }
   });
@@ -836,15 +864,6 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       let documents;
       const linkExisting = async rawIds => {
         const ids = parseDocumentIdArray(rawIds, 'Document ID array');
-        const binding = request.resourceToken;
-        if (binding?.type === 'agent' && binding.basePath && binding.basePath !== '/') {
-          const scope = { context: workspace.getContextTreeSelector(binding.basePath), directory: null };
-          for (const id of ids) {
-            if (!await workspace.has(id, scope)) {
-              throw Object.assign(new Error('Cannot link a document outside the agent\'s bound scope'), { statusCode: 403 });
-            }
-          }
-        }
         return workspace.linkMany(ids, treeSpec);
       };
       if (isTopLevelArray) {

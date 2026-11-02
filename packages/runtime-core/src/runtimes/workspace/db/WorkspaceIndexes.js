@@ -1,3 +1,4 @@
+import { requireQueryScope } from './query-scope.js';
 import { parseDocumentIdArray } from '../../../utils/documentId.js';
 
 export default class WorkspaceIndexes {
@@ -22,8 +23,8 @@ export default class WorkspaceIndexes {
         return await this.#runtime.getActiveDb().deleteDataset(name, { dropDocuments });
     }
 
-    async listBitmaps(...args) {
-        return this.#runtime.getActiveDb().listBitmaps(...args);
+    async listBitmaps(prefix, options = {}) {
+        return requireQueryScope(this.#runtime.getActiveDb(), options.scope).listBitmaps(prefix, options);
     }
 
     async getBitmap(...args) {

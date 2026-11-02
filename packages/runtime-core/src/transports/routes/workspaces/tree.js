@@ -2,6 +2,8 @@ import { emailListPreview } from '../../../runtimes/workspace/connectors/imap/co
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import { posix } from 'node:path';
+import { authorizeTreeRequest, scopedTreeView, treeScopeBase } from '../../middleware/tree-scope.js';
 import { labelBackendTree } from '../../../utils/backend-documents.js';
 import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/workspace-acl.js';
 import { ImportJobs } from '../../../runtimes/workspace/portability/import-jobs.js';
@@ -48,6 +50,7 @@ export default async function workspaceTreeRoutes(fastify) {
         reply.code(responseObject.statusCode).send(responseObject.getResponse());
         return null;
       }
+      if (!authorizeTreeRequest(request, reply, workspace, tree)) return null;
       return { workspace, tree };
     } catch (error) {
       // getTree() reaches into the workspace DB, so on a stopped workspace it
@@ -378,7 +381,7 @@ export default async function workspaceTreeRoutes(fastify) {
     try {
       const resolved = await getTreeInstance(request, reply);
       if (!resolved) return;
-      const treeView = resolved.tree.buildJsonTree();
+      const treeView = scopedTreeView(resolved.tree.buildJsonTree(), treeScopeBase(request));
       if (isBackendsTree(resolved.workspace, resolved.tree) && typeof resolved.workspace.getBackendTrashTree === 'function') {
         // A read-only virtual mount. Never insert recovery blobs as ordinary
         // documents or persist Trash into the physical backend mirror tree.
@@ -402,7 +405,8 @@ export default async function workspaceTreeRoutes(fastify) {
     try {
       const resolved = await getTreeInstance(request, reply);
       if (!resolved) return;
-      const paths = resolved.tree.paths;
+      const base = treeScopeBase(request);
+      const paths = resolved.tree.paths.filter(path => !base || path === base || path.startsWith(`${base}/`));
       const responseObject = new ResponseObject().found(paths, 'Tree paths retrieved successfully', 200, paths.length);
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     } catch (error) {
@@ -592,6 +596,17 @@ export default async function workspaceTreeRoutes(fastify) {
         }
         toPath = r.finalPath;
       }
+      // Copying into the source subtree grows that subtree during traversal.
+      const comparisonPath = value => {
+        const normalized = posix.normalize(`/${value}`).replace(/\/+/g, '/').replace(/\/$/, '') || '/';
+        return resolved.tree.type === 'context' ? normalized.toLowerCase() : normalized;
+      };
+      const source = comparisonPath(fromPath);
+      const destination = comparisonPath(toPath);
+      if (source === '/' || destination === source || destination.startsWith(`${source}/`)) {
+        const response = new ResponseObject().badRequest('Cannot copy a path into itself or its descendants');
+        return reply.code(response.statusCode).send(response.getResponse());
+      }
       const result = await resolved.tree.copyPath(fromPath, toPath, request.body.recursive);
       const responseObject = new ResponseObject().success(result, 'Tree path copied successfully');
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
@@ -721,6 +736,7 @@ export default async function workspaceTreeRoutes(fastify) {
           order: { type: 'string', enum: ['asc', 'desc'], default: 'desc' },
           sortBy: { type: 'string' },
           mode: { type: 'string' },
+          match: { type: 'string', enum: ['any', 'exact'] },
         },
       },
     },
@@ -759,9 +775,9 @@ export default async function workspaceTreeRoutes(fastify) {
       };
       let documents;
       if (queries.length > 1) {
-        documents = await workspace.searchRefined(queries, spec, { limit: request.query.limit, offset: request.query.offset, mode: request.query.mode });
+        documents = await workspace.searchRefined(queries, spec, { limit: request.query.limit, offset: request.query.offset, mode: request.query.mode, match: request.query.match });
       } else if (queries.length === 1) {
-        documents = await workspace.search({ query: queries[0], mode: request.query.mode, ...spec });
+        documents = await workspace.search({ query: queries[0], mode: request.query.mode, match: request.query.match, ...spec });
       } else {
         documents = await workspace.list(spec);
       }

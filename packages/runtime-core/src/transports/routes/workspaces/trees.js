@@ -1,13 +1,20 @@
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import { treeScopeBase } from '../../middleware/tree-scope.js';
 
 export default async function workspaceTreesRoutes(fastify) {
+  fastify.addHook('preHandler', async (request, reply) => {
+    if (treeScopeBase(request) && request.method !== 'GET') {
+      return reply.code(403).send({ statusCode: 403, message: 'Tree management requires a workspace-wide binding' });
+    }
+  });
+
   async function getWorkspaceInstance(request, reply) {
     const identifier = request.params.id;
     const userId = request.user.id;
     const isWorkspaceId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identifier);
-    const workspaceId = isWorkspaceId ? identifier : fastify.workspaceManager.resolveWorkspaceId(userId, identifier);
+    const workspaceId = isWorkspaceId ? identifier : await fastify.workspaceManager.resolveWorkspaceId(userId, identifier);
     if (!workspaceId) {
       const responseObject = new ResponseObject().notFound(`Workspace with ID ${identifier} not found`);
       reply.code(responseObject.statusCode).send(responseObject.getResponse());
@@ -28,7 +35,8 @@ export default async function workspaceTreesRoutes(fastify) {
   }, async (request, reply) => {
     const workspace = await getWorkspaceInstance(request, reply);
     if (!workspace) return reply;
-    const trees = await workspace.listTrees(request.query?.type || null);
+    const available = await workspace.listTrees(request.query?.type || null);
+    const trees = treeScopeBase(request) ? available.filter(tree => tree.id === workspace.getTree().id) : available;
     const count = Array.isArray(trees) ? trees.length : 0;
     const responseObject = new ResponseObject().found(trees, 'Trees retrieved successfully', 200, count, count);
     return reply.code(responseObject.statusCode).send(responseObject.getResponse());

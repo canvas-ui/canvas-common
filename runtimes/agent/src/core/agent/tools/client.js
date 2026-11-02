@@ -32,10 +32,11 @@ export class CanvasApiClient {
      * @param {Object} [options]
      * @param {Object} [options.query] - query params; array values repeat the key
      * @param {Object} [options.body]
+     * @param {'content'} [options.responseType] Return MIME plus bounded text/base64 bytes.
      * @param {AbortSignal} [options.signal]
      * @returns {Promise<Object>} parsed ResponseObject envelope ({ status, statusCode, message, payload, count, totalCount })
      */
-    async request(method, pathname, { query, body, signal } = {}) {
+    async request(method, pathname, { query, body, signal, responseType } = {}) {
         const url = new URL(`${this.#baseUrl}${pathname}`);
         for (const [key, value] of Object.entries(query || {})) {
             if (value === undefined || value === null || value === '') continue;
@@ -56,6 +57,27 @@ export class CanvasApiClient {
             ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         });
 
+        if (response.ok && responseType === 'content') {
+            const type = response.headers.get('content-type') || 'application/octet-stream';
+            const reader = response.body?.getReader();
+            const chunks = [];
+            let size = 0;
+            if (reader) {
+                try {
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        size += value.byteLength;
+                        if (size > 1024 * 1024) throw new Error('Content exceeds the 1 MiB tool limit; retrieve it through the authenticated REST content endpoint.');
+                        chunks.push(Buffer.from(value));
+                    }
+                } catch (error) { await reader.cancel(); throw error; }
+                finally { reader.releaseLock(); }
+            }
+            const bytes = Buffer.concat(chunks);
+            return { contentType: type, size: bytes.length,
+                ...(type.startsWith('text/') || type.includes('json') ? { text: bytes.toString('utf8') } : { bodyBase64: bytes.toString('base64') }) };
+        }
         let envelope = null;
         try {
             envelope = await response.json();

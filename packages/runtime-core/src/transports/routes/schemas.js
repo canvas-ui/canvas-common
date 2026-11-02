@@ -1,5 +1,6 @@
 'use strict';
 
+import { documentQuerySchema } from '../document-query-schema.js';
 import ResponseObject from '../ResponseObject.js';
 import schemaRegistry from 'canvas-synapsd/src/schemas/SchemaRegistry.js';
 
@@ -9,6 +10,10 @@ import schemaRegistry from 'canvas-synapsd/src/schemas/SchemaRegistry.js';
  * @param {Object} options - Plugin options
  */
 export default async function schemaRoutes(fastify, _options) {
+  fastify.get('/query', { schema: { description: 'JSON Schema for the complete native document search request, including exact text, compound lines and bitmap predicates.' } }, async (_request, reply) => {
+    return reply.send(new ResponseObject().found(documentQuerySchema, 'Document query schema').getResponse());
+  });
+
   // List all data schemas
   fastify.get('/', {
   }, async (request, reply) => {

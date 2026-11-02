@@ -69,6 +69,7 @@ export default async function documentRoutes(fastify, _options) {
           q: { anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
           search: { type: 'string' },
           mode: { type: 'string', enum: ['fts', 'vector', 'hybrid'] },
+          match: { type: 'string', enum: ['any', 'exact'] },
           // When false, don't fold the context's STORED binding — the caller is
           // driving filters itself (web live-preview). Bound clients omit it and
           // inherit the context's saved view. Default true.
@@ -118,7 +119,7 @@ export default async function documentRoutes(fastify, _options) {
       const spec = { attributes, filters, options, applyContextSpec: request.query.applyContextSpec, currentPathOnly: request.query.currentPathOnly };
 
       const dbResult = searchQuery
-        ? await context.search(request.user.id, { query: searchQuery, mode: request.query.mode, ...spec })
+        ? await context.search(request.user.id, { query: searchQuery, mode: request.query.mode, match: request.query.match, ...spec })
         : await context.list(request.user.id, spec);
 
       if (dbResult.error) {

@@ -13,7 +13,9 @@
     "format": "prettier --write \"packages/**/*.{js,md,json}\"",
     "publish:npm": "node scripts/publish-npm.mjs",
     "runtime:refresh": "node scripts/regenerate-runtime-core.mjs",
-    "runtime:check": "node scripts/regenerate-runtime-core.mjs --check"
+    "runtime:check": "node scripts/regenerate-runtime-core.mjs --check",
+    "agent:refresh": "node scripts/regenerate-agent-tools.mjs",
+    "agent:check": "node scripts/regenerate-agent-tools.mjs --check"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
@@ -22,7 +24,7 @@
     "globals": "^16.5.0",
     "prettier": "^3.6.2"
   },
-  "version": "0.3.31",
+  "version": "0.3.36",
   "exports": {
     "./*": "./packages/runtime-core/src/*",
     "./host": "./packages/runtime-core/src/runtimes/workspace/runtime/host.js"
@@ -73,6 +75,6 @@
     "sharp": "^0.35.3",
     "undici": "^8.7.0",
     "uuid": "^11.1.1",
-    "@augmentd-labs/canvas-agent-runtime": "^0.1.0"
+    "@augmentd-labs/canvas-agent-runtime": "^0.1.3"
   }
 }

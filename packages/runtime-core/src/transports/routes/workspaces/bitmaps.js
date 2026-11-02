@@ -64,7 +64,11 @@ export default async function workspaceBitmapRoutes(fastify, _options) {
         return reply.code(responseObject.statusCode).send(responseObject.getResponse());
       }
 
+      const binding = request.resourceToken;
+      const scope = binding?.type === 'agent' && binding.basePath && binding.basePath !== '/'
+        ? { context: workspace.getContextTreeSelector(binding.basePath) } : undefined;
       const bitmaps = await workspace.listBitmaps('', {
+        scope,
         includeData: request.query.includeData === true,
         includeInternal: parseBool(request.query.includeInternal)
       });
@@ -72,7 +76,7 @@ export default async function workspaceBitmapRoutes(fastify, _options) {
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     } catch (error) {
       fastify.log.error(error);
-      const responseObject = new ResponseObject().serverError('Failed to list bitmaps');
+      const responseObject = ResponseObject.fromError(error, 'Failed to list bitmaps');
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     }
   });

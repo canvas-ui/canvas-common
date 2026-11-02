@@ -41,10 +41,13 @@ export default class WorkspaceInference {
      * stored (see the adapter in #registerInferd). Returns immediately; poll
      * `imageSummaryStatus()`.
      */
-    async startImageSummaries({ force = false } = {}) {
+    async startImageSummaries({ force = false, scope = null } = {}) {
         if (!this.#workspace.isActive) { throw new Error('Workspace is not active'); }
         if (!this.#runtime.state.inferd) { throw new Error('Inference service is not available'); }
-        return this.#runtime.state.inferd.startImageSummaries(this.#workspace.id, { force: force === true });
+        return this.#runtime.state.inferd.startImageSummaries(this.#workspace.id, {
+            force: force === true,
+            ...(scope ? { scope } : {}),
+        });
     }
 
     /**
@@ -61,10 +64,18 @@ export default class WorkspaceInference {
         return this.#runtime.state.inferd.stopImageSummaries(this.#workspace.id);
     }
 
-    /** Document ids of every image in this workspace — the caption run's input set. */
-    async imageDocumentIds() {
+    /**
+     * Document ids of the images a caption run should visit: every image in
+     * this workspace, or only those under `scope` (`ctx://…` / `dir://…`).
+     */
+    async imageDocumentIds(scope = null) {
         const bitmap = await this.#workspace.getBitmap('data/mime/image', { includeData: true });
-        return Array.isArray(bitmap?.ids) ? bitmap.ids : [];
+        const ids = Array.isArray(bitmap?.ids) ? bitmap.ids : [];
+        if (!scope) { return ids; }
+        const under = await this.documentIdsUnderScope(scope);
+        if (under === null) { throw new Error(`Unknown path scope: ${scope}`); }
+        const inScope = new Set(under);
+        return ids.filter(id => inScope.has(id));
     }
 
     /** Store a caption the daemon produced. */
@@ -188,7 +199,7 @@ export default class WorkspaceInference {
             getUnembedded: (space, schemas) => this.#workspace.getUnembeddedDocIds(space, schemas),
             documentIdsUnderScope: (scope) => this.#workspace.documentIdsUnderScope(scope),
             clearSpace: (space) => this.#workspace.clearSpace(space),
-            imageDocumentIds: () => this.#workspace.imageDocumentIds(),
+            imageDocumentIds: (scope) => this.#workspace.imageDocumentIds(scope),
             setSummary: (docId, text) => this.#workspace.setDocumentSummary(docId, text),
             onQueueDrained: () => {
                 // The shared queue drains after every trickle (a single note

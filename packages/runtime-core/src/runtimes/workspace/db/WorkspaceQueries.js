@@ -1,3 +1,4 @@
+import { requireQueryScope } from './query-scope.js';
 import { parseDocumentId } from '../../../utils/documentId.js';
 import Workspace from '../Workspace.js';
 import { parseSpec } from 'canvas-synapsd/src/utils/spec.js';
@@ -7,19 +8,21 @@ export default class WorkspaceQueries {
     #runtime;
     constructor(workspace, runtime) { this.#workspace = workspace; this.#runtime = runtime; }
 
-    async list(spec = {}) {
+    async list(spec = {}, options = {}) {
+        requireQueryScope(this.#runtime.getActiveDb(), options.scope);
         const querySpec = this.#runtime.docs.normalizeQuerySpec(this.composeCanvasQuerySpec(spec));
         const searchQuery = querySpec.query ?? querySpec.search ?? querySpec.q;
         if (typeof searchQuery === 'string' && searchQuery.trim()) {
-            return await this.#runtime.getActiveDb().search(querySpec);
+            return await this.#runtime.getActiveDb().search(querySpec, options);
         }
-        return await this.#runtime.getActiveDb().list(querySpec);
+        return await this.#runtime.getActiveDb().list(querySpec, options);
     }
 
-    async search(spec = {}) {
+    async search(spec = {}, options = {}) {
+        requireQueryScope(this.#runtime.getActiveDb(), options.scope);
         const querySpec = this.#runtime.docs.normalizeQuerySpec(this.composeCanvasQuerySpec(spec));
         if (querySpec.maxDistance === undefined) { querySpec.maxDistance = Workspace.DEFAULT_MAX_COSINE_DISTANCE; }
-        return await this.#runtime.getActiveDb().search(querySpec);
+        return await this.#runtime.getActiveDb().search(querySpec, options);
     }
 
     // Stateless multi-query refinement: `spec` supplies the structured scope
@@ -27,6 +30,7 @@ export default class WorkspaceQueries {
     // queries that AND-narrow it (last ranks). Text is passed separately, so any
     // single query carried on the spec is dropped from the base scope.
     async searchRefined(queries = [], spec = {}, options = {}) {
+        requireQueryScope(this.#runtime.getActiveDb(), options.scope);
         const baseSpec = this.#runtime.docs.normalizeQuerySpec(this.composeCanvasQuerySpec(spec));
         delete baseSpec.query; delete baseSpec.search; delete baseSpec.q;
         const opts = { ...parseSpec(baseSpec).options, ...options };
@@ -38,6 +42,7 @@ export default class WorkspaceQueries {
     // supplies the shared structured scope, each line its own query chain (+
     // optional per-line filters). See SynapsD.searchCompound for semantics.
     async searchCompound(lines = [], spec = {}, options = {}) {
+        requireQueryScope(this.#runtime.getActiveDb(), options.scope);
         const baseSpec = this.#runtime.docs.normalizeQuerySpec(this.composeCanvasQuerySpec(spec));
         delete baseSpec.query; delete baseSpec.search; delete baseSpec.q;
         const opts = { ...parseSpec(baseSpec).options, ...options, baseSpec };
@@ -167,8 +172,8 @@ export default class WorkspaceQueries {
      * exclude the similarTo self-match (RRF has no excludeIds); callers pair
      * similarTo with text knowing the reference doc may rank first.
      */
-    async searchByImage({ imageBytes = null, contentType = null, similarTo = null, text = null, spec = {}, limit, offset, minDistance, maxDistance, debug = false, idsOnly = false } = {}) {
-        const db = this.#runtime.getActiveDb();
+    async searchByImage({ imageBytes = null, contentType = null, similarTo = null, text = null, spec = {}, limit, offset, minDistance, maxDistance, debug = false, idsOnly = false, authorizationScope } = {}) {
+        const db = requireQueryScope(this.#runtime.getActiveDb(), authorizationScope);
         let vector;
         let excludeIds = [];
         if (imageBytes) {
@@ -213,12 +218,12 @@ export default class WorkspaceQueries {
                 },
                 limit, offset, idsOnly, debug,
                 maxDistance: Workspace.DEFAULT_MAX_COSINE_DISTANCE, // text dense leg floor
-            });
+            }, { scope: authorizationScope });
         }
 
         return await db.searchByVector(vector, querySpec, {
             space: 'image', limit, offset, minDistance, maxDistance,
-            withDistances: !!debug, idsOnly, excludeIds,
+            withDistances: !!debug, idsOnly, excludeIds, scope: authorizationScope,
         });
     }
 

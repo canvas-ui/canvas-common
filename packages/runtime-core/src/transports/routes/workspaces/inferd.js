@@ -141,6 +141,8 @@ export default async function workspaceInferdRoutes(fastify, _options) {
                 type: 'object',
                 properties: {
                     force: { type: 'boolean' },
+                    // `ctx://…` / `dir://…`: caption only images under that path.
+                    scope: { type: 'string', maxLength: 4096 },
                 },
                 additionalProperties: false,
             },
@@ -155,6 +157,7 @@ export default async function workspaceInferdRoutes(fastify, _options) {
         try {
             const result = await workspace.startImageSummaries({
                 force: request.body?.force === true,
+                scope: request.body?.scope?.trim() || null,
             });
             if (!result.started) {
                 const r = new ResponseObject().badRequest(result.error || 'Could not start image summaries');

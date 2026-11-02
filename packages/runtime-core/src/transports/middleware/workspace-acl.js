@@ -1,3 +1,4 @@
+import { requiredPermission } from '../../runtimes/workspace/security/access.js';
 import { workspaceStopped, workspaceNotReady, workspaceErrorResponse } from '../../runtimes/workspace/runtime/errors.js';
 'use strict';
 
@@ -515,8 +516,7 @@ export async function enforceWorkspaceTokenScope(request, reply) {
 
   if (inWorkspacesApi && matchesBinding) {
     const method = request.method || 'GET';
-    const readPost = method === 'POST' && /\/(search(\/image)?|query|resolve|preview|exports\/ticket|copy-to-workspace)(\/|$)/.test(url);
-    const permission = ['GET', 'HEAD', 'OPTIONS', 'PROPFIND'].includes(method) || readPost ? 'read' : 'write';
+    const permission = requiredPermission(method, url);
     if (binding.permissions?.includes(permission)) return;
     const response = new ResponseObject().forbidden(`Workspace token lacks required permission: ${permission}`);
     return reply.code(response.statusCode).send(response.getResponse());

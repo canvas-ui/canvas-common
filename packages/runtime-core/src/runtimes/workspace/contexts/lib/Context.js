@@ -1392,7 +1392,7 @@ class Context extends EventEmitter {
         } else if (queries.length === 1 && typeof callerQuery === 'string' && !binding.queries?.length) {
             result = await workspace.search({ ...scan, query: queries[0] });
         } else if (queries.length) {
-            result = await workspace.searchRefined(queries, scan, { ...options, limit: scan.limit, offset: scan.offset, page: scan.page, idsOnly: scan.idsOnly, sortBy: scan.sortBy, order: scan.order, mode: rest.mode });
+            result = await workspace.searchRefined(queries, scan, { ...options, limit: scan.limit, offset: scan.offset, page: scan.page, idsOnly: scan.idsOnly, sortBy: scan.sortBy, order: scan.order, mode: rest.mode, match: rest.match });
         } else {
             result = await workspace.list(scan);
         }

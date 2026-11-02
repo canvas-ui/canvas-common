@@ -1,6 +1,7 @@
 'use strict';
 
 import path from 'path';
+import { requiredPermission } from '../../runtimes/workspace/security/access.js';
 import { createLogger } from '../../utils/log.js';
 import ResponseObject from '../ResponseObject.js';
 
@@ -13,9 +14,9 @@ const logger = createLogger('canvas-server:middleware:agent-acl');
  * resource binding: { workspaceId, basePath, permissions }. This middleware is
  * the data-plane clamp:
  *  - the addressed workspace must be the bound workspace
- *  - method → permission (GET/HEAD = read, everything else = write)
- *  - every path input (query.context, body.context, tree wildcard) must stay
- *    under basePath; missing paths default to basePath
+ *  - the runtime permission classifier distinguishes read queries from writes
+ *  - filing/navigation paths are clamped to basePath
+ *  - native document search uses an independent mandatory candidate scope
  *
  * Non-data-plane routes (agents CRUD, admin, users, roles) reject agent
  * tokens outright via rejectAgentTokens.
@@ -60,10 +61,6 @@ function forbidden(reply, message) {
     return reply.code(response.statusCode).send(response.getResponse());
 }
 
-function requiredPermissionForMethod(method) {
-    return ['GET', 'HEAD', 'OPTIONS'].includes(method) ? 'read' : 'write';
-}
-
 // Resolve the addressed workspace (route param) to an id for binding compare.
 function resolveAddressedWorkspaceId(request) {
     const identifier = request.params?.id;
@@ -94,11 +91,18 @@ export async function enforceAgentBinding(request, reply) {
         }
     }
 
-    // 2. Method → permission
-    const needed = requiredPermissionForMethod(request.method);
+    // 2. Runtime operation permission
+    const needed = requiredPermission(request.method, request.url);
     if (!binding.permissions?.includes(needed)) {
         return forbidden(reply, `Agent token lacks required permission: ${needed}`);
     }
+
+    // Native search preserves independent path/feature OR groups. Its handler
+    // supplies a separate mandatory candidate scope before ranking and paging.
+    if (request.method === 'POST' && /\/documents\/search\/?(?:\?|$)/.test(request.url || '')) return;
+
+    // Tree handlers validate their own tree identity, paths and shared-layer scope.
+    if (/\/workspaces\/[^/]+\/trees?(?:\/|$)/.test((request.url || '').split('?')[0])) return;
 
     // 3. Path clamp
     const basePath = binding.basePath || '/';
@@ -118,11 +122,11 @@ export async function enforceAgentBinding(request, reply) {
     }
 
     if (request.body !== undefined && request.body !== null) {
-        if (Array.isArray(request.body)) {
+        if (Array.isArray(request.body) && !(request.method === 'DELETE' && /\/documents\/remove(?:\?|$)/.test(request.url || ''))) {
             // Top-level id arrays insert at '/', which a path-bound agent may not do.
             return forbidden(reply, 'Path-bound agent tokens must use the object body form with an explicit context');
         }
-        if (typeof request.body === 'object') {
+        if (typeof request.body === 'object' && !Array.isArray(request.body)) {
             const contexts = Array.isArray(request.body.context) ? request.body.context : [request.body.context];
             const clamped = contexts.map((entry) => clampPathToBase(basePath, entry));
             if (clamped.some((entry) => entry === null)) {
@@ -132,14 +136,7 @@ export async function enforceAgentBinding(request, reply) {
         }
     }
 
-    // Tree routes address paths via the wildcard segment.
-    if (typeof request.params?.['*'] === 'string') {
-        const clamped = clampPathToBase(basePath, request.params['*']);
-        if (clamped === null) {
-            return forbidden(reply, `Tree path is outside the agent's bound scope (${basePath})`);
-        }
-        request.params['*'] = clamped;
-    }
+
 }
 
 /**

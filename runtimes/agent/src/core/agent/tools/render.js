@@ -10,10 +10,10 @@
  * testable and can be mirrored 1:1 by other runtimes (canvas-agentd).
  */
 
-export const SCHEMA_PREFIX = 'data/schema/';
+const SCHEMA_PREFIX = 'data/schema/';
 
 // Short names the model may use instead of full schema ids.
-export const SCHEMA_ALIASES = {
+const SCHEMA_ALIASES = {
     email: 'data/schema/message/email',
     emails: 'data/schema/message/email',
     mail: 'data/schema/message/email',
@@ -66,12 +66,7 @@ export function resolveSchema(value) {
 }
 
 /** Short schema label for listings: data/schema/message/email -> email */
-export function shortSchema(schema) {
-    const value = String(schema || '');
-    if (!value.startsWith(SCHEMA_PREFIX)) return value || 'document';
-    const rest = value.slice(SCHEMA_PREFIX.length);
-    return rest.split('/').filter(Boolean).pop() || rest || 'document';
-}
+
 
 // ── Paths / time ─────────────────────────────────────────────────────────
 
@@ -83,35 +78,11 @@ export function normalizePath(value) {
     return trimmed || '/';
 }
 
-/**
- * Parse an absolute ISO timestamp or a relative duration ("30m", "24h", "7d",
- * "2w") into a Date. Returns null when unparseable.
- */
-export function parseSince(value, now = new Date()) {
-    const raw = String(value ?? '').trim();
-    if (!raw) return null;
-    const relative = raw.match(/^(\d+(?:\.\d+)?)\s*([mhdw])$/i);
-    if (relative) {
-        const amount = parseFloat(relative[1]);
-        const unitMs = { m: 60e3, h: 3600e3, d: 86400e3, w: 7 * 86400e3 }[relative[2].toLowerCase()];
-        return new Date(now.getTime() - amount * unitMs);
-    }
-    const parsed = new Date(raw);
-    return Number.isNaN(parsed.getTime()) ? null : parsed;
-}
-
-export function formatDate(value) {
+function formatDate(value) {
     if (!value) return '';
     const date = value instanceof Date ? value : new Date(value);
     if (Number.isNaN(date.getTime())) return String(value);
     return date.toISOString().replace('T', ' ').slice(0, 16);
-}
-
-/** Best "when" for a document: content date first, then crud timestamps. */
-export function documentDate(doc) {
-    const data = doc?.data || {};
-    return data.date || data.receivedAt || data.sentAt || data.start || data.timestamp
-        || doc?.createdAt || doc?.created_at || null;
 }
 
 // ── Trees ────────────────────────────────────────────────────────────────
@@ -164,7 +135,7 @@ export function formatPaths(entries) {
 const HTML_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: '\'', nbsp: ' ' };
 
 /** Crude but dependency-free HTML → text (emails without a plain body). */
-export function htmlToText(html) {
+function htmlToText(html) {
     if (!html) return '';
     return String(html)
         .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
@@ -186,18 +157,15 @@ export function htmlToText(html) {
         .trim();
 }
 
-export function truncate(text, max) {
+function truncate(text, max) {
     const value = String(text ?? '');
     if (!max || value.length <= max) return value;
     return `${value.slice(0, max)}\n… [truncated, ${value.length - max} more characters]`;
 }
 
-function oneLine(text, max = 100) {
-    const value = String(text ?? '').replace(/\s+/g, ' ').trim();
-    return value.length > max ? `${value.slice(0, max - 1)}…` : value;
-}
 
-export function formatAddress(entry) {
+
+function formatAddress(entry) {
     if (!entry) return '';
     if (typeof entry === 'string') return entry;
     const { name, address, email, displayName } = entry;
@@ -229,70 +197,6 @@ function fileName(doc) {
         }
     }
     return '';
-}
-
-// ── Document summaries (one line) ────────────────────────────────────────
-
-/**
- * One-line summary for listings: "#id  kind  date  key facts".
- * @param {Object} doc
- * @returns {string}
- */
-export function summarizeDocument(doc) {
-    if (!doc || typeof doc !== 'object') return String(doc);
-    const kind = shortSchema(doc.schema);
-    const data = doc.data || {};
-    const head = `#${doc.id}  ${kind}  ${formatDate(documentDate(doc))}`;
-    const schema = String(doc.schema || '');
-
-    if (schema === SCHEMA_ALIASES.email) {
-        const flags = [];
-        if (data.isRead === false) flags.push('unread');
-        if (data.isFlagged) flags.push('flagged');
-        if (data.attachments?.length) flags.push(`${data.attachments.length} attachment${data.attachments.length === 1 ? '' : 's'}`);
-        return `${head}  from: ${oneLine(formatAddress(data.from), 60)}  subject: ${oneLine(data.subject || '(no subject)', 120)}`
-            + (flags.length ? `  [${flags.join(', ')}]` : '');
-    }
-    if (schema === SCHEMA_ALIASES.message) {
-        const sender = data.sender ? (data.sender.displayName || data.sender.name || data.sender.username || data.sender.id) : '';
-        const channel = data.channel?.name || data.channel?.id || '';
-        return `${head}  ${sender ? `from: ${sender}  ` : ''}${channel ? `in: ${channel}  ` : ''}${oneLine(data.text, 140)}`;
-    }
-    if (schema === SCHEMA_ALIASES.note) {
-        return `${head}  ${data.title ? `title: ${oneLine(data.title, 80)}  ` : ''}${oneLine(data.content, 120)}`;
-    }
-    if (schema === SCHEMA_ALIASES.tab || schema === SCHEMA_ALIASES.link) {
-        return `${head}  ${data.title ? `${oneLine(data.title, 80)}  ` : ''}${data.url || ''}`;
-    }
-    if (schema === SCHEMA_ALIASES.file) {
-        return `${head}  ${fileName(doc)}${data.mimeType ? `  (${data.mimeType})` : ''}`;
-    }
-    if (schema === SCHEMA_ALIASES.task) {
-        const bits = [data.status, data.dueDate ? `due ${formatDate(data.dueDate)}` : null, data.priority ? `p${data.priority}` : null].filter(Boolean);
-        return `${head}  ${oneLine(data.title, 100)}${bits.length ? `  [${bits.join(', ')}]` : ''}`;
-    }
-    if (under(schema, SCHEMA_ALIASES.event)) {
-        const when = data.end ? `${formatDate(data.start)} → ${formatDate(data.end)}` : formatDate(data.start);
-        return `${head}  ${oneLine(data.title, 100)}  ${when}${data.location ? `  @ ${oneLine(data.location, 60)}` : ''}`;
-    }
-    if (schema.startsWith(SCHEMA_ALIASES.identity)) {
-        const bits = [schemaLeaf(schema, SCHEMA_ALIASES.identity), data.primaryEmail].filter(Boolean);
-        return `${head}  ${oneLine(data.displayName, 80)}${bits.length ? `  (${bits.join(', ')})` : ''}`;
-    }
-    return `${head}  ${oneLine(JSON.stringify(data), 140)}`;
-}
-
-/**
- * Render a document list as text for the model.
- */
-export function formatDocumentList(documents, { count, totalCount, scopeLine } = {}) {
-    const lines = [];
-    const shown = documents.length;
-    const total = Number.isInteger(totalCount) ? totalCount : (Number.isInteger(count) ? count : shown);
-    lines.push(`${shown} document${shown === 1 ? '' : 's'} shown${total > shown ? ` of ${total}` : ''}${scopeLine ? ` — ${scopeLine}` : ''}`);
-    for (const doc of documents) lines.push(summarizeDocument(doc));
-    if (shown) lines.push('Use canvas_get with a document id to read one in full.');
-    return lines.join('\n');
 }
 
 // ── Full document rendering ──────────────────────────────────────────────
@@ -365,8 +269,10 @@ export function renderDocument(doc, { maxChars = 12000 } = {}) {
     }
 
     if (schema === SCHEMA_ALIASES.tab || schema === SCHEMA_ALIASES.link) {
-        if (data.title) lines.push(`Title: ${data.title}`);
-        lines.push(`URL: ${data.url || ''}`);
+        const title = schema === SCHEMA_ALIASES.link ? data.label || data.title : data.title;
+        const url = schema === SCHEMA_ALIASES.link ? data.uri : data.url;
+        if (title) lines.push(`Title: ${title}`);
+        lines.push(`URL: ${url || ''}`);
         if (data.description) lines.push('', truncate(data.description, maxChars));
         return lines.join('\n');
     }
