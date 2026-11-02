@@ -74,18 +74,26 @@ export default class WorkspaceDocuments {
         }
     }
 
-    #assertDestinationPaths(context, directory, createPath) {
-        if (createPath !== false) return;
+    // Destination paths that do not exist yet, in `ctx:`/`dir:` spelling.
+    #missingDestinationPaths(context, directory) {
+        const missing = [];
         for (const [type, selector] of [['context', context], ['directory', directory]]) {
             if (selector == null) continue;
             const treeRef = typeof selector === 'object' ? selector.tree ?? selector.treeId : null;
             const tree = treeRef ? this.#workspace.getTree(treeRef)
                 : type === 'directory' ? this.#workspace.getDefaultDirectoryTree() : this.#workspace.getDefaultContextTree();
             for (const path of WorkspaceDocuments.#extractPaths(selector)) {
-                if (!tree.getLayerForPath(path)) {
-                    throw Object.assign(new Error(`Destination path does not exist: ${path}. Set createPath: true to create it.`), { statusCode: 404, code: 'PATH_NOT_FOUND' });
-                }
+                if (!tree.getLayerForPath(path)) missing.push(`${type === 'directory' ? 'dir' : 'ctx'}:${path}`);
             }
+        }
+        return missing;
+    }
+
+    #assertDestinationPaths(context, directory, createPath) {
+        if (createPath !== false) return;
+        const [missing] = this.#missingDestinationPaths(context, directory);
+        if (missing) {
+            throw Object.assign(new Error(`Destination path does not exist: ${missing.slice(4)}. Set createPath: true to create it.`), { statusCode: 404, code: 'PATH_NOT_FOUND' });
         }
     }
 
@@ -407,13 +415,15 @@ export default class WorkspaceDocuments {
         this.#assertBackendsWriteAllowed(directory, allowBackendsWrite);
         this.#assertDestinationPaths(context, directory, createPath);
         const docIds = parseDocumentIdArray(ids, 'Document ID array');
+        // Reported back so a caller can tell a new folder from a new membership.
+        const createdPaths = this.#missingDestinationPaths(context, directory);
         const result = await this.#runtime.getActiveDb().linkMany(docIds, {
             ...WorkspaceDocuments.buildWriteSpec(context, directory),
             features: this.#normalizeFeatureInput(features, attributes),
             emitEvent,
         });
         await this.#cascadeThreadContext('link', docIds, context, emitEvent);
-        return result;
+        return { ...result, createdPaths };
     }
 
     /** Bulk `unlink`; `options.trashIfOrphaned` applies the same rule per document. */

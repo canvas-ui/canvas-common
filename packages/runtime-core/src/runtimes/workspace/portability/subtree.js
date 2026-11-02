@@ -4,7 +4,7 @@ import { parseInitializeDocument } from 'canvas-synapsd/src/utils/document.js';
 import { predicateId } from 'canvas-synapsd/src/indexes/edges/predicates.js';
 
 const FORMAT = 'canvas-subtree';
-const CONTACT_RELATIONS = new Set(['authored-by', 'addressed-to', 'mentions', 'depicts', 'member-of']);
+const CONTACT_RELATIONS = new Set(['authored-by', 'addressed-to', 'reply-to', 'mentions', 'depicts', 'member-of']);
 const clone = value => JSON.parse(JSON.stringify(value));
 const fail = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const join = (parent, child) => `${parent === '/' ? '' : parent}/${child}`;

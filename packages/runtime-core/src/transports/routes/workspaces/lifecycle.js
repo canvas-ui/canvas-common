@@ -214,55 +214,42 @@ export default async function workspaceLifecycleRoutes(fastify, _options) {
     }
   });
 
-  // Index maintenance, owner/admin only. All idempotent and safe on the live
-  // workspace: rebuild crud timelines or per-MIME bitmaps from stored
-  // documents, backfill the full-text (BM25) index (`?rebuild=true` wipes the
-  // table and its coverage bitmap first, for a drifted index), or compact and
-  // prune Lance tables and rebuild their ANN indexes (`space`: 'fts', a vector
-  // space, or omitted for all). Embeddings are /inferd/reindex.
-  const maintenance = (path, schema, run) => fastify.post(path, {
+  // Index maintenance, owner/admin only, as receipts (202) the client polls on
+  // GET /db/maintenance: a rebuild over a large workspace outlasts any HTTP
+  // timeout. All idempotent and safe on the live workspace: rebuild crud
+  // timelines or per-MIME bitmaps from stored documents, backfill the
+  // full-text (BM25) index (`?rebuild=true` wipes the table and its coverage
+  // bitmap first, for a drifted index), or compact and prune Lance tables and
+  // rebuild their ANN indexes (`space`: 'fts', a vector space, or omitted for
+  // all). Embeddings are /inferd/reindex.
+  fastify.get('/db/maintenance', {
+    onRequest: [fastify.authenticate, requireWorkspaceAdmin()],
+  }, async (request, reply) => {
+    const response = new ResponseObject().found(request.workspace.dbMaintenance.status(), 'Index maintenance status');
+    return reply.code(response.statusCode).send(response.getResponse());
+  });
+
+  const maintenance = (path, schema, action, options = () => ({})) => fastify.post(path, {
     onRequest: [fastify.authenticate, requireWorkspaceAdmin()],
     schema: { params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } }, ...schema },
   }, async (request, reply) => {
     try {
-      const workspace = request.workspace;
-      if (!workspace.isActive) {
-        const r = new ResponseObject().workspaceNotActive();
-        return reply.code(r.statusCode).send(r.getResponse());
-      }
-      const [result, message] = await run(workspace.db, request);
-      const r = new ResponseObject().success(result, message);
-      return reply.code(r.statusCode).send(r.getResponse());
+      const job = request.workspace.dbMaintenance.start({ action, options: options(request) });
+      const response = new ResponseObject().success(job, 'Index maintenance started', 202);
+      return reply.code(response.statusCode).send(response.getResponse());
     } catch (error) {
-      fastify.log.error(error);
-      const r = new ResponseObject().serverError(error.message || 'Index maintenance failed');
-      return reply.code(r.statusCode).send(r.getResponse());
+      const response = error.statusCode ? new ResponseObject().error(error.message, null, error.statusCode) : new ResponseObject().serverError(error.message || 'Index maintenance failed');
+      return reply.code(response.statusCode).send(response.getResponse());
     }
   });
-  maintenance('/db/reindex/timelines', {}, async (db) => {
-    const result = await db.reindexCrudTimelines();
-    return [result, `Timelines reindexed: ${result.created} created, ${result.updated} updated (${result.scanned} scanned)`];
-  });
-  maintenance('/db/reindex/mime', {}, async (db) => {
-    const result = await db.reindexMimeBitmaps();
-    return [result, `MIME bitmaps rebuilt: ${result.ticked}/${result.scanned} docs across ${result.keys} type(s)`];
-  });
+  maintenance('/db/reindex/timelines', {}, 'reindex:timelines');
+  maintenance('/db/reindex/mime', {}, 'reindex:mime');
   maintenance('/db/reindex/search', {
     querystring: { type: 'object', properties: { rebuild: { type: 'boolean', default: false } } },
-  }, async (db, request) => {
-    const result = await db.reindexSearchIndex({ rebuild: request.query.rebuild === true });
-    return [result, `FTS reindex complete: ${result.indexed} newly indexed (${result.alreadyIndexed}/${result.totalDocs} total)`];
-  });
+  }, 'reindex:search', request => ({ rebuild: request.query.rebuild === true }));
   maintenance('/db/optimize', {
     body: { type: 'object', properties: { space: { type: 'string' } }, additionalProperties: false },
-  }, async (db, request) => {
-    const { space = null } = request.body || {};
-    const result = {};
-    if (!space || space === 'fts') result.fts = await db.optimizeLance();
-    if (!space) result.vectors = await db.optimizeVectors();
-    else if (space !== 'fts') result.vectors = await db.optimizeVectors(space);
-    return [result, `Optimize complete${space ? ` (${space})` : ''}`];
-  });
+  }, 'optimize', request => ({ space: request.body?.space ?? null }));
 
   // Live-tune search knobs (image relevance floor + hybrid RRF fusion weights).
   // Persisted to workspace.json and applied to the running DB without a restart.

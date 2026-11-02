@@ -13,6 +13,7 @@ import { parseByteRange } from '../../lib/http-range.js';
 import { resolveContentType } from '../../lib/mime.js';
 import { normalizeSchemaId } from '../../../runtimes/workspace/db/classifier.js';
 import { PREDICATES, listPredicates } from 'canvas-synapsd/src/indexes/edges/predicates.js';
+import Identity from 'canvas-synapsd/src/schemas/core/Identity.js';
 import { emailListPreview, resolveEmailBody } from '../../../runtimes/workspace/connectors/imap/content.js';
 
 // Human filename for a location URL: basename of the key after scheme://backend/.
@@ -364,18 +365,29 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     return { text, tokens };
   }
 
+  const DOMAIN_RE = /^[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)+$/u;
+
   // A token value → anchor document ids. Numeric (with optional `#`) is used
-  // as-is; an email address resolves exactly by alias key; anything else by
-  // FTS over identity documents, whole workspace (an identity is rarely filed
-  // in the current context).
+  // as-is; an email address resolves exactly by alias key; a domain resolves
+  // to every identity with an address at it or at a subdomain of it (whole
+  // labels, so `vub.sk` never catches `vubnovinky.sk`); anything else by FTS
+  // over identity documents, whole workspace (an identity is rarely filed in
+  // the current context).
   async function resolveRelAnchors(workspace, value) {
     const bare = value.startsWith('#') ? value.slice(1) : value;
     if (/^\d+$/.test(bare)) { return [parseInt(bare, 10)]; }
-    // An email address resolves exactly through the identity's alias key
-    // (extracted contacts and hand-made ones alike) before any fuzzy match.
     if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
       const exact = await workspace.findIdentityByEmail(value).catch(() => null);
-      if (exact != null) { return [exact]; }
+      return exact != null ? [exact] : [];
+    }
+    if (DOMAIN_RE.test(value)) {
+      const domain = value.toLowerCase();
+      const identities = await workspace.list({
+        context: null, directory: null, attributes: { allOf: ['data/schema/identity'] }, limit: 0, applyCanvasQuerySpec: false,
+      });
+      return (Array.isArray(identities) ? identities : []).filter((doc) => Identity.prototype.emailAddresses.call(doc)
+        .some((address) => { const at = String(address).toLowerCase().split('@')[1] || ''; return at === domain || at.endsWith(`.${domain}`); }))
+        .map((doc) => doc.id);
     }
     const matches = await workspace.search({
       query: value,
@@ -388,6 +400,37 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       applyCanvasQuerySpec: false,
     });
     return Array.isArray(matches) ? matches.filter((id) => Number.isInteger(id)) : [];
+  }
+
+  // The same grammar inside a native spec (POST /search): tokens leave the
+  // text of `query`, or of each string in a compound line's `queries`, and
+  // join `rel`. A positive token that names nobody matches nothing
+  // (`ids: []`), never the unconstrained set.
+  async function applyInlineRelations(workspace, spec) {
+    const strings = typeof spec.query === 'string' ? [spec.query] : Array.isArray(spec.queries) ? spec.queries : null;
+    if (!strings) return spec;
+    const texts = [];
+    const rel = Array.isArray(spec.rel) ? [...spec.rel] : spec.rel ? [spec.rel] : [];
+    let changed = false;
+    for (const raw of strings) {
+      const { text, tokens } = parseInlineRelQuery(raw);
+      if (text) texts.push(text);
+      if (!tokens.length) continue;
+      changed = true;
+      for (const token of tokens) {
+        const anchors = await resolveRelAnchors(workspace, token.value);
+        if (anchors.length === 0) {
+          if (token.negated) continue;
+          return { ...spec, ids: [] };
+        }
+        rel.push({ op: token.negated ? 'noneOf' : 'allOf', p: token.p, of: anchors, dir: token.dir });
+      }
+    }
+    if (!changed) return spec;
+    const next = { ...spec, rel };
+    if (typeof spec.query === 'string') { if (texts.length) next.query = texts[0]; else delete next.query; }
+    else if (texts.length) next.queries = texts; else delete next.queries;
+    return next;
   }
 
   const paginationQueryProps = {
@@ -607,7 +650,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     onRequest: [fastify.authenticate],
     validatorCompiler: ({ schema }) => queryValidator.compile(schema),
     schema: {
-      description: 'Query workspace documents with the native Synapsd spec: bitmap paths/features/timelines/relations, text ranking, IDs or countOnly. Empty spec selects the workspace. Compound lines intersect the shared spec, then combine by op. PDF MIME matches attachments; use includes relations to select their emails.',
+      description: 'Query workspace documents with the native Synapsd spec: bitmap paths/features/timelines/relations, text ranking, IDs or countOnly. Empty spec selects the workspace. Compound lines intersect the shared spec, then combine by op. query accepts inline @predicate:value tokens (an id, e-mail address or identity name; :out reverses the direction). PDF MIME matches attachments; use includes relations to select their emails.',
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
       body: documentQuerySchema,
     },
@@ -615,13 +658,15 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     try {
       const workspace = await getWorkspaceInstance(request, reply);
       if (!workspace) return reply;
-      const { lines, op, ...spec } = request.body;
+      const { lines: rawLines, op, ...rawSpec } = request.body;
       try {
-        parseSpec(spec);
-        for (const line of lines || []) parseSpec(line);
+        parseSpec(rawSpec);
+        for (const line of rawLines || []) parseSpec(line);
       } catch (error) {
         return reply.code(400).send(new ResponseObject().badRequest(error.message).getResponse());
       }
+      const spec = await applyInlineRelations(workspace, rawSpec);
+      const lines = rawLines ? await Promise.all(rawLines.map((line) => applyInlineRelations(workspace, line))) : rawLines;
       const binding = request.resourceToken;
       const scope = binding?.type === 'agent' && binding.basePath && binding.basePath !== '/'
         ? { context: workspace.getContextTreeSelector(binding.basePath) } : undefined;

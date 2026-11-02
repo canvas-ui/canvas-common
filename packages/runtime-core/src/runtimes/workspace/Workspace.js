@@ -36,6 +36,7 @@ import WorkspaceContacts from './services/contacts/WorkspaceContacts.js';
 import WorkspaceMessaging from './connectors/messaging/WorkspaceMessaging.js';
 import OperationMonitor from './runtime/OperationMonitor.js';
 import WorkspaceCacheMaintenance from './storage/WorkspaceCacheMaintenance.js';
+import WorkspaceDbMaintenance from './db/WorkspaceDbMaintenance.js';
 import WorkspaceBackups from './storage/WorkspaceBackups.js';
 import HookService from './services/hooks/index.js';
 import WorkspaceDotfiles from './services/dotfile/index.js';
@@ -79,6 +80,7 @@ class Workspace extends EventEmitter {
     get storageOperations() { return this.#runtime.state.storedIndex?.stored?.replicas; }
     get backups() { return this.#runtime.backups; }
     get cacheMaintenance() { return this.#runtime.cacheMaintenance; }
+    get dbMaintenance() { return this.#runtime.dbMaintenance; }
     get hooks() { return this.#runtime.hooks; }
     get dotfiles() { return this.#runtime.dotfiles; }
     get devices() { return this.#runtime.devices; }
@@ -100,6 +102,10 @@ class Workspace extends EventEmitter {
         this.#runtime.cacheMaintenance = new WorkspaceCacheMaintenance(
             () => this.#runtime.state.storedIndex?.stored,
             action => this.#runtime.operations.run('cache.maintenance', action),
+        );
+        this.#runtime.dbMaintenance = new WorkspaceDbMaintenance(
+            () => (this.isActive ? this.db : null),
+            action => this.#runtime.operations.run('db.maintenance', action),
         );
         this.#runtime.config = new WorkspaceConfiguration(this, this.#runtime);
         this.#runtime.pins = new WorkspacePins(this, this.#runtime);

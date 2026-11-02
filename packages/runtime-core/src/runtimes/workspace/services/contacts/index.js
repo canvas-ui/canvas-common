@@ -5,8 +5,9 @@ export { messageParties } from './participants.js';
  * Contact extraction from filed messages, and matching against known identities.
  *
  * Every address on a message (From → `authored-by`, To/Cc/Bcc →
- * `addressed-to`) resolves to one Identity document, so "all mail from Alice"
- * is an incoming-edge read on Alice instead of a full-text scan.
+ * `addressed-to`, Reply-To → `reply-to`) resolves to one Identity document, so
+ * "all mail from Alice" is an incoming-edge read on Alice instead of a
+ * full-text scan.
  *
  * New contacts only come from messages a user FILED — linked into a context or a non-backends
  * directory. An IMAP mirror alone never extracts: auto-creating an identity

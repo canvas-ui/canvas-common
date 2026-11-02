@@ -18,7 +18,7 @@ function parties(value) {
 }
 
 export function messageParties(data = {}) {
-    return { authors: parties(data.from), recipients: [...parties(data.to), ...parties(data.cc), ...parties(data.bcc)] };
+    return { authors: parties(data.from), recipients: [...parties(data.to), ...parties(data.cc), ...parties(data.bcc)], replyTo: parties(data.replyTo) };
 }
 
 export function identityKeys(doc) {
@@ -40,8 +40,11 @@ export function identityKeys(doc) {
 export function participants(doc) {
     if (!isMessage(doc)) return [];
     if (doc.schema.startsWith('data/schema/message/email')) {
-        const { authors, recipients } = messageParties(doc.data);
-        return [...authors.map((party) => ({ p: 'authored-by', party })), ...recipients.map((party) => ({ p: 'addressed-to', party }))]
+        const { authors, recipients, replyTo } = messageParties(doc.data);
+        // Reply-To is its own role: a bulk sender with Reply-To at the
+        // organisation's domain must not become the author.
+        return [...authors.map((party) => ({ p: 'authored-by', party })), ...recipients.map((party) => ({ p: 'addressed-to', party })),
+            ...replyTo.map((party) => ({ p: 'reply-to', party }))]
             .map(({ p, party }) => ({ p, party: { ...party, keys: [Identity.emailAliasKey(party.address)] } }));
     }
     const data = doc.data || {};
