@@ -12,7 +12,7 @@ import { stripDeviceFeatureTags } from '../../../utils/device-features.js';
 import { parseByteRange } from '../../lib/http-range.js';
 import { resolveContentType } from '../../lib/mime.js';
 import { normalizeSchemaId } from '../../../runtimes/workspace/db/classifier.js';
-import { PREDICATES } from 'canvas-synapsd/src/indexes/edges/predicates.js';
+import { PREDICATES, listPredicates } from 'canvas-synapsd/src/indexes/edges/predicates.js';
 import { emailListPreview, resolveEmailBody } from '../../../runtimes/workspace/connectors/imap/content.js';
 
 // Human filename for a location URL: basename of the key after scheme://backend/.
@@ -311,7 +311,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   // ("documents jane points at"). Unknown predicates are NOT stripped — the
   // token stays ordinary search text, so an email address or handle in a
   // query never 400s.
-  const INLINE_REL_RE = /(^|\s)(!?)@([a-z][a-z-]*):("[^"]*"|[^\s"]+?)(:(in|out))?(?=\s|$)/g;
+  const INLINE_REL_RE = /(^|\s)(!?)@([a-z][a-z-]*):\s*(?!!?@[a-z][a-z-]*:)("[^"]*"|[^\s"]+?)(:(in|out))?(?=\s|$)/g;
 
   function parseInlineRelQuery(query) {
     const tokens = [];
@@ -773,6 +773,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   fastify.post('/', {
     onRequest: [fastify.authenticateClient],
     schema: {
+      description: 'Insert documents or link existing IDs into destination paths. Fetch /schemas/data/schema/<type> for required fields and examples. Missing paths are created by default; set createPath false to require existing destinations. Validation failures return INVALID_DOCUMENT with field paths.',
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
       body: {
         oneOf: [
@@ -787,6 +788,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
               // satisfy both oneOf branches → ambiguous → 400.
               context: { type: ['string', 'array'], items: { type: 'string' } },
               features: { type: 'array', items: { type: 'string' } },
+              createPath: { type: 'boolean', description: 'Create missing destination paths (default true). False requires every path to exist; returns 404 without inserting when one is missing. Never falls back to root.' },
               documents: { oneOf: [{ type: 'object' }, { type: 'array' }] },
               documentIds: {
                 anyOf: [
@@ -823,6 +825,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
         context: insertTreeType === 'directory' ? null : insertSelector,
         directory: insertTreeType === 'directory' ? insertSelector : null,
         features: enforcedFeatures,
+        createPath: isTopLevelArray ? true : request.body.createPath,
       };
 
       let documents;
@@ -1701,7 +1704,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   // "Link to…" relation picker. Direction is an AXIS, not a predicate name:
   // `outgoing` is this document as subject, `incoming` is it as object.
 
-  const RELATION_PREDICATES = Object.keys(PREDICATES);
+  const RELATION_PREDICATES = listPredicates();
 
   // Body shared by POST/DELETE: which edge, and on which axis.
   const relationBodySchema = {
@@ -1748,13 +1751,14 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   fastify.get('/relations/predicates', {
     onRequest: [fastify.authenticate],
     schema: {
+      description: 'List every registered Synapsd relation predicate. Use @predicate: value in document text searches; whitespace after the colon is accepted. Values may be document IDs, email addresses or quoted identity names. The default finds documents pointing to the value; :out reverses the direction.',
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
     },
   }, async (request, reply) => {
     try {
       const workspace = await getWorkspaceInstance(request, reply);
       if (!workspace) return reply;
-      const r = new ResponseObject().found({ predicates: RELATION_PREDICATES }, 'Relation predicates retrieved');
+      const r = new ResponseObject().found({ predicates: listPredicates() }, 'Relation predicates retrieved');
       return reply.code(r.statusCode).send(r.getResponse());
     } catch (error) {
       fastify.log.error(error);

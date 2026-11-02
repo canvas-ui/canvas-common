@@ -74,6 +74,21 @@ export default class WorkspaceDocuments {
         }
     }
 
+    #assertDestinationPaths(context, directory, createPath) {
+        if (createPath !== false) return;
+        for (const [type, selector] of [['context', context], ['directory', directory]]) {
+            if (selector == null) continue;
+            const treeRef = typeof selector === 'object' ? selector.tree ?? selector.treeId : null;
+            const tree = treeRef ? this.#workspace.getTree(treeRef)
+                : type === 'directory' ? this.#workspace.getDefaultDirectoryTree() : this.#workspace.getDefaultContextTree();
+            for (const path of WorkspaceDocuments.#extractPaths(selector)) {
+                if (!tree.getLayerForPath(path)) {
+                    throw Object.assign(new Error(`Destination path does not exist: ${path}. Set createPath: true to create it.`), { statusCode: 404, code: 'PATH_NOT_FOUND' });
+                }
+            }
+        }
+    }
+
     // Does a directory selector target the backends tree? (by tree id or name)
     #isBackendsTreeSelector(directory) {
         if (!WorkspaceDocuments.#isTreeQualified(directory)) { return false; }
@@ -83,8 +98,9 @@ export default class WorkspaceDocuments {
         return target?.id === backends.id;
     }
 
-    async put(record, { context = '/', directory = null, features = [], attributes, emitEvent = true, allowBackendsWrite = false, provenance = null } = {}) {
+    async put(record, { context = '/', directory = null, features = [], attributes, emitEvent = true, allowBackendsWrite = false, provenance = null, createPath = true } = {}) {
         this.#assertBackendsWriteAllowed(directory, allowBackendsWrite);
+        this.#assertDestinationPaths(context, directory, createPath);
         const writtenThrough = allowBackendsWrite
             ? null
             : await this.#connectorWriteThrough(record, this.#normalizeFeatureInput(features, attributes));
@@ -101,8 +117,9 @@ export default class WorkspaceDocuments {
         return result;
     }
 
-    async link(id, { context = '/', directory = null, features = [], attributes, emitEvent = true, allowBackendsWrite = false, provenance = null } = {}) {
+    async link(id, { context = '/', directory = null, features = [], attributes, emitEvent = true, allowBackendsWrite = false, provenance = null, createPath = true } = {}) {
         this.#assertBackendsWriteAllowed(directory, allowBackendsWrite);
+        this.#assertDestinationPaths(context, directory, createPath);
         const result = await this.#runtime.getActiveDb().link(id, {
             ...WorkspaceDocuments.buildWriteSpec(context, directory),
             features: this.#normalizeFeatureInput(features, attributes),
@@ -260,8 +277,9 @@ export default class WorkspaceDocuments {
         });
     }
 
-    async putMany(records, { context = '/', directory = null, features = [], attributes, allowBackendsWrite = false } = {}) {
+    async putMany(records, { context = '/', directory = null, features = [], attributes, allowBackendsWrite = false, createPath = true } = {}) {
         this.#assertBackendsWriteAllowed(directory, allowBackendsWrite);
+        this.#assertDestinationPaths(context, directory, createPath);
 
         // Documents that mirror a remote object go to their source first (see
         // #connectorWriteThrough). Everything else keeps the single batched
@@ -381,8 +399,9 @@ export default class WorkspaceDocuments {
         return { id: result?.docId ?? id };
     }
 
-    async linkMany(ids, { context = '/', directory = null, features = [], attributes, emitEvent = true, allowBackendsWrite = false } = {}) {
+    async linkMany(ids, { context = '/', directory = null, features = [], attributes, emitEvent = true, allowBackendsWrite = false, createPath = true } = {}) {
         this.#assertBackendsWriteAllowed(directory, allowBackendsWrite);
+        this.#assertDestinationPaths(context, directory, createPath);
         const docIds = parseDocumentIdArray(ids, 'Document ID array');
         const result = await this.#runtime.getActiveDb().linkMany(docIds, {
             ...WorkspaceDocuments.buildWriteSpec(context, directory),

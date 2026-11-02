@@ -30,6 +30,7 @@ export default async function schemaRoutes(fastify, _options) {
   // handler returned the CLASS, which JSON-serializes to `{}`.
   fastify.get('/data/schema/*', {
     schema: {
+      description: 'Get document type fields, required/optional lists, JSON Schema, examples and normalization notes from Synapsd. The wildcard is the schema suffix (e.g. link, task, message/email). Append .json for JSON Schema only.',
       params: {
         type: 'object',
         required: ['*'],
@@ -58,6 +59,7 @@ export default async function schemaRoutes(fastify, _options) {
       const payload = wantsJson
         ? schemaRegistry.getJsonSchema(schemaId)
         : schemaRegistry.getSchemaDescriptor(schemaId);
+      if (!wantsJson && payload) payload.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
       const message = wantsJson ? 'JSON schema retrieved successfully' : 'Schema retrieved successfully';
       const response = new ResponseObject().found(payload, message);
       return reply.code(response.statusCode).send(response.getResponse());

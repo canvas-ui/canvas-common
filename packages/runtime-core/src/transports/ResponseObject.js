@@ -61,6 +61,21 @@ export default class ResponseObject {
      *   anything else → generic 500 with `fallbackMessage`.
      */
     static fromError(error, fallbackMessage = 'Request failed') {
+        let validation = error;
+        const visited = new Set();
+        while (validation && !visited.has(validation)) {
+            visited.add(validation);
+            if (validation.code === 'INVALID_DOCUMENT' || validation.name === 'ZodError') {
+                const message = error.failedIndex !== undefined ? `document[${error.failedIndex}]: ${validation.message}` : validation.message;
+                const response = new ResponseObject().badRequest(message, {
+                    ...(validation.details || { issues: validation.issues }),
+                    ...(error.failedIndex !== undefined ? { documentIndex: error.failedIndex } : {}),
+                });
+                response.code = 'INVALID_DOCUMENT';
+                return response;
+            }
+            validation = validation.cause;
+        }
         // Coded errors from the core carry no statusCode, but they are just as
         // much the caller's problem as a 404 — surface them rather than hiding
         // them behind a generic 500. `cause` is checked too because batch paths
@@ -86,6 +101,7 @@ export default class ResponseObject {
         if (code === 'EINFERDDOWN') { return new ResponseObject().error(error.message, { retryable: true }, 503); }
 
         switch (error?.statusCode) {
+            case 400: return new ResponseObject().badRequest(error.message, error.details);
             case 403: return new ResponseObject().forbidden(error.message);
             case 404: return new ResponseObject().notFound(error.message);
             case 503: return new ResponseObject().error(error.message, { retryable: true }, 503);
