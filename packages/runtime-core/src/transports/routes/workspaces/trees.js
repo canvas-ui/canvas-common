@@ -24,6 +24,7 @@ export default async function workspaceTreesRoutes(fastify) {
 
   fastify.get('/', {
     onRequest: [fastify.authenticate],
+    schema: { description: 'List workspace trees and their types. context trees AND node bitmaps along each path (/foo/bar/baz = foo AND bar AND baz); linking ticks every node and does not retain explicit filing locations. directory trees have filesystem-like exact folder membership; recursive queries OR descendant folders.' },
   }, async (request, reply) => {
     const workspace = await getWorkspaceInstance(request, reply);
     if (!workspace) return reply;

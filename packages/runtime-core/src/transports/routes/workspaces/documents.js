@@ -235,9 +235,11 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   // ── Shared querystring schema fragments ──────────────────────────────────
 
+  const treeTypeDescription = 'context: bitmap nodes ANDed along the path; linking ticks every node and does not record an explicit filing location. directory: filesystem-like folders with exact membership; recursive queries OR descendant folders.';
+
   const contextQueryProps = {
     treeNameOrTreeId: { type: 'string' },
-    treeType: { type: 'string', enum: ['context', 'directory'] },
+    treeType: { type: 'string', enum: ['context', 'directory'], description: treeTypeDescription },
     context: { type: 'string', default: '/' },
   };
 
@@ -401,9 +403,9 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     // read — the client is driving the filters itself (live canvas filter
     // preview via the toolbox). Default true = normal canvas behavior.
     applyCanvasSpec: { type: 'boolean', default: true },
-    // A context path also lists what is filed at its deeper paths;
-    // `currentPathOnly` keeps only the documents filed at the path itself.
-    currentPathOnly: { type: 'boolean', default: false },
+    // Subtract descendant matches from the context path's bitmap intersection.
+    // This cannot recover where a document was explicitly filed.
+    currentPathOnly: { type: 'boolean', default: false, description: 'Subtract descendant matches from context membership. Does not identify explicit filing locations or preserve parent-link history.' },
   };
 
   // All server-side selection semantics live here: list and purge must agree.
@@ -781,7 +783,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
             type: 'object',
             properties: {
               treeNameOrTreeId: { type: 'string' },
-              treeType: { type: 'string', enum: ['context', 'directory'] },
+              treeType: { type: 'string', enum: ['context', 'directory'], description: treeTypeDescription },
               // A single path, or an array of paths to insert the same docs into
               // multiple tree paths in ONE op (one embed, all memberships). Use a
               // type union (not oneOf) — Fastify array-coercion makes a string
@@ -789,8 +791,10 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
               context: { type: ['string', 'array'], items: { type: 'string' } },
               features: { type: 'array', items: { type: 'string' } },
               createPath: { type: 'boolean', description: 'Create missing destination paths (default true). False requires every path to exist; returns 404 without inserting when one is missing. Never falls back to root.' },
+              returnDetails: { type: 'boolean', description: 'For documents, return one {id, created, status: created|existing|updated} result per input instead of IDs. Computed during the write, including checksum and in-batch deduplication. Use documentIds to link without changing content.' },
               documents: { oneOf: [{ type: 'object' }, { type: 'array' }] },
               documentIds: {
+                description: 'Link existing IDs without changing document content, dates, checksums or versions. Every ID must be accessible within an agent token’s bound context. Returns successful and failed items; thread roots also file their replies.',
                 anyOf: [
                   { type: 'array', items: { anyOf: [{ type: 'string' }, { type: 'number' }] }, minItems: 1 },
                   { type: 'string' },
@@ -826,14 +830,28 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
         directory: insertTreeType === 'directory' ? insertSelector : null,
         features: enforcedFeatures,
         createPath: isTopLevelArray ? true : request.body.createPath,
+        returnDetails: !isTopLevelArray && request.body.returnDetails === true,
       };
 
       let documents;
+      const linkExisting = async rawIds => {
+        const ids = parseDocumentIdArray(rawIds, 'Document ID array');
+        const binding = request.resourceToken;
+        if (binding?.type === 'agent' && binding.basePath && binding.basePath !== '/') {
+          const scope = { context: workspace.getContextTreeSelector(binding.basePath), directory: null };
+          for (const id of ids) {
+            if (!await workspace.has(id, scope)) {
+              throw Object.assign(new Error('Cannot link a document outside the agent\'s bound scope'), { statusCode: 403 });
+            }
+          }
+        }
+        return workspace.linkMany(ids, treeSpec);
+      };
       if (isTopLevelArray) {
-        documents = await workspace.linkMany(request.body, treeSpec);
+        documents = await linkExisting(request.body);
       } else if (request.body.documentIds) {
         const ids = Array.isArray(request.body.documentIds) ? request.body.documentIds : [request.body.documentIds];
-        documents = await workspace.linkMany(ids, treeSpec);
+        documents = await linkExisting(ids);
       } else if (request.body.documents) {
         const docs = Array.isArray(request.body.documents) ? request.body.documents : [request.body.documents];
         documents = await workspace.putMany(docs, treeSpec);
@@ -845,7 +863,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       const linkErrorResponse = sendLinkResult(reply, documents);
       if (linkErrorResponse) return linkErrorResponse;
 
-      const responseObject = new ResponseObject().created(documents, 'Documents inserted successfully');
+      const responseObject = new ResponseObject().created(documents, isTopLevelArray || request.body.documentIds ? 'Documents linked successfully' : 'Documents stored successfully');
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     } catch (error) {
       fastify.log.error(error);
@@ -964,7 +982,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
         // /documents/remove unlinks them.
         properties: {
           treeNameOrTreeId: { type: 'string' },
-          treeType: { type: 'string', enum: ['context', 'directory'] },
+          treeType: { type: 'string', enum: ['context', 'directory'], description: treeTypeDescription },
           context: { type: 'string', default: '/' },
           features: { type: 'array', items: { type: 'string' }, default: [] },
           // No `id` requirement: PUT is an upsert. A body carrying an id

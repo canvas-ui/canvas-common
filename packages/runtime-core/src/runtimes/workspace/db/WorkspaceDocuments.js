@@ -277,7 +277,7 @@ export default class WorkspaceDocuments {
         });
     }
 
-    async putMany(records, { context = '/', directory = null, features = [], attributes, allowBackendsWrite = false, createPath = true } = {}) {
+    async putMany(records, { context = '/', directory = null, features = [], attributes, allowBackendsWrite = false, createPath = true, returnDetails = false } = {}) {
         this.#assertBackendsWriteAllowed(directory, allowBackendsWrite);
         this.#assertDestinationPaths(context, directory, createPath);
 
@@ -294,6 +294,7 @@ export default class WorkspaceDocuments {
             return await this.#runtime.getActiveDb().putMany(list, {
                 ...WorkspaceDocuments.buildWriteSpec(context, directory),
                 features: this.#normalizeFeatureInput(features, attributes),
+                returnDetails,
             });
         }
 
@@ -308,12 +309,15 @@ export default class WorkspaceDocuments {
             ? await this.#runtime.getActiveDb().putMany(local, {
                 ...WorkspaceDocuments.buildWriteSpec(context, directory),
                 features: this.#normalizeFeatureInput(features, attributes),
+                returnDetails,
             })
             : [];
 
         // Reassemble in the caller's order — a batch's result array is
         // positional, and callers match ids back to what they sent.
-        const out = list.map((_, index) => writtenThrough[index]?.id ?? null);
+        const out = list.map((_, index) => writtenThrough[index]
+            ? returnDetails ? { id: writtenThrough[index].id, created: false, status: 'updated' } : writtenThrough[index].id
+            : null);
         localIndexes.forEach((index, i) => { out[index] = Array.isArray(localIds) ? localIds[i] : null; });
         return out;
     }
