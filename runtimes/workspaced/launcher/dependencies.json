@@ -1,0 +1,6 @@
+{
+  "proper-lockfile": "^4.1.2",
+  "@canvas-local/undici": "npm:undici@^6.21.3",
+  "engine.io-client": "^6.6.6",
+  "socket.io-client": "^4.8.3"
+}

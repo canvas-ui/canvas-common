@@ -228,7 +228,7 @@ class Agent extends EventEmitter {
     /**
      * @param {Object} [options]
      * @param {Object|null} [options.canvasEnv] - Runtime env for canvas tools
-     *   ({ CANVAS_URL, CANVAS_TOKEN, CANVAS_WORKSPACE, CANVAS_BASE_PATH, ... });
+     *   ({ CANVAS_URL, CANVAS_CONNECTIONS, CANVAS_AGENT_ID });
      *   null/absent = unbound agent, no canvas tools.
      */
     async start(options = {}) {

@@ -2,11 +2,11 @@
 
 `canvas-workspaced` hosts one local workspace, its database, context APIs and web UI, and registers it with canvas-server over an outbound tunnel. It uses the private canvas-synapsd engine. **Neither workspaced nor canvas-runtime-core is published to npm.**
 
-For an independent agent with Ollama and voice, use [canvas-agent-runtime](../agent/README.md). `canvas init agent` installs that public package and creates only `.agent/` state.
+For an independent agent with Ollama and voice, use [canvas-agent-runtime](../agent/README.md). `canvas init agent` installs its private Git/local distribution and creates only `.agent/` state.
 
 ## Install from Git
 
-Node >=22.19, Git, and read access to canvas-synapsd are required. After the public agent-runtime and API-client releases are available:
+Node >=22.19, Git, and read access to canvas-synapsd are required. The launcher and its shared client sources are included in the Git distribution:
 
 ```sh
 npm pkg set 'overrides.fast-jwt=6.2.4'

@@ -1,7 +1,7 @@
 name: release
 
 # Publishes the shared packages (protocol, schemas, wallpapers, api-client,
-# edge, agent) to npm under @augmentd-labs — every version npm does not
+# edge) to npm under @augmentd-labs — every version npm does not
 # have yet (scripts/publish-npm.mjs), so an unbumped push publishes nothing.
 # Release = bump the package version and push main.
 #

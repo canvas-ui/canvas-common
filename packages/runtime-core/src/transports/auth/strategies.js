@@ -349,6 +349,7 @@ export async function verifyApiToken(request, _reply) {
           tokenType: 'agent',
           agentId: principal.agentId,
           agentName: principal.agentName,
+          grantId: principal.grantId,
           workspaceId: principal.workspaceId,
           workspaceName: principal.workspaceName,
           basePath: principal.basePath,
@@ -447,6 +448,7 @@ export async function verifyApiToken(request, _reply) {
       ...(tokenResult.tokenType === 'agent' ? {
         agentId: tokenResult.agentId,
         agentName: tokenResult.agentName,
+        grantId: tokenResult.grantId,
         basePath: tokenResult.basePath,
       } : {})
     };

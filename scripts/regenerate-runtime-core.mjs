@@ -66,7 +66,7 @@ for (const relative of ['packages/runtime-core/package.json', 'package.json']) {
   const file = path.join(common, relative);
   const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
   const wanted = relative === 'package.json'
-    ? { ...dependencies, '@augmentd-labs/canvas-agent-runtime': manifest.dependencies['@augmentd-labs/canvas-agent-runtime'] }
+    ? { ...dependencies, ...JSON.parse(fs.readFileSync(path.join(common, 'runtimes/workspaced/launcher/dependencies.json'), 'utf8')) }
     : dependencies;
   if (JSON.stringify(manifest.dependencies) !== JSON.stringify(wanted)) changed = true;
   if (check) {

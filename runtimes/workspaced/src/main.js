@@ -1,7 +1,7 @@
 import path from 'node:path';
 import manifest from '../package.json' with { type: 'json' };
 import { fileURLToPath } from 'node:url';
-import { runRuntime } from '@augmentd-labs/canvas-agent-runtime/runtime/daemon.js';
+import { runRuntime } from '../launcher/src/runtime/daemon.js';
 
 export async function main({ argv = process.argv.slice(2), createHost } = {}) {
     return runRuntime({ kind: 'workspace', argv, version: manifest.version,

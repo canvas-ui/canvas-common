@@ -12,10 +12,11 @@
     "lint": "eslint . --no-error-on-unmatched-pattern && pnpm -r --if-present --filter '!canvas-common' run lint",
     "format": "prettier --write \"packages/**/*.{js,md,json}\"",
     "publish:npm": "node scripts/publish-npm.mjs",
-    "runtime:refresh": "node scripts/regenerate-runtime-core.mjs",
-    "runtime:check": "node scripts/regenerate-runtime-core.mjs --check",
+    "runtime:refresh": "node scripts/export-private-runtime.mjs --workspace && node scripts/regenerate-runtime-core.mjs",
+    "runtime:check": "node scripts/export-private-runtime.mjs --workspace --check && node scripts/regenerate-runtime-core.mjs --check",
     "agent:refresh": "node scripts/regenerate-agent-tools.mjs",
-    "agent:check": "node scripts/regenerate-agent-tools.mjs --check"
+    "agent:check": "node scripts/regenerate-agent-tools.mjs --check",
+    "agent:export": "node scripts/regenerate-agent-tools.mjs --check && node scripts/export-private-runtime.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
@@ -24,7 +25,7 @@
     "globals": "^16.5.0",
     "prettier": "^3.6.2"
   },
-  "version": "0.3.39",
+  "version": "0.3.41",
   "exports": {
     "./*": "./packages/runtime-core/src/*",
     "./host": "./packages/runtime-core/src/runtimes/workspace/runtime/host.js"
@@ -40,7 +41,8 @@
     "runtimes/workspaced/README.md",
     "NOTICE",
     "packages/runtime-core/package.json",
-    "runtimes/workspaced/package.json"
+    "runtimes/workspaced/package.json",
+    "runtimes/workspaced/launcher"
   ],
   "dependencies": {
     "@augmentd-labs/canvas-protocol": "^0.4.0",
@@ -75,6 +77,9 @@
     "sharp": "^0.35.3",
     "undici": "^8.7.0",
     "uuid": "^11.1.1",
-    "@augmentd-labs/canvas-agent-runtime": "^0.1.4"
+    "proper-lockfile": "^4.1.2",
+    "@canvas-local/undici": "npm:undici@^6.21.3",
+    "engine.io-client": "^6.6.6",
+    "socket.io-client": "^4.8.3"
   }
 }

@@ -8,6 +8,7 @@ import EventEmitter from 'eventemitter2';
 import { DefaultPackageManager, SettingsManager } from '@earendil-works/pi-coding-agent';
 import { generateUUID } from '../../utils/id.js';
 import { createLogger } from '../../utils/log.js';
+import { writePrivateJson } from '../../utils/private-file.js';
 import Agent, { AGENT_STATUS_CODES, LOCAL_PROVIDER_DEFAULTS, sanitizeAgentData, AGENT_SESSION_MODES } from './Agent.js';
 import { createCanvasTools } from './tools/index.js';
 import { createCodingTools } from '@earendil-works/pi-coding-agent';
@@ -145,7 +146,7 @@ function normalizeAgentName(name) {
  *
  * Orchestrates agent lifecycle (create/open/start/stop/restart/delete/update/list).
  * Agents live under the owner's `agents` module root — by default
- * {user.home}/Agents/{agent-slug}, relocatable per user (see core/user/lib/paths.js).
+ * {user.home}/Agents/{agent-slug}, relocatable per user (see hub/users/lib/paths.js).
  */
 class Agents extends EventEmitter {
 
@@ -153,7 +154,8 @@ class Agents extends EventEmitter {
     #indexStore;
     #nameIndex = new Map();
     #referenceIndex = new Map();
-    #tokenIndex = new Map();      // tokenHash -> indexKey (agent principal lookup)
+    #tokenIndex = new Map();      // tokenHash -> { indexKey, grantId }
+    #accessWrites = new Map();
     #users;
     #workspaceManager = null;
     #contextManager = null;
@@ -296,7 +298,7 @@ class Agents extends EventEmitter {
             await fsPromises.mkdir(path.join(agentDir, subdir), { recursive: true });
         }
 
-        await fsPromises.writeFile(configPath, JSON.stringify(configData, null, 2));
+        await writePrivateJson(configPath, configData);
         await materializeAgentRuntimeFiles(agentDir, configData);
         logger.debug(`Agent config written: ${configPath}`);
 
@@ -326,11 +328,11 @@ class Agents extends EventEmitter {
                     metadata: { agentId },
                 });
                 configData.workspace = { id: workspace.id, rootPath: workspace.rootPath };
-                await fsPromises.writeFile(configPath, JSON.stringify(configData, null, 2));
+                await writePrivateJson(configPath, configData);
                 this.#updateIndex(indexKey, { workspace: configData.workspace });
                 indexEntry.workspace = configData.workspace;
                 await this.setAccess(owner, agentId, {
-                    binding: { type: 'workspace', workspace: workspace.id }, permissions: ['read', 'write'],
+                    grants: [{ id: 'home', label: 'Agent home', binding: { type: 'workspace', workspace: workspace.id }, permissions: ['read', 'write'] }],
                 });
                 indexEntry.access = this.#indexStore.get(indexKey).access;
             } catch (error) {
@@ -498,29 +500,73 @@ class Agents extends EventEmitter {
      */
 
     async setAccess(userId, agentIdentifier, accessSpec = {}, requestingUserId) {
-        const { owner, entry, agent, _indexKey } = await this.#requireOwnedAgent(userId, agentIdentifier, requestingUserId);
+        return this.#withAccessWrite(userId, agentIdentifier, requestingUserId, async owned => {
+            if (!Array.isArray(accessSpec.grants) || !accessSpec.grants.length || accessSpec.grants.length > 32) {
+                throw new Error('Invalid grants: provide 1 to 32 named connections');
+            }
+            const ids = new Set();
+            const grants = [];
+            const tokens = [];
+            for (const spec of accessSpec.grants) {
+                const { grant, token } = await this.#mintGrant(owned.owner, spec);
+                if (ids.has(grant.id)) throw new Error(`Invalid duplicate connection ID: ${grant.id}`);
+                ids.add(grant.id); grants.push(grant); tokens.push({ id: grant.id, token });
+            }
+            return this.#saveGrants(owned, grants, tokens);
+        });
+    }
 
-        const binding = await this.#normalizeBindingSpec(owner, accessSpec.binding);
-        const permissions = normalizeAgentPermissions(accessSpec.permissions);
+    async setAccessGrant(userId, agentIdentifier, grantId, spec, requestingUserId) {
+        return this.#withAccessWrite(userId, agentIdentifier, requestingUserId, async owned => {
+            const { grant, token } = await this.#mintGrant(owned.owner, { ...spec, id: grantId });
+            const grants = (owned.entry.access?.grants || []).filter(value => value.id !== grantId);
+            if (grants.length >= 32) throw new Error('Invalid grants: at most 32 connections');
+            grants.push(grant);
+            return this.#saveGrants(owned, grants, [{ id: grantId, token }]);
+        });
+    }
+
+    async revokeAccessGrant(userId, agentIdentifier, grantId, requestingUserId) {
+        return this.#withAccessWrite(userId, agentIdentifier, requestingUserId, async owned => {
+            const grants = owned.entry.access?.grants || [];
+            if (!grants.some(grant => grant.id === grantId)) throw new Error(`Connection not found: ${grantId}`);
+            return this.#saveGrants(owned, grants.filter(grant => grant.id !== grantId), []);
+        });
+    }
+
+    async #withAccessWrite(userId, agentIdentifier, requestingUserId, write) {
+        const { entry } = await this.#requireOwnedAgent(userId, agentIdentifier, requestingUserId);
+        const previous = this.#accessWrites.get(entry.id) || Promise.resolve();
+        const pending = previous.catch(() => {}).then(async () => write(await this.#requireOwnedAgent(userId, agentIdentifier, requestingUserId)));
+        this.#accessWrites.set(entry.id, pending);
+        try { return await pending; }
+        finally { if (this.#accessWrites.get(entry.id) === pending) this.#accessWrites.delete(entry.id); }
+    }
+
+    async #mintGrant(owner, spec) {
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(spec?.id || '')) throw new Error('Invalid connection ID: use 1–64 letters, numbers, hyphens or underscores');
+        if (spec.label !== undefined && (typeof spec.label !== 'string' || spec.label.length > 120)) throw new Error('Invalid connection label');
+        const binding = await this.#normalizeBindingSpec(owner, spec.binding);
+        if (!await this.#resolveBindingScope(owner, binding)) throw new Error(`Connection scope not found: ${spec.id}`);
+        const permissions = normalizeAgentPermissions(spec.permissions);
         const token = mintAgentToken({ permissions });
+        return { grant: { id: spec.id, label: spec.label?.trim() || spec.id, binding, permissions,
+            tokenId: token.id, tokenHash: token.hash, boundAt: new Date().toISOString() }, token: token.value };
+    }
 
-        const access = {
-            binding,
-            permissions,
-            tokenId: token.id,
-            tokenHash: token.hash,
-            boundAt: new Date().toISOString(),
-        };
-
+    async #saveGrants({ owner, entry, agent }, grants, tokens) {
+        const stored = await loadAgentRuntimeEnv(entry.rootPath);
+        const tokenValues = new Map(JSON.parse(stored?.CANVAS_CONNECTIONS || '[]').map(connection => [connection.id, connection.token]));
+        for (const { id, token } of tokens) tokenValues.set(id, token);
+        // Build credentials before publishing the access change.
+        const env = await this.#buildConnectionsEnv(entry, grants, tokenValues);
+        const access = grants.length ? { grants } : null;
         await this.#persistAccess(owner, entry, agent, access);
-        await this.#writeCanvasEnv(entry, access, token.value);
-
+        if (env) await persistAgentRuntimeEnv(entry.rootPath, env);
+        else await removeAgentRuntimeEnv(entry.rootPath);
         if (agent.isActive) await agent.restart();
-        this.emit('agent.access.changed', { agentId: entry.id, userId: owner, access: { ...access } });
-        logger.debug(`Agent access set: ${entry.id} -> ${binding.type}:${binding.workspace || binding.context}${binding.path || ''}`);
-
-        // Token value is returned exactly once; only the hash is stored server-side.
-        return { access, token: token.value };
+        this.emit('agent.access.changed', { agentId: entry.id, userId: owner, access });
+        return { access, tokens };
     }
 
     async getAccess(userId, agentIdentifier, requestingUserId) {
@@ -548,7 +594,7 @@ class Agents extends EventEmitter {
         let canvasTools = [];
         if (config?.tools?.canvas?.enabled !== false) {
             const canvasEnv = await this.#resolveCanvasEnvForStart(entry);
-            if (canvasEnv) canvasTools = createCanvasTools(canvasEnv);
+            if (canvasEnv) canvasTools = await createCanvasTools(canvasEnv);
         }
         const codingTools = createCodingTools(path.join(entry.rootPath, 'home'));
         return {
@@ -560,37 +606,28 @@ class Agents extends EventEmitter {
         };
     }
 
-    async rotateAgentToken(userId, agentIdentifier, requestingUserId) {
-        const { owner, entry, agent } = await this.#requireOwnedAgent(userId, agentIdentifier, requestingUserId);
-        if (!entry.access?.tokenHash) throw new Error(`Agent ${entry.id} has no access binding`);
-
-        const token = mintAgentToken({ permissions: entry.access.permissions });
-        const access = {
-            ...entry.access,
-            tokenId: token.id,
-            tokenHash: token.hash,
-            rotatedAt: new Date().toISOString(),
-        };
-
-        await this.#persistAccess(owner, entry, agent, access);
-        await this.#writeCanvasEnv(entry, access, token.value);
-
-        if (agent.isActive) await agent.restart();
-        this.emit('agent.access.changed', { agentId: entry.id, userId: owner, access: { ...access } });
-        return { access, token: token.value };
+    async rotateAgentToken(userId, agentIdentifier, grantId, requestingUserId) {
+        return this.#withAccessWrite(userId, agentIdentifier, requestingUserId, async owned => {
+            const current = owned.entry.access?.grants?.find(grant => grant.id === grantId);
+            if (!current) throw new Error(`Connection not found: ${grantId}`);
+            const token = mintAgentToken({ permissions: current.permissions });
+            const grant = { ...current, tokenId: token.id, tokenHash: token.hash, rotatedAt: new Date().toISOString() };
+            return this.#saveGrants(owned, owned.entry.access.grants.map(value => value.id === grantId ? grant : value), [{ id: grantId, token: token.value }]);
+        });
     }
 
     async revokeAccess(userId, agentIdentifier, requestingUserId) {
-        const { owner, entry, agent } = await this.#requireOwnedAgent(userId, agentIdentifier, requestingUserId);
-        if (!entry.access) return false;
+        return this.#withAccessWrite(userId, agentIdentifier, requestingUserId, async owned => {
+            const { owner, entry, agent } = owned;
+            if (!entry.access) return false;
 
-        if (entry.access.tokenHash) this.#tokenIndex.delete(entry.access.tokenHash);
-        await this.#persistAccess(owner, entry, agent, null);
-        await removeAgentRuntimeEnv(entry.rootPath);
+            await this.#persistAccess(owner, entry, agent, null);
+            await removeAgentRuntimeEnv(entry.rootPath);
 
-        if (agent.isActive) await agent.restart();
-        this.emit('agent.access.changed', { agentId: entry.id, userId: owner, access: null });
-        return true;
+            if (agent.isActive) await agent.restart();
+            this.emit('agent.access.changed', { agentId: entry.id, userId: owner, access: null });
+            return true;
+        });
     }
 
     /**
@@ -602,13 +639,12 @@ class Agents extends EventEmitter {
     async verifyAgentToken(tokenValue) {
         if (!this.#initialized) return null;
 
-        const indexKey = this.#tokenIndex.get(hashToken(tokenValue));
-        if (!indexKey) return null;
-
-        const entry = this.#indexStore.get(indexKey);
-        if (!entry?.access || !verifyAgentTokenValue(tokenValue, entry.access)) return null;
-
-        const scope = await this.#resolveBindingScope(entry.owner, entry.access.binding);
+        const indexed = this.#tokenIndex.get(hashToken(tokenValue));
+        if (!indexed) return null;
+        const entry = this.#indexStore.get(indexed.indexKey);
+        const grant = entry?.access?.grants?.find(value => value.id === indexed.grantId);
+        if (!verifyAgentTokenValue(tokenValue, grant)) return null;
+        const scope = await this.#resolveBindingScope(entry.owner, grant.binding);
         if (!scope) {
             logger.warn(`Agent token scope resolution failed for agent ${entry.id}`);
             return null;
@@ -621,7 +657,8 @@ class Agents extends EventEmitter {
             workspaceId: scope.workspaceId,
             workspaceName: scope.workspaceName,
             basePath: scope.basePath,
-            permissions: entry.access.permissions,
+            grantId: grant.id,
+            permissions: grant.permissions,
         };
     }
 
@@ -842,7 +879,7 @@ class Agents extends EventEmitter {
                 await this.#workspaceManager.removeWorkspace(entry.workspace.id, owner, false);
             }
             this.#agents.delete(agentId);
-            if (entry.access?.tokenHash) this.#tokenIndex.delete(entry.access.tokenHash);
+            for (const grant of entry.access?.grants || []) this.#tokenIndex.delete(grant.tokenHash);
             this.#indexStore.delete(indexKey);
 
             const host = entry.host || DEFAULT_HOST;
@@ -912,7 +949,7 @@ class Agents extends EventEmitter {
         updated.config = this.#mergeAgentConfig(config.config, updates.config);
 
         if (!updateData.deferProviderValidation) await validateAgentProvider(updated);
-        await fsPromises.writeFile(entry.configPath, JSON.stringify(updated, null, 2));
+        await writePrivateJson(entry.configPath, updated);
         await materializeAgentRuntimeFiles(entry.rootPath, updated);
 
         await this.#writeModelsConfig(path.join(entry.rootPath, AGENT_DIRECTORIES.runtime), {
@@ -1145,68 +1182,46 @@ class Agents extends EventEmitter {
     async #persistAccess(owner, entry, agent, access) {
         const config = await this.#loadConfig(entry.configPath);
         const updated = { ...config, access, updatedAt: new Date().toISOString() };
-        await fsPromises.writeFile(entry.configPath, JSON.stringify(updated, null, 2));
+        await writePrivateJson(entry.configPath, updated);
         await materializeAgentRuntimeFiles(entry.rootPath, updated);
 
         agent.setConfigKey('access', access);
 
         const indexKey = constructAgentIndexKey(owner, entry.id);
-        if (entry.access?.tokenHash && entry.access.tokenHash !== access?.tokenHash) {
-            this.#tokenIndex.delete(entry.access.tokenHash);
-        }
-        if (access?.tokenHash) {
-            this.#tokenIndex.set(access.tokenHash, indexKey);
-        }
+        for (const grant of entry.access?.grants || []) this.#tokenIndex.delete(grant.tokenHash);
+        for (const grant of access?.grants || []) this.#tokenIndex.set(grant.tokenHash, { indexKey, grantId: grant.id });
         this.#updateIndex(indexKey, { access });
         entry.access = access;
     }
 
-    // Materialize {rootPath}/runtime/canvas.env for the current binding.
-    async #writeCanvasEnv(entry, access, tokenValue) {
-        if (!this.#apiBaseUrl) {
-            logger.warn(`apiBaseUrl not set; agent ${entry.id} canvas.env not written`);
-            return;
+    async #buildConnectionsEnv(entry, grants, tokens) {
+        if (!grants.length || !this.#apiBaseUrl) return null;
+        const connections = [];
+        for (const grant of grants) {
+            const token = tokens.get(grant.id);
+            const credentialsValid = token && hashToken(token) === grant.tokenHash;
+            const scope = await this.#resolveBindingScope(entry.owner, grant.binding);
+            const unavailable = !credentialsValid ? 'Rotate this connection token to restore runtime credentials'
+                : !scope ? 'Connection scope is unavailable' : undefined;
+            connections.push({ id: grant.id, label: grant.label, ...(credentialsValid ? { token } : {}),
+                ...scope, permissions: grant.permissions, ...(unavailable ? { unavailable } : {}) });
         }
-        const scope = await this.#resolveBindingScope(entry.owner, access.binding);
-        if (!scope) throw new Error(`Cannot resolve binding scope for agent ${entry.id}`);
-
-        const env = buildAgentRuntimeEnv({
-            ...scope,
-            agentId: entry.id,
-            tokenValue,
-            apiBaseUrl: this.#apiBaseUrl,
-        });
-        if (env) await persistAgentRuntimeEnv(entry.rootPath, env);
+        return buildAgentRuntimeEnv({ agentId: entry.id, connections, apiBaseUrl: this.#apiBaseUrl });
     }
 
-    // Build the canvasEnv passed into Agent.start(). Refreshes canvas.env with
-    // the live-resolved scope (context bindings can move between workspaces).
     async #resolveCanvasEnvForStart(entry) {
-        if (!entry?.access?.tokenHash || !this.#apiBaseUrl) return null;
-
+        if (!entry?.access?.grants?.length || !this.#apiBaseUrl) return null;
         const stored = await loadAgentRuntimeEnv(entry.rootPath);
-        if (!stored?.CANVAS_TOKEN || hashToken(stored.CANVAS_TOKEN) !== entry.access.tokenHash) {
-            logger.warn(`Agent ${entry.id} has a binding but no matching canvas.env token; rotate the token to restore canvas tools`);
-            return null;
-        }
-
-        const scope = await this.#resolveBindingScope(entry.owner, entry.access.binding);
-        if (!scope) return null;
-
-        const env = buildAgentRuntimeEnv({
-            ...scope,
-            agentId: entry.id,
-            tokenValue: stored.CANVAS_TOKEN,
-            apiBaseUrl: this.#apiBaseUrl,
-        });
+        const tokens = new Map(JSON.parse(stored?.CANVAS_CONNECTIONS || '[]').map(connection => [connection.id, connection.token]));
+        const env = await this.#buildConnectionsEnv(entry, entry.access.grants, tokens);
         if (env) await persistAgentRuntimeEnv(entry.rootPath, env);
         return env;
     }
 
     #rebuildTokenIndex() {
         this.#tokenIndex.clear();
-        for (const [key, entry] of Object.entries(this.#indexStore.store)) {
-            if (entry?.access?.tokenHash) this.#tokenIndex.set(entry.access.tokenHash, key);
+        for (const [indexKey, entry] of Object.entries(this.#indexStore.store)) {
+            for (const grant of entry?.access?.grants || []) this.#tokenIndex.set(grant.tokenHash, { indexKey, grantId: grant.id });
         }
     }
 
@@ -1393,7 +1408,7 @@ class Agents extends EventEmitter {
             updatedAt: new Date().toISOString(),
         };
 
-        await fsPromises.writeFile(entry.configPath, JSON.stringify(updated, null, 2));
+        await writePrivateJson(entry.configPath, updated);
         agent.setConfigKey('config', updated.config);
         this.#updateIndex(indexKey, {
             config: updated.config,
@@ -1423,7 +1438,7 @@ class Agents extends EventEmitter {
         };
 
         const filePath = path.join(runtimePath, 'models.json');
-        await fsPromises.writeFile(filePath, JSON.stringify(config, null, 2));
+        await writePrivateJson(filePath, config);
         logger.debug(`models.json written: ${filePath}`);
     }
 

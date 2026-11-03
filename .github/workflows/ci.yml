@@ -47,13 +47,13 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund "$tgz"
           test -d node_modules/@augmentd-labs/canvas-edge/node_modules/canvas-stored
           CANVAS_USER_HOME=/tmp/edge-ci timeout 8 node node_modules/.bin/canvas-edge --foreground || [ $? -eq 124 ]
-      - name: Smoke-test the standalone agent distribution
+      - name: Smoke-test private local agent distribution
+        working-directory: .
         run: |
           set -e
-          node scripts/pack-dist.mjs agent --out runtime-artifacts --pack
-          tgz=$(ls "$PWD"/runtime-artifacts/augmentd-labs-canvas-agent-runtime-*.tgz)
-          consumer=$(mktemp -d)
-          # Exercise a different host undici version: the bundled client uses 6.
-          npm install --prefix "$consumer" --no-audit --no-fund "$tgz" 'undici@^8.7.0'
-          node scripts/check-public-package.mjs "$consumer/node_modules/@augmentd-labs/canvas-agent-runtime"
-          node scripts/smoke-runtime.mjs "$consumer/node_modules/@augmentd-labs/canvas-agent-runtime"
+          node --test scripts/private-tests/*.test.mjs
+          deployment=$(mktemp -d)
+          node scripts/export-private-runtime.mjs --out "$deployment/source"
+          npm pack "$deployment/source" --pack-destination "$deployment"
+          npm install --prefix "$deployment/consumer" --no-audit --no-fund "$deployment"/*.tgz
+          node scripts/smoke-runtime.mjs "$deployment/consumer/node_modules/canvas-agentd"

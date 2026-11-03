@@ -1,6 +1,8 @@
 services:
   agent:
-    build: .
+    build:
+      context: ../..
+      dockerfile: runtime/deploy/Dockerfile
     restart: unless-stopped
     user: "${CANVAS_UID:-1000}:${CANVAS_GID:-1000}"
     ports: ["127.0.0.1:${CANVAS_LOCAL_PORT:-8012}:8012"]

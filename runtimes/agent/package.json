@@ -1,6 +1,6 @@
 {
   "name": "@augmentd-labs/canvas-agent-runtime",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Standalone Canvas Pi agent, local API, voice and outbound registration",
   "type": "module",
   "license": "AGPL-3.0-or-later",
@@ -47,5 +47,6 @@
     "type": "git",
     "url": "git+https://github.com/canvas-ui/canvas-common.git",
     "directory": "runtimes/agent"
-  }
+  },
+  "private": true
 }

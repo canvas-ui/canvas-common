@@ -7,7 +7,8 @@ import { pathToFileURL } from 'node:url';
 
 const installed = path.resolve(process.argv[2] || 'node_modules/@augmentd-labs/canvas-agent-runtime');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canvas-distribution-'));
-const { main } = await import(pathToFileURL(path.join(installed, 'src/main.js')));
+const manifest = JSON.parse(fs.readFileSync(path.join(installed, 'package.json')));
+const { main } = await import(pathToFileURL(path.join(installed, manifest.main || 'src/main.js')));
 fs.writeFileSync(path.join(root, 'existing.txt'), 'Existing file');
 const runtime = await main({ argv: [root, '--foreground', '--no-web'] });
 try {

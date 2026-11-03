@@ -4,14 +4,21 @@ const source = new URL('../../canvas-server/src/runtimes/agent/', import.meta.ur
 const target = new URL('../runtimes/agent/src/core/agent/', import.meta.url);
 const check = process.argv.includes('--check');
 let changed = false;
-for (const [from, to] of [['tools/index.js', 'tools/index.js'], ['tools/client.js', 'tools/client.js'], ['tools/render.js', 'tools/render.js'], ['tools/trees.js', 'tools/trees.js'], ['config/files.js', 'files.js'],
-    ['Agent.js', 'Agent.js'], ['config/models.js', 'config/models.js'], ['config/generation.js', 'config/generation.js'],
+for (const [from, to] of [['tools/index.js', 'tools/index.js'], ['tools/client.js', 'tools/client.js'], ['tools/render.js', 'tools/render.js'], ['tools/trees.js', 'tools/trees.js'], ['tools/connections.js', 'tools/connections.js'], ['config/files.js', 'files.js'],
+    ['Agent.js', 'Agent.js'], ['../../hub/agents/index.js', 'index.js'],
+    ['../../hub/agents/runtime-env.js', 'runtime-env.js'], ['../../hub/agents/AgentTokens.js', 'lib/AgentTokens.js'],
+    ['../../hub/agents/validation.js', 'validation.js'], ['config/models.js', 'config/models.js'], ['config/generation.js', 'config/generation.js'],
     ['runtime/view-context.js', 'view-context.js'], ['../../utils/private-file.js', '../../utils/private-file.js'],
     ['../../transports/routes/agents/index.js', '../../transports/routes/agents/index.js']]) {
     let code = fs.readFileSync(new URL(from, source), 'utf8');
     // The standalone package has a flat agent directory and its own auth entry.
     if (from === 'Agent.js') code = code.replaceAll('./runtime/worker-session.js', './worker-session.js')
         .replaceAll('./runtime/view-context.js', './view-context.js').replaceAll('./config/files.js', './files.js');
+    if (from.startsWith('../../hub/agents/')) code = code
+        .replaceAll('../../runtimes/agent/Agent.js', './Agent.js')
+        .replaceAll('../../runtimes/agent/tools/index.js', './tools/index.js')
+        .replaceAll('../../runtimes/agent/config/files.js', './files.js')
+        .replaceAll('./AgentTokens.js', './lib/AgentTokens.js');
     if (from === '../../transports/routes/agents/index.js') code = code
         .replaceAll('../../../runtimes/agent/config/models.js', '../../../core/agent/config/models.js')
         .replaceAll('../../../runtimes/agent/runtime/view-context.js', '../../../core/agent/view-context.js')

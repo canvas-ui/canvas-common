@@ -1,6 +1,6 @@
 {
   "name": "@augmentd-labs/canvas-workspaced",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "type": "module",
   "description": "Canvas workspace runtime with outbound hub registration",
   "license": "AGPL-3.0-or-later",
@@ -18,12 +18,15 @@
     "bin",
     "deploy",
     "NOTICE",
-    "README.md"
+    "README.md",
+    "launcher"
   ],
   "dependencies": {
     "@augmentd-labs/canvas-runtime-core": "workspace:*",
     "proper-lockfile": "^4.1.2",
-    "@augmentd-labs/canvas-agent-runtime": "workspace:*"
+    "@canvas-local/undici": "npm:undici@^6.21.3",
+    "engine.io-client": "^6.6.6",
+    "socket.io-client": "^4.8.3"
   },
   "private": true
 }

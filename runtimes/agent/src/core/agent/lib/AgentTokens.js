@@ -7,14 +7,13 @@ import { v4 as uuidv4 } from 'uuid';
  * AgentTokens — token primitives for agent principals.
  *
  * Unlike WorkspaceTokens (which owns a config-store ACL map), agent tokens are
- * single-active-per-agent and their hash lives inside the agent's index entry
- * (entry.access.tokenHash). This module therefore only provides the pure
+ * independent per connection and their hashes live in the agent's access grants. This module therefore only provides the pure
  * mint/hash/verify primitives; storage is owned by the Agents service.
  */
 
 export const AGENT_TOKEN_PREFIX = 'canvas-agent-';
 
-export const AGENT_TOKEN_PERMISSIONS = ['read', 'write'];
+const AGENT_TOKEN_PERMISSIONS = ['read', 'write'];
 
 export function hashToken(tokenValue) {
     return `sha256:${crypto.createHash('sha256').update(tokenValue).digest('hex')}`;

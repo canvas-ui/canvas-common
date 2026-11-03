@@ -12,8 +12,10 @@ canvas init agent ./gpu-agent --yes --local-only --foreground
 An omitted path uses the current directory. Interactive setup prompts for missing settings and defaults to PM2 background operation. `--no-start` initializes only. The CLI manages Node 22.20 on Linux x64/arm64. Direct installation requires Node >=22.19:
 
 ```sh
-npm install -g @augmentd-labs/canvas-agent-runtime
-canvas-agent ./gpu-agent --foreground
+git clone git@github.com:canvas-ui/canvas-agentd.git
+cd canvas-agentd
+npm install
+node src/local.js ./gpu-agent --foreground
 ```
 
 Direct background launch requires PM2 on PATH. The CLI installs PM2 itself. Native execution has the launching user's OS permissions; use the Docker template for a separate filesystem/process environment.
@@ -84,35 +86,36 @@ docker compose run --rm -e CANVAS_PAIRING_TOKEN agent \
 docker compose up -d agent
 ```
 
-The paired device token persists in the mounted folder. Read the local login token from `.agent/runtime.json` on the host. The Dockerfile accepts `CANVAS_RUNTIME_PACKAGE` as a build argument for choosing a published package version. See the upstream [Speaches installation](https://speaches.ai/installation/), [model provisioning](https://speaches.ai/usage/model-discovery/) and [Kokoro configuration](https://github.com/remsky/Kokoro-FastAPI/blob/master/docs/configuration.md) for service-specific requirements.
+The paired device token persists in the mounted folder. Read the local login token from `.agent/runtime.json` on the host. The Dockerfile builds from the private AgentD checkout and installs its public dependencies. See the upstream [Speaches installation](https://speaches.ai/installation/), [model provisioning](https://speaches.ai/usage/model-discovery/) and [Kokoro configuration](https://github.com/remsky/Kokoro-FastAPI/blob/master/docs/configuration.md) for service-specific requirements.
 
-## Development and release
+## Private local deployments
 
-Implementation lives in `runtimes/agent`; canvas-server and the private workspace runtime reuse its agent/voice modules. The tunnel client lives in `packages/api-client`, independently of the canvas-edge mirror daemon. Set `CANVAS_WEB_ROOT` to a local UI build; web 2.15.3 hides workspace navigation on an agent-only host.
+Agent and workspace runtimes are not published to npm. Production agent logic
+comes from canvas-server; `scripts/regenerate-agent-tools.mjs` refreshes the
+derived runtime sources. The exporter includes the shared API client and protocol
+sources so local deployments do not require unpublished Canvas libraries.
 
-```sh
-node scripts/install-public.mjs
-cd .public-workspace
-node --test runtimes/agent/tests/*.test.js scripts/tests/*.test.mjs
-node scripts/pack-dist.mjs agent --out artifacts --pack
-```
-
-`CANVAS_RUNTIME_NO_DEV=1` bypasses the CLI's sibling-checkout detection. `CANVAS_AGENT_PACKAGE` selects an agent version or tarball. `CANVAS_RUNTIME_PACKAGE` remains a generic override for the selected runtime kind.
-
-### Installing the runtime from Git or a tarball
-
-The package is not published to npm yet. `--runtime-package` on `canvas init agent` and `canvas runtime start|restart` accepts any npm package spec and takes precedence over the environment variables and over a sibling checkout:
+From canvas-common:
 
 ```sh
-# A Git repository (public, or private with Git credentials on the host) that provides the canvas-agent executable
-canvas init agent ./gpu-agent --yes --local-only --runtime-package github:canvas-ui/canvas-agentd#main
-# A packed tarball (node scripts/pack-dist.mjs agent --pack) or a release asset URL
-canvas init agent ./gpu-agent --yes --runtime-package ./augmentd-labs-canvas-agent-runtime-0.1.0.tgz
-canvas runtime restart ./gpu-agent --runtime-package https://github.com/canvas-ui/canvas-common/releases/download/agent-v0.1.0/augmentd-labs-canvas-agent-runtime-0.1.0.tgz
+npm run agent:export
+node scripts/export-private-runtime.mjs --check
+cd ../canvas-agentd
+npm pack
 ```
 
-The source package is installed under the `@augmentd-labs/canvas-agent-runtime` name whatever it calls itself; it must provide a `canvas-agent` executable in its `bin`. The chosen spec is recorded in `~/.canvas/runtime/agent/package.json`, so a later `canvas runtime start` without the flag keeps it. Git sources of a Git source resolve through npm as usual, so every dependency of the pointed-to repository must itself be installable (a registry version, a Git URL or a tarball).
+Install from the private Git repository, a GitHub ZIP, or a local tarball:
 
-The installer creates `.public-workspace` with only public source packages and their exact lockfile resolutions. Public CI and releases run there without fetching synapsd. The npm allowlist contains protocol, schemas, wallpapers, api-client, edge and agent. Publish api-client before agent. Both packing and publishing reject private packages and dependencies, including transitive synapsd references. The agent tarball is tested in a clean npm installation without access to private repositories. Runtime-core and workspaced remain private and are tested/deployed through Git; see [workspaced](../workspaced/README.md).
+```sh
+canvas init agent ./gpu-agent --runtime-package git@github.com:canvas-ui/canvas-agentd.git
+canvas init agent ./gpu-agent --runtime-package ./canvas-agentd-main.zip
+canvas init agent ./gpu-agent --runtime-package ./canvas-agentd-0.3.2.tgz
+```
 
-No model weights are included. One hub per runtime and turn-based audio are supported; realtime full-duplex voice remains separate work.
+The CLI clones Git sources without submodules, packs them, and caches the result.
+Only public dependencies are resolved through npm. `CANVAS_RUNTIME_NO_DEV=1`
+bypasses sibling-checkout detection; `CANVAS_AGENT_PACKAGE` selects a Git or local
+archive source. No model weights are included.
+
+The npm allowlist is limited to protocol, schemas, wallpapers, api-client and edge.
+Private runtime packages and dependencies are rejected by public packaging checks.

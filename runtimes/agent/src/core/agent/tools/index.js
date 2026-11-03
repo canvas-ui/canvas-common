@@ -6,6 +6,7 @@ import { defineTool } from '@earendil-works/pi-coding-agent';
 
 import { CanvasApiClient } from './client.js';
 import { createTreeTools } from './trees.js';
+import { connectionTools } from './connections.js';
 import {
     SCHEMA_HELP,
     extractSubtree,
@@ -57,8 +58,12 @@ function scopedPath(basePath, requested) {
  * @returns {Promise<Array>} pi tool definitions
  */
 export async function createCanvasTools(env) {
+    return connectionTools(env, createScopedTools);
+}
+
+async function createScopedTools(env) {
     const client = new CanvasApiClient(env);
-    const { payload: querySchema } = await client.get('/schemas/query');
+    const { payload: querySchema } = await client.get('/schemas/query', { signal: AbortSignal.timeout(10000) });
     if (querySchema?.type !== 'object' || !querySchema.properties?.match) throw new Error('Server must publish the native document query schema at /schemas/query.');
     const workspaceId = env.CANVAS_WORKSPACE;
     const workspaceName = env.CANVAS_WORKSPACE_NAME || workspaceId;

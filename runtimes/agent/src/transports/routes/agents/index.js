@@ -526,9 +526,9 @@ export default async function agentRoutes(fastify, _options) {
     });
 
     /**
-     * Access binding — lock the agent to a workspace / workspace path / context, or grant global (cross-workspace) scope
-     * and mint its canvas-agent-* token. The token value is returned exactly
-     * once (only the hash is stored server-side).
+     * Named access grants independently scope the agent to workspaces, paths,
+     * contexts or global access. Each grant has its own canvas-agent-* token. The token value is returned exactly
+     * once in API responses; the private runtime env holds the worker credentials.
      */
     fastify.get('/:agentIdentifier/access', { onRequest: [fastify.authenticate] }, async (request, reply) => {
         if (!requireUser(request, reply)) return;
@@ -547,27 +547,23 @@ export default async function agentRoutes(fastify, _options) {
         }
     });
 
+    const grantSchema = {
+        type: 'object', additionalProperties: false, required: ['binding', 'permissions'],
+        properties: {
+            id: { type: 'string', pattern: '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$' },
+            label: { type: 'string', maxLength: 120 },
+            binding: { type: 'object', additionalProperties: false, required: ['type'], properties: {
+                type: { type: 'string', enum: ['workspace', 'path', 'context', 'global'] },
+                workspace: { type: 'string' }, path: { type: 'string' }, context: { type: 'string' },
+            } },
+            permissions: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', enum: ['read', 'write'] } },
+        },
+    };
     fastify.put('/:agentIdentifier/access', {
         onRequest: [fastify.authenticate],
-        schema: {
-            body: {
-                type: 'object',
-                required: ['binding'],
-                properties: {
-                    binding: {
-                        type: 'object',
-                        required: ['type'],
-                        properties: {
-                            type: { type: 'string', enum: ['workspace', 'path', 'context', 'global'] },
-                            workspace: { type: 'string' },
-                            path: { type: 'string' },
-                            context: { type: 'string' },
-                        },
-                    },
-                    permissions: { type: 'array', items: { type: 'string', enum: ['read', 'write'] } },
-                },
-            },
-        },
+        schema: { body: { type: 'object', additionalProperties: false, required: ['grants'], properties: {
+            grants: { type: 'array', minItems: 1, maxItems: 32, items: { ...grantSchema, required: [...grantSchema.required, 'id'] } },
+        } } },
     }, async (request, reply) => {
         if (!requireUser(request, reply)) return;
         try {
@@ -586,17 +582,38 @@ export default async function agentRoutes(fastify, _options) {
         }
     });
 
-    fastify.post('/:agentIdentifier/access/token', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    fastify.put('/:agentIdentifier/access/grants/:grantId', {
+        onRequest: [fastify.authenticate], schema: { body: grantSchema },
+    }, async (request, reply) => {
+        if (!requireUser(request, reply)) return;
+        try {
+            const result = await fastify.agents.setAccessGrant(request.user.id, request.params.agentIdentifier, request.params.grantId, request.body, request.user.id);
+            return reply.code(201).send(new ResponseObject().created(result, 'Connection saved; its token is shown once').getResponse());
+        } catch (error) {
+            return reply.code(400).send(new ResponseObject().badRequest(error.message).getResponse());
+        }
+    });
+    fastify.delete('/:agentIdentifier/access/grants/:grantId', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+        if (!requireUser(request, reply)) return;
+        try {
+            const result = await fastify.agents.revokeAccessGrant(request.user.id, request.params.agentIdentifier, request.params.grantId, request.user.id);
+            return new ResponseObject().success(result, 'Connection revoked').getResponse();
+        } catch (error) {
+            return reply.code(400).send(new ResponseObject().badRequest(error.message).getResponse());
+        }
+    });
+
+    fastify.post('/:agentIdentifier/access/grants/:grantId/token', { onRequest: [fastify.authenticate] }, async (request, reply) => {
         if (!requireUser(request, reply)) return;
         try {
             const result = await fastify.agents.rotateAgentToken(
-                request.user.id, request.params.agentIdentifier, request.user.id
+                request.user.id, request.params.agentIdentifier, request.params.grantId, request.user.id
             );
             const r = new ResponseObject().created(result, 'Agent token rotated — store the token now, it is not shown again');
             return reply.code(r.statusCode).send(r.getResponse());
         } catch (err) {
             fastify.log.error(err);
-            const r = err.message?.includes('no access binding') || err.message?.startsWith('Agent not found')
+            const r = err.message?.includes('not found')
                 ? new ResponseObject().badRequest(err.message)
                 : new ResponseObject().serverError(err.message || 'Failed to rotate agent token');
             return reply.code(r.statusCode).send(r.getResponse());
