@@ -14,7 +14,7 @@
 // Usage:
 //   node scripts/pack-dist.mjs <target|all> [--out artifacts] [--pack] [--registry]
 //
-// Targets: protocol schemas wallpapers api-client edge agent (see TARGETS).
+// Targets: protocol schemas wallpapers api-client edge (see TARGETS).
 // Output: <out>/dist/<target>/; --pack also writes <out>/<name>-<version>.tgz.
 
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -33,7 +33,6 @@ export const TARGETS = {
     wallpapers: { dir: 'packages/wallpapers' },
     'api-client': { dir: 'packages/api-client' },
     edge: { dir: 'runtimes/edge' },
-    agent: { dir: 'runtimes/agent' },
 };
 
 const META_FILES = ['package.json', 'LICENSE', 'LICENSE.md', 'NOTICE', 'README.md'];

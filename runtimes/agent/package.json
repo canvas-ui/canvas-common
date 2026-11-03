@@ -47,5 +47,6 @@
     "type": "git",
     "url": "git+https://github.com/canvas-ui/canvas-common.git",
     "directory": "runtimes/agent"
-  }
+  },
+  "private": true
 }

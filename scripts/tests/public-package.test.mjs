@@ -16,9 +16,9 @@ function manifest(dir, data) {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(data));
 }
-test('release targets exclude the private workspace runtime even when explicitly requested', async () => {
+test('release targets exclude the private agent and workspace runtimes even when explicitly requested', async () => {
     assert.deepEqual(Object.keys(TARGETS).sort(), [...PUBLIC_PACKAGES].sort());
-    for (const name of ['runtime-core', 'workspaced']) await assert.rejects(stage(name), /unknown target/);
+    for (const name of ['agent', 'agentd', 'runtime-core', 'workspaced']) await assert.rejects(stage(name), /unknown target/);
 });
 test('public packaging rejects private dependencies directly and through another package', t => {
     const root = fixture(t);
@@ -36,4 +36,14 @@ test('artifact scan rejects undeclared vendored synapsd and private runtime mani
     manifest(root, { name: 'public-wrapper' });
     manifest(path.join(root, 'vendor/db'), { name: 'canvas-synapsd' });
     assert.throws(() => assertPublicArtifact(root), /canvas-synapsd/);
+});
+
+test('public artifacts reject agent and workspace runtime dependencies', t => {
+    for (const name of ['canvas-agentd', '@augmentd-labs/canvas-agent-runtime', '@augmentd-labs/canvas-workspaced']) {
+        const root = fixture(t);
+        manifest(root, { name: 'wrapper', dependencies: { [name]: '1.0.0' } });
+        assert.throws(() => assertPublicDependencies(root), /Private dependency/);
+        manifest(root, { name });
+        assert.throws(() => assertPublicArtifact(root), /Private package/);
+    }
 });
