@@ -93,6 +93,9 @@ export default class ResponseObject {
         }
         // The caller named a document id that does not exist.
         if (code === 'ENODOCUMENT') { return new ResponseObject().notFound(error.message); }
+        // Synapsd rejected the request's shape (a malformed spec, a query made
+        // only of exclusions): the caller's problem, reported as such.
+        if (error?.name === 'ArgumentError') { return new ResponseObject().badRequest(error.message); }
         // A connector source refused a write-through (revoked token, missing
         // scope, object deleted upstream): 502, with the reason it gave.
         if (code === 'ECONNECTORWRITE') { return new ResponseObject().error(error.message, null, 502); }

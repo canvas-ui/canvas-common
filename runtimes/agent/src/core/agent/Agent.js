@@ -10,9 +10,12 @@ import {
     SessionManager,
     createCodingTools,
 } from '@earendil-works/pi-coding-agent';
-import { getModel } from '@earendil-works/pi-ai';
+import { installViewContext } from './view-context.js';
+import { configureGeneration } from './config/generation.js';
+import { resolveAgentModel } from './config/models.js';
 
 import { createLogger } from '../../utils/log.js';
+import { writePrivateJson } from '../../utils/private-file.js';
 import { createCanvasTools } from './tools/index.js';
 import { createWorkerSession } from './worker-session.js';
 import { migrateAgentRuntimeFiles } from './files.js';
@@ -277,15 +280,13 @@ class Agent extends EventEmitter {
                 logger.warn(`models.json parse error for agent ${this.id}: ${modelRegistry.getError()}`);
             }
 
-            // Resolve model from registry (local/custom) or built-in pi-ai catalogue.
-            const modelObj = modelRegistry.find(this.llmProvider, this.model)
-                || getModel(this.llmProvider, this.model);
-            if (!modelObj) {
-                throw new Error(
-                    `Unknown model: ${this.llmProvider}/${this.model}. ` +
-                    `For local providers, add a models.json to ${runtimePath}.`
-                );
-            }
+            const modelObj = await resolveAgentModel(modelRegistry, {
+                provider: this.llmProvider,
+                modelId: this.model,
+                baseUrl: this.agentConfig.baseUrl,
+                apiKey: storedApiKey,
+                parameters: this.agentConfig.connectors?.[this.llmProvider],
+            });
 
             // Canvas tools only for bound agents with a runtime env (explicit
             // option, else the resolver the Agents service installs so that
@@ -295,7 +296,7 @@ class Agent extends EventEmitter {
             if (canvasEnv === undefined && this.#canvasEnvResolver) {
                 canvasEnv = await this.#canvasEnvResolver();
             }
-            const canvasTools = canvasEnv && canvasToolsEnabled ? createCanvasTools(canvasEnv) : [];
+            const canvasTools = canvasEnv && canvasToolsEnabled ? await createCanvasTools(canvasEnv) : [];
             const codingTools = createCodingTools(this.#homePath());
 
             // pi's `tools` option is an allow/activate list of tool NAMES (built-in
@@ -304,7 +305,7 @@ class Agent extends EventEmitter {
             const sessionOptions = {
                 cwd: this.#homePath(),
                 agentDir: path.join(this.#rootPath, 'home', '.pi'),
-                model: modelObj,
+                model: this.agentConfig.baseUrl ? { ...modelObj, baseUrl: this.agentConfig.baseUrl } : modelObj,
                 authStorage,
                 modelRegistry,
                 sessionManager: this.#sessionManager(),
@@ -316,6 +317,8 @@ class Agent extends EventEmitter {
             }
 
             const { session } = await createAgentSession(sessionOptions);
+            installViewContext(session);
+            configureGeneration(session, this.agentConfig, this.llmProvider);
             this.#session = session;
             this.#status = AGENT_STATUS_CODES.ACTIVE;
             this.emit('status.changed', { id: this.id, status: this.#status });
@@ -346,7 +349,7 @@ class Agent extends EventEmitter {
                 },
             },
         };
-        await writeFile(filePath, JSON.stringify(config, null, 2));
+        await writePrivateJson(filePath, config);
         logger.debug(`Auto-generated models.json for agent ${this.id} (${this.llmProvider})`);
     }
 
@@ -367,7 +370,7 @@ class Agent extends EventEmitter {
         if (!model || model.input?.includes('image')) return;
 
         model.input = Array.isArray(model.input) ? [...new Set([...model.input, 'image'])] : LOCAL_MODEL_INPUT;
-        await writeFile(filePath, JSON.stringify(config, null, 2));
+        await writePrivateJson(filePath, config);
         logger.debug(`Enabled image input for ${this.llmProvider}/${this.model} in models.json`);
     }
 
@@ -417,6 +420,7 @@ class Agent extends EventEmitter {
         });
         try {
             await this.#session.prompt(message, {
+                ...(options.viewContext !== undefined ? { viewContext: options.viewContext } : {}),
                 ...(Array.isArray(options.images) && options.images.length > 0
                     ? { images: options.images }
                     : {}),
@@ -439,6 +443,7 @@ class Agent extends EventEmitter {
         const unsub = this.#session.subscribe(onEvent);
         try {
             await this.#session.prompt(message, {
+                ...(options.viewContext !== undefined ? { viewContext: options.viewContext } : {}),
                 ...(Array.isArray(options.images) && options.images.length > 0
                     ? { images: options.images }
                     : {}),

@@ -111,6 +111,17 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   // (→ dir: path grammar), NOT spec.context (→ ctx:), otherwise list/search query
   // the wrong tree and return nothing. Returns { context, directory } with exactly
   // one populated. Defaults to context.
+  // A single-document read (by id, by checksum) is scoped only when the caller
+  // names a scope: a path-bound agent always does (the binding middleware sets
+  // `context`), everyone else reads the whole workspace, like search does. A
+  // default of the context root would hide every document that is only in a
+  // backend mirror tree, which search and content reads still return.
+  function resolveReadScope(workspace, query) {
+    return query?.context != null || query?.treeNameOrTreeId
+      ? resolveScopeSelectors(workspace, query, '/')
+      : { context: null, directory: null };
+  }
+
   function resolveScopeSelectors(workspace, source = {}, fallbackPath = '/') {
     const path = source?.context ?? fallbackPath;
     const treeNameOrId = source?.treeNameOrTreeId ?? null;
@@ -309,7 +320,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     rel: { type: 'array', items: { type: 'string' }, default: [] },
   };
 
-  const REL_SIGILS = { '+': 'allOf', '!': 'noneOf' };
+  const REL_SIGILS = { '+': 'allOf', '!': 'noneOf', '-': 'noneOf' };
 
   function parseRelTokens(tokens = []) {
     const parsed = [];
@@ -320,7 +331,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       const body = REL_SIGILS[token[0]] ? token.slice(1) : token;
       const [p, of, dir = 'out'] = body.split(':');
       if (!p || !of) {
-        throw new Error(`rel token "${token}" must be "<predicate>:<documentId>[:in|:out]"`);
+        throw new Error(`rel token "${token}" must be "[+|!|-]<predicate>:<documentId>[:in|:out]"`);
       }
       // Checked here so an unknown (or inverse-style) predicate is a 400 rather
       // than a 500 thrown from deep inside the query resolver.
@@ -337,7 +348,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   // ── Inline relation grammar in q ──────────────────────────────────────────
   // `@<predicate>:<value>[:in|:out]` inside a text query, negated with a
-  // leading `!`. The value is a document id (`42` / `#42`) or an identity
+  // leading `!` or `-`. The value is a document id (`42` / `#42`) or an identity
   // name (`jane`, `"Jane Doe"` — quoted for spaces), resolved against
   // data/schema/identity documents by FTS; several matches union into ONE
   // rel operand (multi-id `of`), AND-ed with the rest of the query.
@@ -351,7 +362,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   // ("documents jane points at"). Unknown predicates are NOT stripped — the
   // token stays ordinary search text, so an email address or handle in a
   // query never 400s.
-  const INLINE_REL_RE = /(^|\s)(!?)@([a-z][a-z-]*):\s*(?!!?@[a-z][a-z-]*:)("[^"]*"|[^\s"]+?)(:(in|out))?(?=\s|$)/g;
+  const INLINE_REL_RE = /(^|\s)([!-]?)@([a-z][a-z-]*):\s*(?![!-]?@[a-z][a-z-]*:)("[^"]*"|[^\s"]+?)(:(in|out))?(?=\s|$)/g;
 
   function parseInlineRelQuery(query) {
     const tokens = [];
@@ -359,7 +370,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       if (!Object.hasOwn(PREDICATES, p)) { return match; }
       if (value.startsWith('"')) { value = value.slice(1, -1); }
       if (!value) { return lead; }
-      tokens.push({ negated: bang === '!', p, value, dir: dir === 'out' ? 'out' : 'in' });
+      tokens.push({ negated: bang !== '', p, value, dir: dir === 'out' ? 'out' : 'in' });
       return lead;
     }).trim();
     return { text, tokens };
@@ -459,8 +470,9 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     mode: { type: 'string', enum: ['fts', 'vector', 'hybrid'] },
     // Search text grammar: bare words match in any order (all required,
     // widening to any when nothing matches every word); a double-quoted
-    // segment is a verbatim phrase. 'exact' treats the whole text as one
-    // phrase. Any phrase ranks on FTS alone.
+    // segment is a verbatim phrase; a leading - or ! excludes a word or
+    // phrase. 'exact' treats the whole text as one phrase. Any phrase ranks
+    // on FTS alone.
     match: { type: 'string', enum: ['any', 'exact'] },
     // Optional cosine-distance floor for the dense side of vector/hybrid
     // search — drops weak (far) kNN hits before fusion. 0..2 (0 = identical).
@@ -952,7 +964,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     try {
       const workspace = await getWorkspaceInstance(request, reply);
       if (!workspace) return reply;
-      const { context: ctxSel, directory: dirSel } = resolveScopeSelectors(workspace, request.query, '/');
+      const { context: ctxSel, directory: dirSel } = resolveReadScope(workspace, request.query);
 
       const document = await workspace.get(request.params.docId);
       if (!document) {
@@ -2007,7 +2019,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     try {
       const workspace = await getWorkspaceInstance(request, reply);
       if (!workspace) return reply;
-      const { context: ctxSel, directory: dirSel } = resolveScopeSelectors(workspace, request.query, '/');
+      const { context: ctxSel, directory: dirSel } = resolveReadScope(workspace, request.query);
 
       const checksumString = `${request.params.algo}/${request.params.hash}`;
       const document = await workspace.getByChecksumString(checksumString);

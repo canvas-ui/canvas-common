@@ -11,8 +11,10 @@ import {
     extractSubtree,
     formatPaths,
     normalizePath,
+    pickFields,
     renderDocument,
     resolveSchema,
+    summarizeDocument,
     treeToPaths,
 } from './render.js';
 
@@ -183,19 +185,28 @@ export async function createCanvasTools(env) {
     const canvasFind = defineTool({
         name: 'canvas_doc_find',
         label: 'Canvas Document Find',
-        description: 'Query documents using the complete native Synapsd spec. Paths in spec are workspace-absolute; your token scope is independently ANDed before counting, ranking and pagination. Use features allOf/anyOf/noneOf, filters such as t:content:2026-10-01..2026-10-31, relations, named context/directory trees, idsOnly or countOnly. query is text or vectors; match: exact preserves verbatim string search. Compound lines use native OR/AND. Call canvas_features for valid bitmap keys. Returns server payload, count, totalCount and per-line counts without client filtering.',
-        parameters: Type.Object({ spec: { ...querySchema, description: 'Native search request. Omit query for bitmap-only listing or count.' }, ...workspaceParams }),
+        description: 'Query documents using the complete native Synapsd spec. Paths in spec are workspace-absolute; your token scope is independently ANDed before counting, ranking and pagination. Use features allOf/anyOf/noneOf, filters such as t:content:2026-10-01..2026-10-31, relations, named context/directory trees, idsOnly or countOnly. query is text or vectors; match: exact preserves verbatim string search; a leading - or ! excludes a word, a "phrase" or a @predicate token; @predicate:value tokens inside query filter by relation (e.g. @authored-by:someone@example.com). Compound lines use native OR/AND. Call canvas_features for valid bitmap keys. Each hit is a compact summary (id, schema, title, from, date, preview, attachments); pass fields for other document properties or raw for whole documents, then canvas_doc_get_by_id to read one. count, totalCount and per-line counts come from the server without client filtering.',
+        parameters: Type.Object({
+            spec: { ...querySchema, description: 'Native search request. Omit query for bitmap-only listing or count. limit 0 returns every match.' },
+            fields: Type.Optional(Type.Array(Type.String(), { description: 'Dotted document paths to return per hit instead of the summary, e.g. ["data.subject", "data.attachments", "metadata.contentType"]. id and schema are always included.' })),
+            raw: Type.Optional(Type.Boolean({ description: 'Return whole documents (every header and field). Large; prefer fields.' })),
+            ...workspaceParams,
+        }),
         async execute(_id, params, signal) {
             try {
                 const workspace = resolveWorkspace(params);
                 const spec = structuredClone(params.spec);
                 const featureKeys = value => Array.isArray(value)
-                    ? value.map(key => key.replace(/^[+!]/, ''))
+                    ? value.map(key => key.replace(/^[+!-]/, ''))
                     : Object.values(value || {}).flat();
                 const features = [...featureKeys(spec.features), ...(spec.lines || []).flatMap(line => featureKeys(line.features))];
                 if (features.length) assertKnownFeatures(features, await listFeatureKeys(workspace, signal));
                 if (spec.limit === undefined && spec.options?.limit === undefined) spec.limit = DEFAULT_FIND_LIMIT;
-                return toolResult(await client.post(`${documentsBase(workspace)}/search`, { signal, body: spec }));
+                const result = await client.post(`${documentsBase(workspace)}/search`, { signal, body: spec });
+                if (params.raw || !Array.isArray(result.payload)) return toolResult(result);
+                const shape = params.fields?.length ? (doc) => pickFields(doc, params.fields) : summarizeDocument;
+                // idsOnly/countOnly pages carry numbers; only documents get reshaped.
+                return toolResult({ ...result, payload: result.payload.map((hit) => (hit && typeof hit === 'object' ? shape(hit) : hit)) });
             } catch (error) { return toolError(error); }
         },
     });
@@ -295,7 +306,7 @@ export async function createCanvasTools(env) {
     const canvasLink = defineTool({
         name: 'canvas_link',
         label: 'Canvas Link',
-        description: 'File existing documents at another path in your scope, preserving their content, dates, checksums and versions. Use this instead of re-inserting document data. Returns linked IDs for new memberships and alreadyLinked IDs for existing memberships (context paths use AND-ed layer bitmaps, not filing history). Missing paths are created by default. Requires write permission; documents must already be accessible within your scope.',
+        description: 'File existing documents at another path in your scope, preserving their content, dates, checksums and versions. Use this instead of re-inserting document data. Returns linked IDs for new memberships and alreadyLinked IDs for existing memberships (context paths use AND-ed layer bitmaps, not filing history). Missing paths are created by default; created reports whether this call created the path. Requires write permission; documents must already be accessible within your scope.',
         parameters: Type.Object({
             docIds: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, description: 'Existing document IDs to attach; never sends document content.' }),
             path: Type.String({ description: 'Destination path relative to your scope' }),
@@ -312,7 +323,7 @@ export async function createCanvasTools(env) {
                     context: scopedPath(isGlobal ? '/' : basePath, params.path),
                     createPath: params.createPath ?? true,
                 } });
-                return toolResult({ path: normalizePath(params.path), created: false, linked: result.payload.successful.filter(entry => !entry.alreadyLinked).map(entry => entry.id), alreadyLinked: result.payload.successful.filter(entry => entry.alreadyLinked).map(entry => entry.id), failed: result.payload.failed });
+                return toolResult({ path: normalizePath(params.path), created: (result.payload.createdPaths || []).length > 0, linked: result.payload.successful.filter(entry => !entry.alreadyLinked).map(entry => entry.id), alreadyLinked: result.payload.successful.filter(entry => entry.alreadyLinked).map(entry => entry.id), failed: result.payload.failed });
             } catch (error) { return toolError(error); }
         },
     });

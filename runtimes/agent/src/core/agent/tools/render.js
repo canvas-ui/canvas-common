@@ -199,6 +199,74 @@ function fileName(doc) {
     return '';
 }
 
+// ── Compact listing ──────────────────────────────────────────────────────
+
+const PREVIEW_CHARS = 200;
+
+function preview(text) {
+    const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+    return flat.length > PREVIEW_CHARS ? `${flat.slice(0, PREVIEW_CHARS)}…` : flat;
+}
+
+/**
+ * The listing form of a document: what a search result needs to decide
+ * whether to read the whole thing. Keys with nothing to say are omitted.
+ * @param {Object} doc
+ * @returns {{ id:number, schema:string, title?:string, from?:string, date?:string, preview?:string, attachments?:string[] }}
+ */
+export function summarizeDocument(doc) {
+    if (!doc || typeof doc !== 'object') return doc;
+    const schema = String(doc.schema || '');
+    const data = doc.data || {};
+    const summary = { id: doc.id, schema };
+    let title; let from; let date; let body;
+    if (schema === SCHEMA_ALIASES.email) {
+        title = data.subject;
+        from = formatAddress(data.from);
+        date = data.date;
+        body = data.bodyPreview || data.body || (data.bodyHtml ? htmlToText(data.bodyHtml) : '');
+        if (data.attachments?.length) summary.attachments = data.attachments.map((attachment) => attachment.filename).filter(Boolean);
+    } else if (schema === SCHEMA_ALIASES.message) {
+        from = data.sender ? formatAddress({ name: data.sender.displayName || data.sender.name || data.sender.username, address: data.sender.email }) || data.sender.id : '';
+        date = data.timestamp || data.date;
+        body = data.text || (data.html ? htmlToText(data.html) : '');
+    } else if (schema === SCHEMA_ALIASES.link) {
+        title = data.label || data.title || data.uri;
+        body = data.description;
+    } else if (schema === SCHEMA_ALIASES.tab) {
+        title = data.title || data.url;
+        body = data.description;
+    } else if (under(schema, SCHEMA_ALIASES.event)) {
+        title = data.title;
+        date = data.start;
+        body = data.description;
+    } else if (schema.startsWith(SCHEMA_ALIASES.identity)) {
+        title = data.displayName || data.name || data.fullName;
+        body = data.notes || data.description;
+    } else {
+        title = data.title || data.name || fileName(doc);
+        body = data.content || data.description || data.text;
+    }
+    if (title) summary.title = String(title);
+    if (from) summary.from = from;
+    summary.date = date || doc.createdAt || undefined;
+    if (!summary.date) delete summary.date;
+    const snippet = preview(body);
+    if (snippet) summary.preview = snippet;
+    return summary;
+}
+
+/** Dotted-path projection of a document; id and schema always come along. */
+export function pickFields(doc, fields) {
+    if (!doc || typeof doc !== 'object') return doc;
+    const picked = { id: doc.id, schema: doc.schema };
+    for (const field of fields) {
+        const value = field.split('.').reduce((current, key) => (current == null ? undefined : current[key]), doc);
+        if (value !== undefined) picked[field] = value;
+    }
+    return picked;
+}
+
 // ── Full document rendering ──────────────────────────────────────────────
 
 /**

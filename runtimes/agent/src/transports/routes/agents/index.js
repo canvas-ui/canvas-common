@@ -1,5 +1,7 @@
 'use strict';
 
+import { discoverAgentModels, agentProviderBaseUrl } from '../../../core/agent/config/models.js';
+import { validateViewContext } from '../../../core/agent/view-context.js';
 import ResponseObject from '../../ResponseObject.js';
 import { validateUser } from '../../auth/validate-user.js';
 import { rejectAgentTokens } from '../../middleware/agent-acl.js';
@@ -13,6 +15,30 @@ export default async function agentRoutes(fastify, _options) {
     // Agent tokens are data-plane only — an agent may not manage agents
     // (including itself).
     fastify.addHook('preHandler', rejectAgentTokens);
+
+    fastify.post('/models', {
+        onRequest: [fastify.authenticate],
+        schema: { body: { type: 'object', required: ['provider'], additionalProperties: false, properties: {
+            provider: { type: 'string', enum: ['anthropic', 'openai', 'ollama', 'lm-studio', 'vllm', 'custom'] },
+            apiKey: { type: 'string' }, baseUrl: { type: 'string' }, agentIdentifier: { type: 'string' },
+        } } },
+    }, async (request, reply) => {
+        if (!requireUser(request, reply)) return;
+        try {
+            const options = { ...request.body };
+            if (!options.apiKey && options.agentIdentifier) {
+                const agent = await fastify.agents.open(request.user.id, options.agentIdentifier, request.user.id);
+                if (!agent) return reply.code(404).send(new ResponseObject().notFound('Agent not found').getResponse());
+                if (agent.llmProvider === options.provider && agentProviderBaseUrl(options.provider, options.baseUrl) === agentProviderBaseUrl(agent.llmProvider, agent.agentConfig.baseUrl)) {
+                    options.apiKey = agent.agentConfig.apiKey;
+                }
+            }
+            const models = await discoverAgentModels(options);
+            return reply.send(new ResponseObject().success(models, 'Provider models loaded').getResponse());
+        } catch (error) {
+            return reply.code(400).send(new ResponseObject().badRequest(error.message).getResponse());
+        }
+    });
 
     const normalizePromptImages = (images) => {
         if (!Array.isArray(images)) return [];
@@ -41,6 +67,7 @@ export default async function agentRoutes(fastify, _options) {
     const handlePromptRequest = async (request, reply) => {
         if (!requireUser(request, reply)) return;
         try {
+            const viewContext = validateViewContext(request.body?.viewContext);
             if (request.params.sessionId) {
                 const selected = await fastify.agents.selectSession(
                     request.user.id,
@@ -73,6 +100,7 @@ export default async function agentRoutes(fastify, _options) {
             const wasProcessing = agent.isProcessing;
             const messages = await agent.prompt(text, {
                 images: normalizedImages,
+                viewContext,
                 streamingBehavior: streamingBehaviorValue,
             });
             const r = new ResponseObject().success({
@@ -84,7 +112,7 @@ export default async function agentRoutes(fastify, _options) {
             fastify.log.error(err);
             const r = err.message?.startsWith('Session not found:')
                 ? new ResponseObject().notFound(err.message)
-                : new ResponseObject().serverError(err.message || 'Prompt failed');
+                : new ResponseObject().error(err.message || 'Prompt failed', null, err.statusCode || 500);
             return reply.code(r.statusCode).send(r.getResponse());
         }
     };
@@ -92,6 +120,7 @@ export default async function agentRoutes(fastify, _options) {
     const handlePromptStreamRequest = async (request, reply) => {
         if (!requireUser(request, reply)) return;
         try {
+            const viewContext = validateViewContext(request.body?.viewContext);
             if (request.params.sessionId) {
                 const selected = await fastify.agents.selectSession(
                     request.user.id,
@@ -148,7 +177,10 @@ export default async function agentRoutes(fastify, _options) {
                         send({ type: 'tool_end', toolName: event.toolName, isError: event.isError ?? false });
                         break;
                     case 'message_end':
-                        if (event.message?.role === 'assistant') collectedMessages.push(event.message);
+                        if (event.message?.role === 'assistant') {
+                            collectedMessages.push(event.message);
+                            if (event.message.stopReason === 'error') send({ type: 'error', error: event.message.errorMessage || 'Prompt stream failed' });
+                        }
                         break;
                     case 'agent_end':
                         send({ type: 'complete', messages: collectedMessages });
@@ -161,6 +193,7 @@ export default async function agentRoutes(fastify, _options) {
             try {
                 await agent.stream(text, onEvent, {
                     images: normalizedImages,
+                    viewContext,
                     ...(streamingBehavior ? { streamingBehavior: normalizeStreamingBehavior(streamingBehavior) } : {}),
                 });
             } catch (streamErr) {
@@ -173,7 +206,7 @@ export default async function agentRoutes(fastify, _options) {
             fastify.log.error(err);
             const r = err.message?.startsWith('Session not found:')
                 ? new ResponseObject().notFound(err.message)
-                : new ResponseObject().serverError(err.message || 'Failed to start stream');
+                : new ResponseObject().error(err.message || 'Failed to start stream', null, err.statusCode || 500);
             return reply.code(r.statusCode).send(r.getResponse());
         }
     };
@@ -759,6 +792,11 @@ export default async function agentRoutes(fastify, _options) {
                 if (file) {
                     audio = await file.toBuffer();
                     mimeType = file.mimetype || mimeType;
+                    const field = file.fields?.viewContext;
+                    if (field && 'value' in field) {
+                        try { options.viewContext = JSON.parse(field.value); }
+                        catch { throw Object.assign(new Error('viewContext must contain valid JSON'), { statusCode: 400 }); }
+                    }
                 }
             } else if (request.body && typeof request.body === 'object' && request.body.audio) {
                 audio = Buffer.from(String(request.body.audio), 'base64');
@@ -770,6 +808,8 @@ export default async function agentRoutes(fastify, _options) {
                 const r = new ResponseObject().badRequest('Audio is required (multipart file or JSON base64 "audio")');
                 return reply.code(r.statusCode).send(r.getResponse());
             }
+
+            const viewContext = validateViewContext(options.viewContext);
 
             // 2. Transcribe
             const { text: transcript } = await fastify.voice.transcribe(audio, {
@@ -783,7 +823,7 @@ export default async function agentRoutes(fastify, _options) {
 
             // 3. Prompt the agent (starts it if needed, returns flattened text)
             const replyText = await fastify.agents.prompt(
-                request.user.id, request.params.agentIdentifier, transcript, {}, request.user.id
+                request.user.id, request.params.agentIdentifier, transcript, { viewContext }, request.user.id
             );
 
             // 4. Synthesize the reply (optional)
@@ -818,7 +858,7 @@ export default async function agentRoutes(fastify, _options) {
             fastify.log.error(err);
             const r = err.message?.includes('not found') || err.message?.includes('not configured')
                 ? new ResponseObject().badRequest(err.message)
-                : new ResponseObject().serverError(err.message || 'Voice prompt failed');
+                : new ResponseObject().error(err.message || 'Voice prompt failed', null, err.statusCode || 500);
             return reply.code(r.statusCode).send(r.getResponse());
         }
     });
@@ -837,6 +877,6 @@ export default async function agentRoutes(fastify, _options) {
      *   { type: 'complete',     messages: AgentMessage[] }
      *   { type: 'error',        error: string }
      */
-    fastify.post('/:agentIdentifier/prompt/stream', { onRequest: [fastify.authenticate] }, handlePromptStreamRequest);
-    fastify.post('/:agentIdentifier/sessions/:sessionId/prompt/stream', { onRequest: [fastify.authenticate] }, handlePromptStreamRequest);
+    fastify.post('/:agentIdentifier/prompt/stream', { onRequest: [fastify.authenticate], config: { mcp: false } }, handlePromptStreamRequest);
+    fastify.post('/:agentIdentifier/sessions/:sessionId/prompt/stream', { onRequest: [fastify.authenticate], config: { mcp: false } }, handlePromptStreamRequest);
 }
