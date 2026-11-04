@@ -81,30 +81,30 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     return stripDeviceFeatureTags(features);
   }
 
+  // Whether a selector addresses a directory tree. The tree's own type wins
+  // over the client's treeType hint, so a stale hint (e.g. "backends" sent as
+  // a context tree) still resolves; the hint decides only for unknown trees.
+  // Only "not found" is swallowed so an unknown tree still produces a clean
+  // error from the selector build; any other error propagates.
+  function isDirectoryTree(workspace, treeNameOrId, treeType) {
+    if (treeNameOrId) {
+      try {
+        const type = workspace.getTree(treeNameOrId)?.type;
+        if (type) return type === 'directory';
+      } catch (err) {
+        if (!/not found/i.test(err?.message || '')) throw err;
+      }
+    }
+    return treeType === 'directory';
+  }
+
   function resolveContextSelector(workspace, source = {}, fallbackPath = '/') {
     const path = source?.context ?? fallbackPath;
     if (!path) { return null; }
     const treeNameOrId = source?.treeNameOrTreeId ?? null;
-    const treeType = source?.treeType ?? null;
-
-    if (treeType === 'directory') {
-      return workspace.getDirectoryTreeSelector(path, treeNameOrId);
-    }
-    if (!treeType && treeNameOrId) {
-      // Fallback: detect type from the tree itself. Only swallow "not found" so
-      // an unknown tree still produces a clean error from getContextTreeSelector;
-      // any other error (and the directory selector build itself) must propagate.
-      let detectedType = null;
-      try {
-        detectedType = workspace.getTree(treeNameOrId)?.type ?? null;
-      } catch (err) {
-        if (!/not found/i.test(err?.message || '')) throw err;
-      }
-      if (detectedType === 'directory') {
-        return workspace.getDirectoryTreeSelector(path, treeNameOrId);
-      }
-    }
-    return workspace.getContextTreeSelector(path, treeNameOrId);
+    return isDirectoryTree(workspace, treeNameOrId, source?.treeType)
+      ? workspace.getDirectoryTreeSelector(path, treeNameOrId)
+      : workspace.getContextTreeSelector(path, treeNameOrId);
   }
 
   // Read scoping mirrors write scoping: a directory tree must land in spec.directory
@@ -125,18 +125,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   function resolveScopeSelectors(workspace, source = {}, fallbackPath = '/') {
     const path = source?.context ?? fallbackPath;
     const treeNameOrId = source?.treeNameOrTreeId ?? null;
-    const treeType = source?.treeType ?? null;
-
-    let isDirectory = treeType === 'directory';
-    if (!treeType && treeNameOrId) {
-      try {
-        isDirectory = workspace.getTree(treeNameOrId)?.type === 'directory';
-      } catch (err) {
-        if (!/not found/i.test(err?.message || '')) throw err;
-      }
-    }
-
-    return isDirectory
+    return isDirectoryTree(workspace, treeNameOrId, source?.treeType)
       ? { context: null, directory: workspace.getDirectoryTreeSelector(path, treeNameOrId) }
       : { context: workspace.getContextTreeSelector(path, treeNameOrId), directory: null };
   }
@@ -183,25 +172,9 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     if (body?.context || body?.treeNameOrTreeId) {
       const path = body?.context ?? '/';
       const treeNameOrId = body?.treeNameOrTreeId ?? null;
-      const treeType = body?.treeType ?? null;
-
-      if (treeType === 'directory') {
-        return { treeType: 'directory', selector: workspace.getDirectoryTreeSelector(path, treeNameOrId) };
-      }
-      if (!treeType && treeNameOrId) {
-        // Only swallow "not found" (let the context path emit a clean error for
-        // unknown trees); rethrow anything else instead of masking it.
-        let detectedType = null;
-        try {
-          detectedType = workspace.getTree(treeNameOrId)?.type ?? null;
-        } catch (err) {
-          if (!/not found/i.test(err?.message || '')) throw err;
-        }
-        if (detectedType === 'directory') {
-          return { treeType: 'directory', selector: workspace.getDirectoryTreeSelector(path, treeNameOrId) };
-        }
-      }
-      return { treeType: 'context', selector: workspace.getContextTreeSelector(path, treeNameOrId) };
+      return isDirectoryTree(workspace, treeNameOrId, body?.treeType)
+        ? { treeType: 'directory', selector: workspace.getDirectoryTreeSelector(path, treeNameOrId) }
+        : { treeType: 'context', selector: workspace.getContextTreeSelector(path, treeNameOrId) };
     }
     if (body?.documents || body?.documentIds) {
       return { treeType: 'context', selector: workspace.getContextTreeSelector('/') };
@@ -1286,11 +1259,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       // resolveContextSelector already returns the right selector for the tree
       // type; route it to the matching key so a directory selector isn't
       // normalized as a context tree (which throws → 500).
-      let isDirectory = request.query.treeType === 'directory';
-      if (!request.query.treeType && request.query.treeNameOrTreeId) {
-        try { isDirectory = workspace.getTree(request.query.treeNameOrTreeId)?.type === 'directory'; }
-        catch (_) { isDirectory = false; }
-      }
+      const isDirectory = isDirectoryTree(workspace, request.query.treeNameOrTreeId, request.query.treeType);
       const result = await workspace.unlinkMany(
         documentIds,
         isDirectory ? { directory: contextSelector, attributes } : { context: contextSelector, attributes },
