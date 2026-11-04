@@ -47,6 +47,7 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund "$tgz"
           test -d node_modules/@augmentd-labs/canvas-edge/node_modules/canvas-stored
           CANVAS_USER_HOME=/tmp/edge-ci timeout 8 node node_modules/.bin/canvas-edge --foreground || [ $? -eq 124 ]
+<<<<<<< HEAD
       - name: Smoke-test private local agent distribution
         working-directory: .
         run: |
@@ -57,3 +58,5 @@ jobs:
           npm pack "$deployment/source" --pack-destination "$deployment"
           npm install --prefix "$deployment/consumer" --no-audit --no-fund "$deployment"/*.tgz
           node scripts/smoke-runtime.mjs "$deployment/consumer/node_modules/canvas-agentd"
+=======
+>>>>>>> @{u}
