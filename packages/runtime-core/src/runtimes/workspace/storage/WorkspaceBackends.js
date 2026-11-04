@@ -1,3 +1,4 @@
+import { exchangeGoogleCode } from '../services/google-oauth.js';
 import { gitTreePath } from '../services/git/GitRepositories.js';
 import { containsSecrets } from '../security/WorkspaceCrypto.js';
 import * as fsPromises from 'fs/promises';
@@ -547,6 +548,22 @@ export default class WorkspaceBackends {
                 : ((await fsPromises.stat(target).catch(() => null))?.size ?? 0);
         }
         return { workspaceId: this.#workspace.id, bytes, breakdown, computedAt: new Date().toISOString() };
+    }
+
+    async exchangeBackendGoogleCode(driver, address, input) {
+        if (!['gdrive', 'gcal'].includes(driver)) {
+            throw Object.assign(new Error('This backend does not support Google sign-in'), { statusCode: 400 });
+        }
+        const config = driver === 'gdrive'
+            ? this.#workspace.dataBackends[address]
+            : (await (await this.#runtime.integrations.connectors()).readStoredConfig()).backends[`gcal:${address}`];
+        if (!config || config.driver !== driver) {
+            throw Object.assign(new Error('Google backend not found'), { statusCode: 404 });
+        }
+        if (this.#runtime.state.withoutSecrets) {
+            throw Object.assign(new Error('Unlock the workspace before reconnecting Google'), { statusCode: 403 });
+        }
+        return exchangeGoogleCode(this.#runtime.config.resolveCredentials(config), input);
     }
 
     async updateBackend(driver, address, patch = {}) {

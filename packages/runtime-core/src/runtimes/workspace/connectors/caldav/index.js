@@ -5,9 +5,11 @@
  * Radicale, SOGo, …). One backend per account (address = account label).
  *
  * Config: `url` (calendar-home or a single calendar collection), `username`,
- * `password` (basic auth), optional `calendars` (collection names/hrefs to
- * sync; empty = every calendar found), `readOnly` (default TRUE — set false
- * to enable write-back), `initialSyncDays`.
+ * `password` (basic auth), optional `calendars` (collection names to sync,
+ * each optionally renamed in Canvas as `<name> = <calendar name>`, see
+ * calendar-names.js; empty = every calendar found, named by its DAV display
+ * name), `readOnly` (default TRUE — set false to enable write-back),
+ * `initialSyncDays`.
  *
  * Sync: RFC 6578 sync-collection REPORT with the server's sync-token as the
  * cursor (changed hrefs → calendar-multiget for the ICS payloads). An invalid
@@ -27,6 +29,7 @@
  */
 
 import BaseConnector from '../BaseConnector.js';
+import { parseCalendarList } from '../calendar-names.js';
 
 const DAV_NS_HINT = 'xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"';
 
@@ -43,7 +46,7 @@ export default class CaldavConnector extends BaseConnector {
         { key: 'url', label: 'CalDAV URL (calendar home or one calendar)', placeholder: 'https://host/caldav/user', required: true },
         { key: 'username', label: 'Username' },
         { key: 'password', label: 'Password', secret: true },
-        { key: 'calendars', label: 'Calendar names (one per line, blank = all)', list: true },
+        { key: 'calendars', label: 'Calendar names (one per line, blank = all; "<name> = <calendar name>" names the calendar in Canvas)', list: true },
         { key: 'writeBack', label: 'Allow Canvas to create/delete events', type: 'boolean' },
     ];
 
@@ -122,11 +125,16 @@ export default class CaldavConnector extends BaseConnector {
             calendars.push({ id: name, name, href: `${base}/`, writable: this.canWrite });
         }
 
-        const wanted = (Array.isArray(this.config.calendars) ? this.config.calendars : [])
-            .map((c) => String(c).trim()).filter(Boolean);
-        return wanted.length
-            ? calendars.filter((c) => wanted.includes(c.id) || wanted.includes(c.name))
+        // `calendar` is the calendar's name in Canvas (data.calendar → its own
+        // timeline): the configured name, else the DAV display name.
+        const wanted = parseCalendarList(this.config.calendars);
+        const selected = wanted.length
+            ? calendars.filter((c) => wanted.some((w) => w.id === c.id || w.id === c.name))
             : calendars;
+        return selected.map((c) => ({
+            ...c,
+            calendar: wanted.find((w) => w.id === c.id || w.id === c.name)?.calendar || c.name,
+        }));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -331,6 +339,7 @@ export default class CaldavConnector extends BaseConnector {
                 allDay: allDay || undefined,
                 location: this.#unescapeIcs(event.LOCATION) || undefined,
                 recurrence: event.RRULE || undefined,
+                calendar: container.calendar,
                 calendarId: container.id,
                 eventStatus: event.STATUS ? event.STATUS.toLowerCase() : undefined,
             },

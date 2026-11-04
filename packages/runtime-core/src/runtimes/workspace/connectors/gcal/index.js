@@ -3,7 +3,9 @@
 /**
  * Google Calendar driver — one backend per Google account (address = account
  * email/label). `config.calendars` lists calendar ids ('primary', an email, or
- * a long group id); defaults to ['primary'].
+ * a long group id), each optionally naming the calendar in Canvas
+ * (`<id> = <name>`, see calendar-names.js); defaults to ['primary'], named
+ * after the account label.
  *
  * Cursor per calendar: Google's `nextSyncToken` — true incremental sync
  * (changed AND cancelled instances come back). A 410 GONE invalidates the
@@ -16,6 +18,7 @@
  */
 
 import BaseConnector from '../BaseConnector.js';
+import { parseCalendarList } from '../calendar-names.js';
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const API = 'https://www.googleapis.com/calendar/v3';
@@ -34,7 +37,7 @@ export default class GcalConnector extends BaseConnector {
         { key: 'clientId', label: 'OAuth client id', required: true },
         { key: 'clientSecret', label: 'OAuth client secret', secret: true, required: true },
         { key: 'refreshToken', label: 'Refresh token', secret: true, required: true },
-        { key: 'calendars', label: 'Calendar ids (one per line, blank = all)', list: true },
+        { key: 'calendars', label: 'Calendar ids (one per line, blank = primary; "<id> = <name>" names the calendar in Canvas)', list: true },
         { key: 'initialSyncDays', label: 'Initial history (days)', type: 'number', placeholder: '365' },
     ];
 
@@ -86,11 +89,17 @@ export default class GcalConnector extends BaseConnector {
         await this.#get('/users/me/calendarList', { maxResults: 1 });
     }
 
+    // `calendar` is the calendar's name in Canvas (data.calendar → its own
+    // timeline). Unnamed calendars fall back to the account label for
+    // 'primary' and to the calendar id otherwise.
     async listContainers() {
-        const configured = (Array.isArray(this.config.calendars) && this.config.calendars.length)
-            ? this.config.calendars
-            : ['primary'];
-        return configured.map((id) => ({ id: String(id), name: String(id) }));
+        const configured = parseCalendarList(this.config.calendars);
+        const list = configured.length ? configured : [{ id: 'primary', calendar: null }];
+        return list.map(({ id, calendar }) => ({
+            id,
+            name: id,
+            calendar: calendar || (id === 'primary' ? this.address : id),
+        }));
     }
 
     // Cursor shape: { syncToken } after the first full pass, or
@@ -156,6 +165,7 @@ export default class GcalConnector extends BaseConnector {
                 allDay: Boolean(event.start?.date && !event.start?.dateTime) || undefined,
                 location: event.location || undefined,
                 recurrence: rrule ? rrule.replace(/^RRULE:/i, '') : undefined,
+                calendar: container.calendar,
                 // Connector extras (Event data schema is passthrough)
                 calendarId: container.id,
                 organizer: event.organizer?.email || undefined,

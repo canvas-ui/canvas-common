@@ -123,6 +123,20 @@ export default async function workspaceBackendRoutes(fastify) {
         } catch (error) { return fail(request, reply, error); }
     });
 
+    fastify.post('/:driver/:address/oauth/google/exchange', {
+        onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+    }, async (request, reply) => {
+        if (request.resourceToken) {
+            return reply.code(403).send(new ResponseObject().forbidden('User credentials required').getResponse());
+        }
+        try {
+            reply.header('Cache-Control', 'no-store');
+            return ok(reply, await request.workspace.exchangeBackendGoogleCode(
+                drv(request.params.driver), arg(request.params.address), request.body || {},
+            ));
+        } catch (error) { return fail(request, reply, error); }
+    });
+
     fastify.delete('/:driver/:address', {
         onRequest: [fastify.authenticate, requireWorkspaceWrite(), manageMessaging],
     }, async (request, reply) => {

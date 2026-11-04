@@ -655,6 +655,7 @@ class Workspace extends EventEmitter {
     transferDocumentsToBackends(...args) { return this.#runtime.operations.run('transfers.transferDocumentsToBackends', () => this.#runtime.transfers.transferDocumentsToBackends(...args)); }
     getBackendDiskUsage(...args) { return this.#runtime.operations.run('backends.getBackendDiskUsage', () => this.#runtime.backends.getBackendDiskUsage(...args)); }
     getDiskUsage(...args) { return this.#runtime.operations.run('backends.getDiskUsage', () => this.#runtime.backends.getDiskUsage(...args)); }
+    exchangeBackendGoogleCode(...args) { return this.#runtime.operations.run('backends.exchangeBackendGoogleCode', () => this.#runtime.backends.exchangeBackendGoogleCode(...args)); }
     updateBackend(...args) { return this.#runtime.operations.run('backends.updateBackend', () => this.#runtime.backends.updateBackend(...args)); }
     removeBackend(...args) { return this.#runtime.operations.run('backends.removeBackend', () => this.#runtime.backends.removeBackend(...args)); }
     syncBackend(...args) { return this.#runtime.operations.run('backends.syncBackend', () => this.#runtime.backends.syncBackend(...args)); }
