@@ -130,7 +130,14 @@ export class WorkspaceStoredIndex {
         let opened = false;
         try {
             this.#runtime.state.stored = await Stored.open({
-                onStartupStage: stage => this.#runtime.state.logger.info({ workspaceId: this.#runtime.state.workspaceId, ...stage }, 'Workspace startup stage'),
+                onStartupStage: stage => {
+                    const details = { workspaceId: this.#runtime.state.workspaceId, ...stage };
+                    if (stage.stage === 'stored.index.quarantined') {
+                        this.#runtime.state.logger.warn(details, 'Stored index quarantined; rescan backends to rebuild. Operational records remain in quarantine');
+                    } else {
+                        this.#runtime.state.logger.info(details, 'Workspace startup stage');
+                    }
+                },
                 // Configured runtime root (default db/stored) — NOT a hidden
                 // .stored/. Holds Stored's metadata index; the blob cache is
                 // redirected to the workspace cache dir (services.stored.cache).
