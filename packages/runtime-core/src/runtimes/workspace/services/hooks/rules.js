@@ -46,7 +46,7 @@ import { classifyDocument } from '../../db/classifier.js';
  * document's BYTES between backends (with template renaming) and delete them
  * from named backends; everything else operates on the index. `store` takes
  * `folder` (destination directory on the target backend), `recursive: true`
- * (append the sub-path of a directory source; context sources must use a fixed folder) and `key`
+ * (append the sub-path explicitly targeted by the filing event) and `key`
  * (file-name template) — composed as folder/{{match.rel}}/key.
  */
 
@@ -507,16 +507,17 @@ const ACTIONS = {
      *     "recursive": true }
      *
      * filed under dir:/projects/canvas/UI/mobile → home:Projects/Canvas/UI/mobile/<name>.
-     * Context paths use when.eventPathExact and pathMode:'full': only the
-     * explicitly targeted folder matches, and its full path is recreated
-     * beneath folder. Ancestor membership is never an insertion destination.
+     * Context paths use the explicit filing event, never ancestor membership.
+     * Prefix rules append its relative path; eventPathExact with pathMode:'full'
+     * recreates the full selected path beneath folder.
      * The three parts are joined with `..`/leading-slash segments dropped.
      *
      * Copy is the default. A move requires one explicit `from` backend and
      * exactly one location there. Once that copy has moved, re-runs cannot
      * select another backend's copy just because its checksum matches.
      */
-    async store(action, { workspace, doc, scope, logger, placement = false, sourceOverride = null }) {
+    async store(action, args) {
+        let { workspace, doc, scope, logger, placement = false, sourceOverride = null } = args;
         if (!doc?.id) return { status: 'skipped', error: 'No document' };
         if (action.autoLink === true && !scope.match) return { status: 'skipped', error: 'No explicit virtual placement' };
         const mode = action.mode === 'move' ? 'move' : 'copy';
@@ -542,8 +543,10 @@ const ACTIONS = {
             const exactContext = action.pathMode === 'full' && scope.rule?.when?.eventPathExact !== undefined
                 && asArray(scope.rule.when.eventPathExact).length === 1
                 && matches.every(match => match.tree === 'context' && match.rel === '');
-            if (!matches.length || (!exactContext && matches.some(match => !isDirectory(match)))) {
-                throw new Error('Recursive storage requires a directory source, or one exact Context insertion path with pathMode:"full".');
+            const eventContext = ['document.inserted', 'document.linked'].includes(scope.event) && !scope.payload?.backfill
+                && matches.every(match => match.tree === 'context');
+            if (!matches.length || (!exactContext && !eventContext && matches.some(match => !isDirectory(match)))) {
+                throw new Error('Recursive storage requires a directory source or an explicit Context filing event.');
             }
             if (action.pathMode === 'full' && !exactContext) {
                 throw new Error('Full path recreation requires one exact Context insertion path.');
@@ -551,6 +554,10 @@ const ACTIONS = {
             if (!workspace.backendKeepsPaths(String(action.to || '').trim())) {
                 throw new Error('Recreating the sub-folder path requires a destination backend that supports folder paths');
             }
+        }
+        if (!placement && mode === 'copy' && !sources.length && doc.schema !== 'data/schema/file'
+            && /^https?:\/\//i.test(doc.data?.url || '') && !(await workspace.documentByteEndpoints(doc)).length) {
+            return ACTIONS.download(action, args);
         }
         if (action.autoLink === true && !placement) {
             if (!workspace.backendKeepsPaths(action.to)) throw new Error('Auto-Link requires a backend that preserves folder paths');
@@ -924,6 +931,10 @@ const ACTIONS = {
 // the rule has no `path` condition. Exposed to templates as
 // {{match.rel}} / {{match.path}} / {{match.prefix}} and consumed by
 // `recursive: true` on link/unlink.
+export function resolveRuleMatch(rule, context) {
+    return matchedPath(mapRulePaths(rule, rulePathMapper(context.workspace, 'decode')), context);
+}
+
 function matchedPath(rule, context) {
     const eventExact = rule?.when?.eventPathExact !== undefined;
     const prefixes = asArray(rule?.when?.eventPathExact || rule?.when?.pathExact || rule?.when?.path || []).filter(Boolean);
@@ -932,13 +943,18 @@ function matchedPath(rule, context) {
     try { c = context.classify(); } catch { return null; }
     if (!c || typeof c.pathMatches !== 'function') { return null; }
     const autoLink = rule.then?.some(action => action.autoLink === true);
+    const filing = ['document.inserted', 'document.linked'].includes(context.eventName) && !context.payload?.backfill;
+    const eventPlacement = filing && rule.then?.some(action => action.recursive === true || action.action === 'download');
     if (autoLink && context.eventName === 'document.linked' && !context.payload?.backfill) {
         // A backend event must not reactivate unrelated existing virtual links.
         c = classifyDocument(context.payload?.document, { changed: context.payload?.changed, directory: { treeName: context.payload?.directory?.treeName || context.payload?.directory?.tree } });
     }
     const placements = new Map();
     for (const prefix of autoLink ? [...prefixes].sort((a, b) => String(b).length - String(a).length) : prefixes) {
-        const all = (eventExact ? c.eventPathMatches(prefix) : c.pathMatches(prefix))
+        const candidates = eventExact ? c.eventPathMatches(prefix) : eventPlacement
+            ? [...c.eventPathMatches(prefix), ...c.pathMatches(prefix).filter(match => match.tree !== 'context' && !c.eventTreePaths?.[match.tree]?.length)]
+            : c.pathMatches(prefix);
+        const all = candidates
             .filter((match) => (!eventExact && rule?.when?.pathExact === undefined) || match.rel === '');
         if (autoLink) {
             for (const match of all) {
@@ -978,7 +994,7 @@ export async function executeRuleActions(rule, context, logger) {
         event: eventName,
         workspace: { id: workspace.id, name: workspace.name },
         rule: { id: rule.id, description: rule.description, when: rule.when },
-        match: matchedPath(rule, context),
+        match: context.ruleMatch !== undefined ? context.ruleMatch : matchedPath(rule, context),
         downloads: [],
     };
     // Writes this rule makes are automation caused by the triggering event.

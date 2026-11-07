@@ -24,6 +24,7 @@ import crypto from 'crypto';
  * Record shape (one line):
  *   { actionId, ts, status: 'pending'|'approved'|'declined'|'failed'|'expired',
  *     handlerType: 'rule'|'hook', handler,        // rule id | hook file rel. hooks/
+ *     when, pathMatch,                          // original conditions and resolved filing destination
  *     event, envelope,                            // replay envelope (doc → {id, schema})
  *     provenance: { origin, causedBy, depth },    // of the TRIGGERING event
  *     title, summary,

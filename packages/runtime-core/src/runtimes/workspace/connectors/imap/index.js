@@ -15,6 +15,7 @@ import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
 import { getBackendEmailContext, normalizeSegment } from '../../../../utils/backend-documents.js';
 import { timeSpan } from '../../../../utils/perf-monitor.js';
 import { emailBodyChecksum, emailText, isEmail } from './content.js';
+import { isEmailSignature } from '../../db/email-attachments.js';
 
 /*
  * WorkspaceMailIndex (ImapService)
@@ -593,8 +594,9 @@ export class WorkspaceMailIndex extends EventEmitter {
             });
             // Keep inline resources available for rendering the email without
             // promoting signature logos/tracking pixels into standalone files.
-            // An explicit attachment remains a file even when it has a CID.
-            if (!isInline) {
+            // Detached cryptographic signatures stay attached to the email too.
+            // Other explicit attachments remain files even when they have a CID.
+            if (!isInline && !isEmailSignature(attachment)) {
                 attachmentDocs.push(this.#buildAttachmentDocument({
                     filename, contentType: attachment.contentType, size, checksum, url: blob.url,
                 }));

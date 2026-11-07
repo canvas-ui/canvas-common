@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { classifyDocument } from '../../db/classifier.js';
+import { isEmailSignature } from '../../db/email-attachments.js';
 import { joinKey, sanitizeSegment, mimeForFilename, MIME_EXTENSIONS } from './key-utils.js';
 
 const array = value => Array.isArray(value) ? value : [value];
@@ -45,6 +46,7 @@ export function matchingAttachments(doc, action) {
     }
     if (action.filename !== undefined && typeof action.filename !== 'string') throw new Error('Attachment filename filter must be text');
     return (doc.data?.attachments || []).filter(attachment => attachment &&
+        !isEmailSignature(attachment) &&
         (action.includeInline === true || attachment.isInline !== true) &&
         patterns.some(pattern => pattern === '*' || pattern === '*/*' || (pattern.endsWith('/*')
             ? attachmentType(attachment).startsWith(pattern.slice(0, -1)) : attachmentType(attachment) === pattern)) &&

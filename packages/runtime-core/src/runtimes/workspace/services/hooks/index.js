@@ -8,7 +8,7 @@ import { WORKSPACE_DIRECTORIES } from '../../config/constants.js';
 import { pathToFileURL } from 'url';
 import { createLogger } from '../../../../utils/log.js';
 import { classifyDocument } from '../../db/classifier.js';
-import { resolveRuleFiles, loadRuleFile, matchRule, executeRuleActions } from './rules.js';
+import { resolveRuleFiles, loadRuleFile, matchRule, executeRuleActions, resolveRuleMatch } from './rules.js';
 import { buildHookAgentPrompt } from './agent-prompt.js';
 import { resolveHookFiles, statFile } from './files.js';
 import HookRunLog, { buildReplayEnvelope, createRunTrace } from './run-log.js';
@@ -349,6 +349,8 @@ class HookService extends EventEmitter {
             handler: spec.handler || '?',
             event: spec.event || null,
             envelope: buildReplayEnvelope(spec.event, payload),
+            when: spec.when || {},
+            pathMatch: spec.pathMatch ?? null,
             provenance: {
                 origin: payload?.origin ?? 'user',
                 causedBy: payload?.causedBy ?? null,
@@ -391,6 +393,8 @@ class HookService extends EventEmitter {
             payload,
             trigger,
             actions: heldActions,
+            when: rule.when || {},
+            pathMatch: resolveRuleMatch(rule, this.#buildHookContext(workspace, eventName, payload, 'rule', rule.id)),
             title: rule.description || rule.id || 'Rule action',
             summary: `${heldActions.map((a) => a?.action).filter(Boolean).join(', ')}${doc?.id ? ` · doc ${doc.id} (${doc.schema || '?'})` : ''}`,
             editable: rule.editable,
@@ -428,6 +432,13 @@ class HookService extends EventEmitter {
 
         const amended = amend ? applyAmendments(record, amend) : record;
 
+        if (amended.actions.some(action => action.recursive === true) && !amended.pathMatch) {
+            return store.supersede(amended, {
+                status: 'failed', decidedAt: new Date().toISOString(), decidedBy,
+                result: [{ action: '*', status: 'error', error: 'Missing original filing-path match. Decline this proposal and trigger the rule again.' }],
+            });
+        }
+
         const basePayload = { ...(amended.envelope?.payload || {}) };
         const docId = basePayload.document?.id ?? basePayload.id ?? null;
         if (docId != null) {
@@ -443,11 +454,12 @@ class HookService extends EventEmitter {
             basePayload.document = document;
         }
 
-        const syntheticRule = { id: amended.handler, description: amended.title, then: amended.actions };
+        const syntheticRule = { id: amended.handler, description: amended.title, when: amended.when, then: amended.actions };
         const context = this.#buildHookContext(
             workspace, amended.event, basePayload,
             amended.handlerType === 'rule' ? 'rule' : 'hook', amended.handler,
         );
+        context.ruleMatch = amended.pathMatch;
         const t0 = Date.now();
         const trace = createRunTrace(logger);
         const actions = await executeRuleActions(syntheticRule, context, trace.logger);

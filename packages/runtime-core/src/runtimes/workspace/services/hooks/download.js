@@ -32,8 +32,9 @@ import { listFiles } from '../fetchers/lib.js';
  * when that is another backend. The entry file (image, video, PDF, page's
  * index.html) is indexed as a file document filed exactly where the link is
  * (or at `insert` paths) and tagged with `tags`. A ledger in var/ makes the
- * action idempotent: the same rule never downloads the same URL twice while
- * the file still exists.
+ * action idempotent for each source document, rule and destination while
+ * the downloaded document still exists. Retained links have includes and
+ * derived-from relations; deleteSource removes the link after delivery.
  *
  * Downloads are awaited (`timeout` seconds, default 600, max 3600) so the run
  * log carries the outcome; a timeout kills the whole process group.
@@ -89,13 +90,19 @@ function sha256(file) {
 export async function download(action, { workspace, doc, context, scope, logger, provenance, helpers, fetchers = {} }) {
     const { interpolate, expandKeyTemplate, parseLinkTarget, directorySelector } = helpers;
     if (!doc?.id) { logger.debug('rule download: event carries no document, skipping'); return; }
+    if (doc.schema === 'data/schema/file') return { status: 'skipped', error: 'Already a downloaded file' };
+    if ((scope.rule?.when?.path || scope.rule?.when?.pathExact || scope.rule?.when?.eventPathExact) && !scope.match) {
+        return { status: 'skipped', error: 'No matching filing destination' };
+    }
     const url = typeof doc?.data?.url === 'string' ? doc.data.url.trim() : '';
     if (!/^https?:\/\//i.test(url)) { logger.debug(`rule download: ${doc.id} has no http(s) url, skipping`); return; }
+
+    if (action.recursive === true && !scope.match) throw new Error('Recursive download requires an explicit filing-path match');
 
     const to = String(action.to || 'workspace:home').trim();
     const render = (template) => interpolate(expandKeyTemplate(String(template), { doc, sourceKey: '' }), scope);
     const folder = action.folder != null && String(action.folder).trim() !== '' ? render(action.folder) : '';
-    const rel = action.recursive === true ? String(scope.match?.rel || '') : '';
+    const rel = action.recursive === true ? String((action.pathMode === 'full' ? scope.match?.path : scope.match?.rel) || '') : '';
     const destRel = joinKey(folder, rel);
     const homeRoot = path.resolve(workspace.homePath || path.join(workspace.rootPath, 'home'));
     const destDir = path.resolve(homeRoot, destRel || '.');
@@ -104,12 +111,21 @@ export async function download(action, { workspace, doc, context, scope, logger,
         return;
     }
 
-    // Idempotency: same rule + same URL only once while the file still exists.
+    // Reuse a completed download for this source, rule and destination.
     const ledgerFile = path.join(workspace.rootPath, WORKSPACE_DIRECTORIES.var || 'var', LEDGER_FILE);
     const ledger = readLedger(ledgerFile);
-    const ledgerKey = `${scope.rule?.id || 'rule'}|${url}`;
+    const ledgerKey = JSON.stringify([scope.rule?.id || 'rule', doc.id, url, to, destRel, action.insert || null]);
     const previous = ledger[ledgerKey];
-    if (previous?.file && fs.existsSync(path.resolve(homeRoot, previous.file))) {
+    const finish = async (id) => {
+        if (action.deleteSource === true) await workspace.delete(doc.id, { provenance });
+        else {
+            await workspace.assertRelation(id, 'derived-from', doc.id);
+            await workspace.assertRelation(doc.id, 'includes', id);
+        }
+    };
+    if (previous?.complete && (to !== 'workspace:home' || fs.existsSync(path.resolve(homeRoot, previous.file)))
+        && await workspace.get(previous.documentId)) {
+        await finish(previous.documentId);
         logger.debug(`rule download: ${url} already downloaded to home/${previous.file}, skipping`);
         return { status: 'skipped', reason: 'already downloaded', documentId: previous.documentId };
     }
@@ -164,7 +180,12 @@ export async function download(action, { workspace, doc, context, scope, logger,
         if (!fs.existsSync(entryFinal)) { entryFinal = listFiles(destDir).find((f) => /\.html?$/i.test(f)) || entryFinal; }
     } else {
         const name = action.key ? sanitizeSegment(render(action.key).replace(/\{\{\s*ext\s*\}\}/g, path.extname(entry)), path.basename(entry)) : path.basename(entry);
-        entryFinal = uniquePath(path.join(destDir, name));
+        const target = path.join(destDir, name);
+        if (fs.existsSync(target) && action.onConflict === 'error') {
+            fs.rmSync(workDir, { recursive: true, force: true });
+            throw new Error(`Download destination already exists: ${target}`);
+        }
+        entryFinal = action.onConflict === 'overwrite' ? target : uniquePath(target);
         moveTree(entry, entryFinal);
     }
     fs.rmSync(workDir, { recursive: true, force: true });
@@ -179,7 +200,7 @@ export async function download(action, { workspace, doc, context, scope, logger,
         : [];
     if (!targets.length) {
         const c = typeof context?.classify === 'function' ? context.classify() : null;
-        for (const [tree, paths] of Object.entries(c?.treePaths || {})) {
+        for (const [tree, paths] of Object.entries(c?.eventTreePaths || {})) {
             if (tree === 'backends') { continue; }
             for (const p of paths) { targets.push({ tree, path: p }); }
         }
@@ -189,7 +210,7 @@ export async function download(action, { workspace, doc, context, scope, logger,
         checksumArray: [`sha256/${checksum}`],
         locations: [{ url: `file://{WORKSPACE_ROOT}/home/${relFile}` }],
         metadata: { contentType, size: stat.size, filename: path.basename(entryFinal), sourceUrl: url, sourceDocumentId: doc.id },
-        data: { title: title || path.basename(entryFinal), url },
+        data: { title: title || path.basename(entryFinal) },
     };
     const first = targets[0];
     const selector = !first
@@ -197,32 +218,35 @@ export async function download(action, { workspace, doc, context, scope, logger,
         : first.tree !== 'context' ? { context: null, directory: directorySelector(first) } : { context: first.path };
     const inserted = await context.insert(fileDoc, selector);
     const newId = inserted?.id ?? inserted;
+    if (!['string', 'number'].includes(typeof newId)) throw new Error('Download was not indexed; source link retained');
     for (const target of targets.slice(1)) {
         await workspace.link(newId, {
             ...(target.tree !== 'context' ? { directory: directorySelector(target) } : { context: workspace.getContextTreeSelector(target.path) }),
             features: action.tags || [],
             emitEvent: false,
             provenance,
-        }).catch((err) => logger.debug(`rule download: link ${newId} → ${target.tree}:${target.path} failed: ${err.message}`));
+        });
     }
     if (first && Array.isArray(action.tags) && action.tags.length && typeof workspace.link === 'function') {
         await workspace.link(newId, {
             ...(first.tree !== 'context' ? { directory: directorySelector(first) } : { context: workspace.getContextTreeSelector(first.path) }),
             features: action.tags, emitEvent: false, provenance,
-        }).catch(() => {});
+        });
     }
 
-    ledger[ledgerKey] = { file: relFile, documentId: newId, at: new Date().toISOString() };
-    writeLedger(ledgerFile, ledger);
-
     // Another backend than home: hand the bytes over (the index entry follows).
-    if (to && to !== 'workspace:home' && typeof workspace.transferDocumentBytes === 'function') {
+    if (to && to !== 'workspace:home') {
         const moved = await workspace.transferDocumentBytes({ ...fileDoc, id: newId }, {
             to, mode: 'move', key: relFile, onConflict: action.onConflict || 'rename',
             from: { backend: 'workspace:home', key: relFile },
-        }).catch((err) => { logger.warn(`rule download: moving ${relFile} to ${to} failed: ${err.message}`); return null; });
+        });
+        if (!moved || moved.state === 'pending') throw new Error(`Download delivery to ${to} is not complete; source link retained`);
         if (moved) { logger.debug(`rule download: ${relFile} moved on to ${to}`); }
     }
+
+    ledger[ledgerKey] = { file: relFile, documentId: newId, complete: true, at: new Date().toISOString() };
+    writeLedger(ledgerFile, ledger);
+    await finish(newId);
 
     logger.debug(`rule download: ${doc.id} ${kind} ${fetchUrl} → home/${relFile} (doc ${newId}, filed at ${targets.map((t) => `${t.tree}:${t.path}`).join(', ') || 'nowhere'})`);
     return { status: 'ok', file: relFile, documentId: newId };
