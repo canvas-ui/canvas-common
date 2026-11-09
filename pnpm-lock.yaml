@@ -14,6 +14,9 @@ importers:
       '@augmentd-labs/canvas-protocol':
         specifier: ^0.4.0
         version: 0.4.0
+      '@augmentd-labs/canvas-synapsd':
+        specifier: github:canvas-ui/canvas-synapsd#main
+        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#28e2c92d1f61a359178f1a94d7f668d0abe3c111(@types/node@26.6.4)
       '@augmentd-labs/canvas-web':
         specifier: ^2.15.0
         version: 2.15.0
@@ -43,10 +46,7 @@ importers:
         version: 3.0.3
       canvas-stored:
         specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/5f2dd3e9f2b182480b1a3d1365ea565012083887
-      canvas-synapsd:
-        specifier: github:canvas-ui/canvas-synapsd#main
-        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#32a5fde80f340af7371d7239a777487ce02a882b(@types/node@26.6.4)
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2
       conf:
         specifier: ^14.0.0
         version: 14.0.0
@@ -162,6 +162,9 @@ importers:
       '@augmentd-labs/canvas-protocol':
         specifier: ^0.4.0
         version: 0.4.0
+      '@augmentd-labs/canvas-synapsd':
+        specifier: github:canvas-ui/canvas-synapsd#main
+        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#28e2c92d1f61a359178f1a94d7f668d0abe3c111(@types/node@26.6.4)
       '@augmentd-labs/canvas-web':
         specifier: ^2.15.0
         version: 2.15.0
@@ -188,10 +191,7 @@ importers:
         version: 3.0.3
       canvas-stored:
         specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/5f2dd3e9f2b182480b1a3d1365ea565012083887
-      canvas-synapsd:
-        specifier: github:canvas-ui/canvas-synapsd#main
-        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#32a5fde80f340af7371d7239a777487ce02a882b(@types/node@26.6.4)
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2
       conf:
         specifier: ^14.0.0
         version: 14.0.0
@@ -321,7 +321,7 @@ importers:
         version: link:../../packages/protocol
       canvas-stored:
         specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/5f2dd3e9f2b182480b1a3d1365ea565012083887
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2
       fastify:
         specifier: ^4.29.1
         version: 4.29.1
@@ -364,6 +364,11 @@ packages:
   '@augmentd-labs/canvas-protocol@0.4.0':
     resolution: {integrity: sha512-cmPU1k8qcSR9H0klQIbq1hmI22rhbC+1n7XXUkn2ctwjAmk7qDuc9ao3P/nH3XlaUoMJkiTsHgHfMwU+aMad/Q==}
     engines: {node: '>=20'}
+
+  '@augmentd-labs/canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#28e2c92d1f61a359178f1a94d7f668d0abe3c111':
+    resolution: {commit: 28e2c92d1f61a359178f1a94d7f668d0abe3c111, repo: git@github.com:canvas-ui/canvas-synapsd.git, type: git}
+    version: 3.25.2
+    engines: {node: '>=22.0.0'}
 
   '@augmentd-labs/canvas-web@2.15.0':
     resolution: {integrity: sha512-PSmxpltIDOsQt1JmKDKOrrAIbYOEBQGUcaYoygKteSuBgPwlGIghMtskhZqxYNwI0Me9ipSIGAuxWnP04Sm64w==}
@@ -1599,14 +1604,9 @@ packages:
     resolution: {integrity: sha512-L28STB170nwWS63UjtlEOE3dldQApaJXZkOI1uMFfzf3rRuPegHaHesyee+YxQ+W6SvRDQV6UrdOdRiR153wJg==}
     engines: {node: '>=6'}
 
-  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/5f2dd3e9f2b182480b1a3d1365ea565012083887:
-    resolution: {tarball: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/5f2dd3e9f2b182480b1a3d1365ea565012083887}
-    version: 1.17.0
-    engines: {node: '>=22.0.0'}
-
-  canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#32a5fde80f340af7371d7239a777487ce02a882b:
-    resolution: {commit: 32a5fde80f340af7371d7239a777487ce02a882b, repo: git@github.com:canvas-ui/canvas-synapsd.git, type: git}
-    version: 3.25.2
+  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2:
+    resolution: {tarball: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2}
+    version: 1.17.1
     engines: {node: '>=22.0.0'}
 
   chalk-template@0.4.0:
@@ -3206,6 +3206,26 @@ snapshots:
 
   '@augmentd-labs/canvas-protocol@0.4.0': {}
 
+  '@augmentd-labs/canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#28e2c92d1f61a359178f1a94d7f668d0abe3c111(@types/node@26.6.4)':
+    dependencies:
+      '@lancedb/lancedb': 0.40.0(@types/node@26.6.4)(apache-arrow@18.1.0)
+      apache-arrow: 18.1.0
+      date-fns: 4.4.0
+      debug: 4.4.3
+      eventemitter2: 6.4.9
+      lmdb: 3.5.7
+      mkdirp: 3.0.1
+      nodes2ts: 4.0.2
+      roaring: 2.7.0
+      ulid: 3.0.2
+      uuid: 11.1.1
+      zod: 3.25.76
+      zod-to-json-schema: 3.25.2(zod@3.25.76)
+    transitivePeerDependencies:
+      - '@types/node'
+      - encoding
+      - supports-color
+
   '@augmentd-labs/canvas-web@2.15.0': {}
 
   '@aws-sdk/checksums@3.1001.3':
@@ -4564,7 +4584,7 @@ snapshots:
 
   camelcase@5.3.1: {}
 
-  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/5f2dd3e9f2b182480b1a3d1365ea565012083887:
+  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2:
     dependencies:
       '@aws-sdk/client-s3': 3.1152.0
       cacache: 20.0.4
@@ -4580,26 +4600,6 @@ snapshots:
       music-metadata: 11.15.0
       picomatch: 2.3.2
     transitivePeerDependencies:
-      - supports-color
-
-  canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#32a5fde80f340af7371d7239a777487ce02a882b(@types/node@26.6.4):
-    dependencies:
-      '@lancedb/lancedb': 0.40.0(@types/node@26.6.4)(apache-arrow@18.1.0)
-      apache-arrow: 18.1.0
-      date-fns: 4.4.0
-      debug: 4.4.3
-      eventemitter2: 6.4.9
-      lmdb: 3.5.7
-      mkdirp: 3.0.1
-      nodes2ts: 4.0.2
-      roaring: 2.7.0
-      ulid: 3.0.2
-      uuid: 11.1.1
-      zod: 3.25.76
-      zod-to-json-schema: 3.25.2(zod@3.25.76)
-    transitivePeerDependencies:
-      - '@types/node'
-      - encoding
       - supports-color
 
   chalk-template@0.4.0:

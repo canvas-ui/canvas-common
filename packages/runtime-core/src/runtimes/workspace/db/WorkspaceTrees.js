@@ -1,6 +1,6 @@
-import { availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
+import { availableLocations } from '@augmentd-labs/canvas-synapsd/src/utils/document-locations.js';
 import { normalizeBackendsTreePath } from '../../../utils/backend-documents.js';
-import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
+import { parseLocationUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-helpers.js';
 import { deleteDocumentsInBatches } from './bulk-delete.js';
 import { exportSubtree as exportTreeSubtree, importSubtree as importTreeSubtree } from '../portability/subtree.js';
 import Workspace from '../Workspace.js';

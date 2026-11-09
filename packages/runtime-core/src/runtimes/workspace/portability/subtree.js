@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
-import { parseInitializeDocument } from 'canvas-synapsd/src/utils/document.js';
-import { predicateId } from 'canvas-synapsd/src/indexes/edges/predicates.js';
+import { parseInitializeDocument } from '@augmentd-labs/canvas-synapsd/src/utils/document.js';
+import { predicateId } from '@augmentd-labs/canvas-synapsd/src/indexes/edges/predicates.js';
 
 const FORMAT = 'canvas-subtree';
 const CONTACT_RELATIONS = new Set(['authored-by', 'addressed-to', 'reply-to', 'mentions', 'depicts', 'member-of']);

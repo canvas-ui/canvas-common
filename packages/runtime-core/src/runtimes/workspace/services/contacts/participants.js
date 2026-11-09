@@ -1,4 +1,4 @@
-import Identity from 'canvas-synapsd/src/schemas/core/Identity.js';
+import Identity from '@augmentd-labs/canvas-synapsd/src/schemas/core/Identity.js';
 import addressparser from 'nodemailer/lib/addressparser/index.js';
 
 export const isIdentity = (doc) => doc?.schema === 'data/schema/identity' || doc?.schema?.startsWith('data/schema/identity/');

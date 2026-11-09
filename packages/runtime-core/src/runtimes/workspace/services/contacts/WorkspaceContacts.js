@@ -1,5 +1,5 @@
 import { ContactExtractor } from './index.js';
-import Identity from 'canvas-synapsd/src/schemas/core/Identity.js';
+import Identity from '@augmentd-labs/canvas-synapsd/src/schemas/core/Identity.js';
 import Workspace from '../../Workspace.js';
 
 export default class WorkspaceContacts {

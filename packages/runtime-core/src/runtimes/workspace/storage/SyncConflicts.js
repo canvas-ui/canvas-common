@@ -1,7 +1,7 @@
 'use strict';
 
 import path from 'path';
-import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
+import { parseLocationUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-helpers.js';
 import { BACKENDS_TREE_NAME } from '../../../utils/backend-documents.js';
 import { normalizeObjectKey } from './WorkspaceStoredIndex.js';
 

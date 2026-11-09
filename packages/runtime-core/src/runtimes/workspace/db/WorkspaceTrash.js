@@ -1,7 +1,7 @@
-import { availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
+import { availableLocations } from '@augmentd-labs/canvas-synapsd/src/utils/document-locations.js';
 import { parseDocumentId, parseDocumentIdArray } from '../../../utils/documentId.js';
 import { normalizeSegment } from '../../../utils/backend-documents.js';
-import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
+import { parseLocationUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-helpers.js';
 import { backendIdentity, normalizeRemovalPolicy } from '../storage/removal-policy.js';
 import Workspace from '../Workspace.js';
 import WorkspaceDocuments from './WorkspaceDocuments.js';

@@ -1,7 +1,7 @@
-import { isAvailableLocation, availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
+import { isAvailableLocation, availableLocations } from '@augmentd-labs/canvas-synapsd/src/utils/document-locations.js';
 import path from 'path';
 import { isDeepStrictEqual } from 'node:util';
-import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
+import { parseLocationUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-helpers.js';
 import { mimeFromLocations } from '../../db/classifier.js';
 import { pickGeo } from '../../db/geo.js';
 import { BACKENDS_TREE_NAME } from '../../../../utils/backend-documents.js';

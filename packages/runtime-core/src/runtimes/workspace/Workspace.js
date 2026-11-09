@@ -6,7 +6,7 @@ import path from 'path';
 import { env } from '../../env.js';
 
 import { createLogger } from '../../utils/log.js';
-import Db from 'canvas-synapsd';
+import Db from '@augmentd-labs/canvas-synapsd';
 import { BACKENDS_TREE_NAME } from '../../utils/backend-documents.js';
 import { WorkspaceTokens } from './security/WorkspaceTokens.js';
 import { WorkspaceMembers } from './security/WorkspaceMembers.js';

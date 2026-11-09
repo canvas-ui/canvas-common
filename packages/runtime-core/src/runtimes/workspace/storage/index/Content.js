@@ -1,8 +1,8 @@
-import { availableLocations, isAvailableLocation } from 'canvas-synapsd/src/utils/document-locations.js';
+import { availableLocations, isAvailableLocation } from '@augmentd-labs/canvas-synapsd/src/utils/document-locations.js';
 import path from 'path';
 import fs from 'fs/promises';
 import { createReadStream } from 'fs';
-import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
+import { parseLocationUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-helpers.js';
 import { DATA_BLOB_BACKEND } from './contracts.js';
 
 export default class Content {

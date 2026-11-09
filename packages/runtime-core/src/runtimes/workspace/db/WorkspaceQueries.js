@@ -1,7 +1,7 @@
 import { requireQueryScope } from './query-scope.js';
 import { parseDocumentId } from '../../../utils/documentId.js';
 import Workspace from '../Workspace.js';
-import { parseSpec } from 'canvas-synapsd/src/utils/spec.js';
+import { parseSpec } from '@augmentd-labs/canvas-synapsd/src/utils/spec.js';
 
 export default class WorkspaceQueries {
     #workspace;

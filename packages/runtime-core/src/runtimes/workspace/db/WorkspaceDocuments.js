@@ -1,9 +1,9 @@
-import { availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
+import { availableLocations } from '@augmentd-labs/canvas-synapsd/src/utils/document-locations.js';
 import { readMessageThread } from '../connectors/messaging/thread.js';
 
 import { parseDocumentId, parseDocumentIdArray } from '../../../utils/documentId.js';
 
-import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
+import { parseLocationUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-helpers.js';
 import { WorkspaceConnectorIndex, connectorDriverForProvenanceUrl } from '../connectors/index.js';
 import Workspace from '../Workspace.js';
 

@@ -4,7 +4,7 @@ import { downloadLink } from '../../../runtimes/workspace/services/download-link
 import ResponseObject from '../../ResponseObject.js';
 import Ajv from 'ajv';
 import { documentQuerySchema } from '../../document-query-schema.js';
-import { parseSpec } from 'canvas-synapsd/src/utils/spec.js';
+import { parseSpec } from '@augmentd-labs/canvas-synapsd/src/utils/spec.js';
 import { deleteDocumentsInBatches } from '../../../runtimes/workspace/db/bulk-delete.js';
 import { parseDocumentId, parseDocumentIdArray } from '../../../utils/documentId.js';
 import { parseDocumentIdQuery } from '../../lib/document-id-query.js';
@@ -12,8 +12,8 @@ import { stripDeviceFeatureTags } from '../../../utils/device-features.js';
 import { parseByteRange } from '../../lib/http-range.js';
 import { resolveContentType } from '../../lib/mime.js';
 import { normalizeSchemaId } from '../../../runtimes/workspace/db/classifier.js';
-import { PREDICATES, listPredicates } from 'canvas-synapsd/src/indexes/edges/predicates.js';
-import Identity from 'canvas-synapsd/src/schemas/core/Identity.js';
+import { PREDICATES, listPredicates } from '@augmentd-labs/canvas-synapsd/src/indexes/edges/predicates.js';
+import Identity from '@augmentd-labs/canvas-synapsd/src/schemas/core/Identity.js';
 import { emailListPreview, resolveEmailBody } from '../../../runtimes/workspace/connectors/imap/content.js';
 
 // Human filename for a location URL: basename of the key after scheme://backend/.

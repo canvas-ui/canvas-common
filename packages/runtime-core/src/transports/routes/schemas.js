@@ -2,7 +2,7 @@
 
 import { documentQuerySchema } from '../document-query-schema.js';
 import ResponseObject from '../ResponseObject.js';
-import schemaRegistry from 'canvas-synapsd/src/schemas/SchemaRegistry.js';
+import schemaRegistry from '@augmentd-labs/canvas-synapsd/src/schemas/SchemaRegistry.js';
 
 /**
  * Schema routes handler for the API

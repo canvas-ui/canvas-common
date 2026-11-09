@@ -1,4 +1,4 @@
-import { availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
+import { availableLocations } from '@augmentd-labs/canvas-synapsd/src/utils/document-locations.js';
 import { randomUUID } from 'node:crypto';
 import { backendIdentity, normalizeRemovalPolicy } from '../removal-policy.js';
 

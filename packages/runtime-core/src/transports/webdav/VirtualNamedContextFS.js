@@ -1,6 +1,6 @@
 'use strict';
 
-import schemaRegistry from 'canvas-synapsd/src/schemas/SchemaRegistry.js';
+import schemaRegistry from '@augmentd-labs/canvas-synapsd/src/schemas/SchemaRegistry.js';
 import {
     applyBodyToDoc, collectDocuments, docEntries, docName, fileDocumentFromBlob, fileEntry,
     findDocumentByName, httpError, inferDocFromFile, LIST_BUDGET, norm,

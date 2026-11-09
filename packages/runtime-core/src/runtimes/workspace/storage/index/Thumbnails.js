@@ -1,5 +1,5 @@
 import { renderVideoThumbnail, VIDEO_THUMBNAIL_MAX_BYTES } from './video-thumbnail.js';
-import { availableLocations } from 'canvas-synapsd/src/utils/document-locations.js';
+import { availableLocations } from '@augmentd-labs/canvas-synapsd/src/utils/document-locations.js';
 import { WorkspaceStoredIndex } from '../WorkspaceStoredIndex.js';
 import path from 'path';
 

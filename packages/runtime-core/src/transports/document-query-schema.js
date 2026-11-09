@@ -1,4 +1,4 @@
-import { querySpecSchema, candidateSpecSchema } from 'canvas-synapsd/src/query/schema.js';
+import { querySpecSchema, candidateSpecSchema } from '@augmentd-labs/canvas-synapsd/src/query/schema.js';
 
 export const documentQuerySchema = {
   ...querySpecSchema,

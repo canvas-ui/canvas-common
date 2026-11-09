@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import DatabaseBackups, { BACKUP_RETENTION } from 'canvas-synapsd/src/backups/DatabaseBackups.js';
+import DatabaseBackups, { BACKUP_RETENTION } from '@augmentd-labs/canvas-synapsd/src/backups/DatabaseBackups.js';
 
 const busy = message => Object.assign(new Error(message), { statusCode: 409 });
 

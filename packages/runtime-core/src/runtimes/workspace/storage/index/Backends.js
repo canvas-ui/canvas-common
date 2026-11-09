@@ -1,7 +1,7 @@
 import path from 'path';
 import { randomUUID } from 'node:crypto';
 import getFolderSize from 'get-folder-size';
-import { parseLocationUrl, deviceFileUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
+import { parseLocationUrl, deviceFileUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-helpers.js';
 import { normalizeSegment } from '../../../../utils/backend-documents.js';
 import { DEFAULT_SYNC_EXCLUSIONS, WORKSPACE_INTERNAL_EXCLUSIONS } from '../../config/constants.js';
 import { HOME_STORED_BACKEND, DATA_BLOB_BACKEND, STORED_DRIVERS, LOCAL_DRIVERS, CONTAINER_DRIVERS, REMOTE_RESTART_KEYS, objectsError } from './contracts.js';

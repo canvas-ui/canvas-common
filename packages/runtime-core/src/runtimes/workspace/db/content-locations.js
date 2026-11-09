@@ -1,4 +1,4 @@
-import { availableLocations, isAvailableLocation } from 'canvas-synapsd/src/utils/document-locations.js';
+import { availableLocations, isAvailableLocation } from '@augmentd-labs/canvas-synapsd/src/utils/document-locations.js';
 /** Resolve an email attachment through its content identity after a move.
  * The per-message filename/CID/URL remain unchanged on the email record.
  * Only a URL already declared by that record can select an attachment.

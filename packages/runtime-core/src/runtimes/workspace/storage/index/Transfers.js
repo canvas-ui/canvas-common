@@ -1,7 +1,7 @@
-import { isAvailableLocation } from 'canvas-synapsd/src/utils/document-locations.js';
+import { isAvailableLocation } from '@augmentd-labs/canvas-synapsd/src/utils/document-locations.js';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
-import { parseLocationUrl } from 'canvas-synapsd/src/utils/path-helpers.js';
+import { parseLocationUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-helpers.js';
 import { objectsError } from './contracts.js';
 
 export default class Transfers {
