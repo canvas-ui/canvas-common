@@ -16,7 +16,7 @@ importers:
         version: 0.4.0
       '@augmentd-labs/canvas-synapsd':
         specifier: github:canvas-ui/canvas-synapsd#main
-        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#28e2c92d1f61a359178f1a94d7f668d0abe3c111(@types/node@26.6.4)
+        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#946e0ef20d7dab52949ffac377b71ed6962ab72b(@types/node@26.6.4)
       '@augmentd-labs/canvas-web':
         specifier: ^2.15.0
         version: 2.15.0
@@ -164,7 +164,7 @@ importers:
         version: 0.4.0
       '@augmentd-labs/canvas-synapsd':
         specifier: github:canvas-ui/canvas-synapsd#main
-        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#28e2c92d1f61a359178f1a94d7f668d0abe3c111(@types/node@26.6.4)
+        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#946e0ef20d7dab52949ffac377b71ed6962ab72b(@types/node@26.6.4)
       '@augmentd-labs/canvas-web':
         specifier: ^2.15.0
         version: 2.15.0
@@ -365,8 +365,8 @@ packages:
     resolution: {integrity: sha512-cmPU1k8qcSR9H0klQIbq1hmI22rhbC+1n7XXUkn2ctwjAmk7qDuc9ao3P/nH3XlaUoMJkiTsHgHfMwU+aMad/Q==}
     engines: {node: '>=20'}
 
-  '@augmentd-labs/canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#28e2c92d1f61a359178f1a94d7f668d0abe3c111':
-    resolution: {commit: 28e2c92d1f61a359178f1a94d7f668d0abe3c111, repo: git@github.com:canvas-ui/canvas-synapsd.git, type: git}
+  '@augmentd-labs/canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#946e0ef20d7dab52949ffac377b71ed6962ab72b':
+    resolution: {commit: 946e0ef20d7dab52949ffac377b71ed6962ab72b, repo: git@github.com:canvas-ui/canvas-synapsd.git, type: git}
     version: 3.25.2
     engines: {node: '>=22.0.0'}
 
@@ -3206,7 +3206,7 @@ snapshots:
 
   '@augmentd-labs/canvas-protocol@0.4.0': {}
 
-  '@augmentd-labs/canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#28e2c92d1f61a359178f1a94d7f668d0abe3c111(@types/node@26.6.4)':
+  '@augmentd-labs/canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#946e0ef20d7dab52949ffac377b71ed6962ab72b(@types/node@26.6.4)':
     dependencies:
       '@lancedb/lancedb': 0.40.0(@types/node@26.6.4)(apache-arrow@18.1.0)
       apache-arrow: 18.1.0
