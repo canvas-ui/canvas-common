@@ -8,6 +8,8 @@ import { MirrorRuntime } from './mirror-runtime.js';
 import { FuseRuntime } from './fuse-runtime.js';
 import { startControl } from './control.js';
 
+const START_RETRY_MS = 60_000;
+
 /*
  * canvas-edge: the device-side daemon for real-folder mirrors (the non-FUSE
  * client of the sync protocol, for macOS/Windows and anyone who wants a plain
@@ -32,7 +34,13 @@ export async function main(argv = process.argv.slice(2)) {
         logger.error({ err: err?.message }, 'env-driven mirror config failed');
     }
 
+    // A mirror that cannot start (its drive is not mounted yet) is tried again.
+    let retry = null;
+    let stopping = false;
     const load = async () => {
+        clearTimeout(retry);
+        retry = null;
+        let failed = false;
         const wanted = daemonMirrors();
         const fuse = fuseMirrors();
         const wantedIds = new Set([...wanted, ...fuse].map((m) => m.id));
@@ -53,6 +61,8 @@ export async function main(argv = process.argv.slice(2)) {
                 await rt.start();
                 runtimes.set(mirror.id, rt);
             } catch (err) {
+                failed = true;
+                await rt.stop().catch(() => {});
                 logger.error({ mirror: mirror.id, err: err?.message }, 'mirror failed to start');
             }
         }
@@ -67,9 +77,12 @@ export async function main(argv = process.argv.slice(2)) {
                 logger.error({ unit: mirror.id, err: err?.message }, 'fuse unit failed to start');
             }
         }
+        if (failed && !stopping) {
+            retry = setTimeout(() => load().catch((err) => logger.error({ err: err?.message }, 'reload failed')), START_RETRY_MS);
+            retry.unref?.();
+        }
     };
 
-    let stopping = false;
     const shutdown = async () => {
         if (stopping) return;
         stopping = true;

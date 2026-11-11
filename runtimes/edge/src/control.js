@@ -31,6 +31,19 @@ export async function startControl({ runtimes, reload, shutdown, logger }) {
         r.nudge();
         return { ok: true };
     });
+    // Local deletions held by the mirror's delete guard: list, send, or undo.
+    app.get('/mirrors/:id/deletes', async (req, reply) => {
+        const r = byId(req.params.id);
+        if (typeof r?.heldDeletes !== 'function') return reply.code(404).send({ error: 'no such mirror' });
+        return { held: r.heldDeletes() };
+    });
+    app.post('/mirrors/:id/deletes/:verb', async (req, reply) => {
+        const r = byId(req.params.id);
+        if (typeof r?.heldDeletes !== 'function') return reply.code(404).send({ error: 'no such mirror' });
+        if (req.params.verb === 'approve') return { approved: r.approveDeletes() };
+        if (req.params.verb === 'restore') return { restored: r.restoreDeletes() };
+        return reply.code(404).send({ error: 'approve or restore' });
+    });
     app.post('/reload', async () => { await reload(); return { ok: true, mirrors: runtimes.size }; });
     app.post('/shutdown', async () => { setTimeout(() => shutdown(), 50); return { ok: true }; });
 

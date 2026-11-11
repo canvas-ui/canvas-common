@@ -7,6 +7,7 @@ import { io } from 'socket.io-client';
 import Stored, { Mirror } from 'canvas-stored';
 import { MIRROR_IGNORE_DEFAULTS } from 'canvas-stored/src/sync/keys.js';
 import { DEFAULT_SYNC_EXCLUSIONS, WORKSPACE_INTERNAL_EXCLUSIONS } from '@augmentd-labs/canvas-protocol';
+import { BINDING_FILE, bindFolder } from './binding.js';
 
 const STATUS_THROTTLE_MS = 5000;
 const STATUS_HEARTBEAT_MS = 60000;
@@ -19,7 +20,11 @@ const STATUS_HEARTBEAT_MS = 60000;
  * `<folder>/.workspace/` (mirror.json, db/stored, cache, tmp, trash,
  * conflicts) — the folder is self-describing and movable — unless the mirror
  * names a `stateDir` (or the daemon a CANVAS_EDGE_STATE_ROOT), in which case
- * the folder holds user files only and everything else lives there. Staging
+ * the folder holds user files plus `.workspace/binding` and everything else
+ * lives there. The binding is a random id written to both the folder and the
+ * state dir: sync history is only ever applied to the folder that carries it,
+ * so an unmounted drive or a replaced folder is refused instead of read as
+ * "every file was deleted". Staging
  * (temp) must share a filesystem with the folder for atomic placement, so
  * it stays under the state dir only when that is on the same device and
  * falls back to `<folder>/.stored-tmp` otherwise.
@@ -61,7 +66,9 @@ export class MirrorRuntime {
         const folder = this.folder;
         const internal = this.stateDir;
         const external = internal !== path.join(folder, '.workspace');
+        const hadHistory = fs.existsSync(path.join(internal, 'db', 'stored'));
         for (const d of ['db/stored', 'cache', 'trash', 'conflicts']) fs.mkdirSync(path.join(internal, d), { recursive: true });
+        const binding = bindFolder(folder, internal, hadHistory);
         let tempDir = path.join(internal, 'tmp');
         if (external && !canRenameInto(path.join(internal, 'tmp'), folder)) {
             // st_dev lies for bind mounts (one disk, two mounts, rename refused):
@@ -84,7 +91,8 @@ export class MirrorRuntime {
         this.#stored = new Stored({ root: path.join(internal, 'db', 'stored'), cache: { path: path.join(internal, 'cache') }, checksums: ['sha256'] });
         this.#stored.on('error', (err) => this.#logger.warn({ mirror: this.id, err: err?.message }, 'stored error'));
         this.#stored.addBackend('local', {
-            driver: 'file', root: folder, watch: true, tempDir, followSymlinks: false, stabilityThreshold: 2000,
+            driver: 'file', root: folder, createRoot: false, marker: { file: BINDING_FILE, id: binding },
+            watch: true, tempDir, followSymlinks: false, stabilityThreshold: 2000,
             ignored: [...new Set([...WORKSPACE_INTERNAL_EXCLUSIONS, ...DEFAULT_SYNC_EXCLUSIONS, ...hubExclusions, ...MIRROR_IGNORE_DEFAULTS, ...(this.#mirror.ignore || [])])],
         });
         this.#stored.addBackend('trash', { driver: 'file', root: path.join(internal, 'trash'), watch: false });
@@ -109,6 +117,7 @@ export class MirrorRuntime {
         this.#engine.on('revert', (e) => this.#logger.info({ mirror: this.id, key: e?.key, copy: e?.copy }, 'local edit reverted (pull mirror), copy kept'));
         this.#engine.on('skip', (e) => this.#logger.info({ mirror: this.id, key: e?.key, reason: e?.reason }, 'key skipped'));
         this.#engine.on('conflict', (c) => this.#logger.info({ mirror: this.id, key: c?.key }, 'conflict recorded'));
+        this.#engine.on('hold', (h) => this.#logger.warn({ mirror: this.id, files: h?.count }, 'many files are missing locally — deletions held; approve or restore with `canvas remote mirror deletes`'));
         await this.#engine.start();
         await this.#connectSocket();
         this.#reporter = setInterval(() => this.#report().catch(() => {}), STATUS_HEARTBEAT_MS);
@@ -135,7 +144,9 @@ export class MirrorRuntime {
     }
 
     nudge() { this.#engine?.nudge?.(); }
-    async resync() { return this.#engine?.reconcileAll?.(); }
+    heldDeletes() { return this.#engine?.heldDeletes() ?? []; }
+    approveDeletes() { return this.#engine?.approveDeletes() ?? 0; }
+    restoreDeletes() { return this.#engine?.restoreDeletes() ?? 0; }
 
     async #fetchHubExclusions() {
         try {

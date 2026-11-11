@@ -46,7 +46,7 @@ importers:
         version: 3.0.3
       canvas-stored:
         specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/defe50165894988072ac59426e9e8f1a0d86b8d8
       conf:
         specifier: ^14.0.0
         version: 14.0.0
@@ -191,7 +191,7 @@ importers:
         version: 3.0.3
       canvas-stored:
         specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/defe50165894988072ac59426e9e8f1a0d86b8d8
       conf:
         specifier: ^14.0.0
         version: 14.0.0
@@ -321,7 +321,7 @@ importers:
         version: link:../../packages/protocol
       canvas-stored:
         specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/defe50165894988072ac59426e9e8f1a0d86b8d8
       fastify:
         specifier: ^4.29.1
         version: 4.29.1
@@ -1604,9 +1604,9 @@ packages:
     resolution: {integrity: sha512-L28STB170nwWS63UjtlEOE3dldQApaJXZkOI1uMFfzf3rRuPegHaHesyee+YxQ+W6SvRDQV6UrdOdRiR153wJg==}
     engines: {node: '>=6'}
 
-  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2:
-    resolution: {tarball: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2}
-    version: 1.17.1
+  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/defe50165894988072ac59426e9e8f1a0d86b8d8:
+    resolution: {tarball: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/defe50165894988072ac59426e9e8f1a0d86b8d8}
+    version: 1.18.0
     engines: {node: '>=22.0.0'}
 
   chalk-template@0.4.0:
@@ -4584,7 +4584,7 @@ snapshots:
 
   camelcase@5.3.1: {}
 
-  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/53e7ad349064795151503f6fdd68d0b9b06fbcc2:
+  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/defe50165894988072ac59426e9e8f1a0d86b8d8:
     dependencies:
       '@aws-sdk/client-s3': 3.1152.0
       cacache: 20.0.4
