@@ -18,7 +18,10 @@ export const ORPHANED_FEATURE = 'feature/orphaned';
 
 export const NUDGE_THROTTLE_MS = 300;
 
-export const RETENTION_DAYS = Number.parseInt(process.env.CANVAS_RETENTION_DAYS ?? '30', 10) || 0;
+// How long deleted and overwritten data stays recoverable: the Trash of every
+// file backend, trashed documents and displaced file versions. At least one
+// day; there is no setting that turns the Trash off.
+export const TRASH_RETENTION_DAYS = Math.max(1, Number.parseInt(process.env.CANVAS_TRASH_RETENTION_DAYS ?? '', 10) || 30);
 
 export const UPSERT_WAIT_MS = 10000;
 

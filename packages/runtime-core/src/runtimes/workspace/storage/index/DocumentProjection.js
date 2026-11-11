@@ -402,7 +402,7 @@ export default class DocumentProjection {
         const doc = await db.getByChecksumString(checksumArray[0]).catch(() => null);
         if (!doc?.id) return null;
 
-        const locations = this.#mergeDocumentLocations(doc, Array.isArray(payload.locations) ? payload.locations : []);
+        const locations = this.#mergeDocumentLocations(doc, Array.isArray(payload.locations) ? payload.locations : [], payload.from);
         if (!locations.some(isAvailableLocation)) {
             // Nothing left to point at — hand over to the orphan path so the
             // orphanedAt stamp and retention semantics stay in one place.
@@ -656,7 +656,7 @@ export default class DocumentProjection {
     // anything else is derivable from the URL via `stored`.
     #buildDocument(storedFile = {}, checksumArray = [], backends = [], existingDocument = null, meta = null) {
         const size = Number.isFinite(storedFile.size) ? storedFile.size : existingDocument?.metadata?.size;
-        const locations = this.#mergeDocumentLocations(existingDocument, backends);
+        const locations = this.#mergeDocumentLocations(existingDocument, backends, storedFile.from);
         // Fall back to a filename-derived mime when `stored` didn't detect one
         // (filesystem-indexed files often have no sniffed mime) — otherwise the
         // File doc defaults to 'application/json' and images never get classified
@@ -722,10 +722,25 @@ export default class DocumentProjection {
         return doc;
     }
 
-    #mergeDocumentLocations(doc, backends) {
+    // An address the bytes left on purpose is dropped instead of kept as a
+    // location that went missing. That is the source endpoint of a move or
+    // rename (`movedFrom`), and, when a rescan finds the file after a move it
+    // did not witness, the old address on a backend that now holds the same
+    // bytes at an address the document did not have.
+    #mergeDocumentLocations(doc, backends, movedFrom = null) {
         const next = this.#buildDocumentLocations(backends);
         const urls = new Set(next.map((l) => l.url));
+        const had = new Set((doc?.locations || []).map((l) => l.url));
+        const relocated = new Set(next.filter((l) => !had.has(l.url))
+            .map((l) => this.#runtime.transfers.locationEndpoint(l)?.backend).filter(Boolean));
+        const left = new Set();
+        if (movedFrom?.backend && movedFrom?.key) {
+            left.add(`stored://${movedFrom.backend}/${movedFrom.key}`);
+            const twin = this.#runtime.backends.deviceFileLocationUrl(movedFrom.backend, movedFrom.key);
+            if (twin) left.add(twin);
+        }
         for (const location of doc?.locations || []) {
+            if (left.has(location.url) && !urls.has(location.url)) continue;
             if (urls.has(location.url)) {
                 const index = next.findIndex(item => item.url === location.url);
                 const { status: _status, statusChangedAt: _changed, ...details } = location;
@@ -734,6 +749,7 @@ export default class DocumentProjection {
                 continue;
             }
             const endpoint = this.#runtime.transfers.locationEndpoint(location);
+            if (endpoint && relocated.has(endpoint.backend) && isAvailableLocation(location)) continue;
             // Stored's canonical list only describes its enabled backends.
             // It cannot retract IMAP/web/foreign-device or disabled locations.
             if (!urls.has(location.url)) {

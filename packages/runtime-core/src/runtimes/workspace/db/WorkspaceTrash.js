@@ -3,8 +3,41 @@ import { parseDocumentId, parseDocumentIdArray } from '../../../utils/documentId
 import { normalizeSegment } from '../../../utils/backend-documents.js';
 import { parseLocationUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-helpers.js';
 import { backendIdentity, normalizeRemovalPolicy } from '../storage/removal-policy.js';
+import { TRASH_RETENTION_DAYS } from '../storage/index/contracts.js';
 import Workspace from '../Workspace.js';
 import WorkspaceDocuments from './WorkspaceDocuments.js';
+
+const DAY_MS = 86_400_000;
+const SWEEP_INTERVAL_MS = 6 * 3_600_000;
+const DELETED_PAGE = 1000;
+
+const expiryOf = (deletedAt) => {
+    const at = Date.parse(deletedAt);
+    return Number.isFinite(at) ? new Date(at + TRASH_RETENTION_DAYS * DAY_MS).toISOString() : null;
+};
+const sha256Of = (document) => {
+    for (const value of document?.checksumArray || []) {
+        const match = /^sha256[/:]([0-9a-f]{64})$/i.exec(String(value));
+        if (match) return match[1].toLowerCase();
+    }
+    return null;
+};
+const documentName = (document) => {
+    const data = document?.data || {};
+    for (const field of ['title', 'name', 'filename', 'subject']) {
+        if (typeof data[field] === 'string' && data[field].trim()) return data[field].trim();
+    }
+    if (typeof document?.metadata?.filename === 'string' && document.metadata.filename) return document.metadata.filename;
+    const location = locationPaths(document)[0];
+    if (location) return location.slice(location.lastIndexOf('/') + 1);
+    return `${String(document?.schema || 'document').split('/').pop()} ${document?.id}`;
+};
+// `stored://workspace:home/Invoices/a.pdf` → `workspace:home/Invoices/a.pdf`
+const locationPaths = (document) => (document?.locations || [])
+    .map((location) => /^stored:\/\/(.+)$/.exec(String(location?.url || ''))?.[1])
+    .filter(Boolean)
+    .map((value) => { try { return decodeURIComponent(value); } catch { return value; } });
+const parentOf = (value) => (value.includes('/') ? value.slice(0, value.lastIndexOf('/')) : value);
 
 export default class WorkspaceTrash {
     #workspace;
@@ -290,5 +323,202 @@ export default class WorkspaceTrash {
             await this.#workspace.trashOperations.release(docId);
         }
         return { destroyed, preserved, failed: result?.failed ?? [], count: ids.length };
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+    // Recently deleted: one list over the document Trash and the Trash of
+    // every file backend, with one expiry (CANVAS_TRASH_RETENTION_DAYS).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    async #fileBackends() {
+        return (await this.#workspace.listBackendsByDriver('file')).map((backend) => backend.address);
+    }
+
+    /**
+     * Everything that was deleted and can still be brought back, newest first.
+     * A deleted file whose document is in the Trash too is one item: restoring
+     * it puts the bytes and the filing back together.
+     */
+    async listDeleted({ search = '', limit = 500, offset = 0 } = {}) {
+        const items = [];
+        const bySha = new Map();
+        const { documents } = await this.listTrash({ parse: true });
+        for (const document of documents) {
+            const deletedAt = document.trashed?.trashedAt || null;
+            const item = {
+                id: `doc:${document.id}`,
+                kind: 'document',
+                name: documentName(document),
+                schema: document.schema || null,
+                documentId: document.id,
+                from: (document.trashed?.placements || []).flatMap((placement) => placement.paths),
+                reason: document.trashed?.reason === 'source-missing' ? 'source-missing' : 'removed',
+                deletedAt,
+                expiresAt: expiryOf(deletedAt),
+                size: document.metadata?.size ?? document.data?.size ?? null,
+                copies: [],
+            };
+            // Filed nowhere: say where the bytes were instead.
+            if (!item.from.length) item.from = [...new Set(locationPaths(document).map(parentOf))];
+            const sha = sha256Of(document);
+            if (sha && !bySha.has(sha)) bySha.set(sha, item);
+            items.push(item);
+        }
+        for (const backend of await this.#fileBackends()) {
+            let cursor = null;
+            do {
+                const page = await this.#workspace.listBackendTrash('file', backend, { cursor, limit: DELETED_PAGE })
+                    .catch(() => ({ items: [], cursor: null }));
+                for (const entry of page.items) {
+                    const id = `file:${backend}:${entry.id}`;
+                    const owner = entry.type === 'file' && entry.sha256 ? bySha.get(entry.sha256) : null;
+                    if (owner) {
+                        owner.copies.push({ id, backend, key: entry.key });
+                        owner.size ??= entry.size ?? null;
+                        continue;
+                    }
+                    const slash = entry.key.lastIndexOf('/');
+                    items.push({
+                        id,
+                        kind: entry.type === 'directory' ? 'folder' : 'file',
+                        name: entry.key.slice(slash + 1),
+                        backend,
+                        key: entry.key,
+                        from: [`${backend}/${slash > 0 ? entry.key.slice(0, slash) : ''}`.replace(/\/$/, '')],
+                        reason: 'removed',
+                        deletedAt: entry.deletedAt || null,
+                        expiresAt: expiryOf(entry.deletedAt),
+                        size: entry.size ?? null,
+                        copies: [],
+                    });
+                }
+                cursor = page.cursor;
+            } while (cursor);
+        }
+        const needle = String(search || '').trim().toLowerCase();
+        const matching = needle
+            ? items.filter((item) => item.name.toLowerCase().includes(needle) || item.from.some((path) => path.toLowerCase().includes(needle)))
+            : items;
+        matching.sort((a, b) => String(b.deletedAt || '').localeCompare(String(a.deletedAt || '')));
+        return { items: matching.slice(offset, offset + limit), total: matching.length, retentionDays: TRASH_RETENTION_DAYS };
+    }
+
+    #splitDeletedIds(ids) {
+        const documents = [];
+        const files = new Map();
+        const unknown = [];
+        for (const id of [...new Set(ids)]) {
+            const doc = /^doc:(\d+)$/.exec(id);
+            const file = /^file:(.+):([a-f0-9-]{36,64})$/.exec(id);
+            if (doc) documents.push(Number(doc[1]));
+            else if (file) files.set(file[1], [...(files.get(file[1]) || []), file[2]]);
+            else unknown.push(id);
+        }
+        return { documents, files, unknown };
+    }
+
+    // The backend Trash entries that belong to trashed documents, per item id.
+    async #copiesOf(documentIds) {
+        if (!documentIds.length) return new Map();
+        const wanted = new Set(documentIds.map((id) => `doc:${id}`));
+        const { items } = await this.listDeleted({ limit: Number.MAX_SAFE_INTEGER });
+        return new Map(items.filter((item) => wanted.has(item.id)).map((item) => [item.id, item.copies]));
+    }
+
+    async #settleFiles(files, action) {
+        const results = [];
+        for (const [backend, ids] of files) {
+            for (let at = 0; at < ids.length; at += 200) {
+                const batch = ids.slice(at, at + 200);
+                try {
+                    const { results: done } = action === 'restore'
+                        ? await this.#workspace.restoreBackendTrash('file', backend, batch)
+                        : await this.#workspace.discardBackendTrash('file', backend, batch);
+                    for (const r of done) results.push({ id: `file:${backend}:${r.id}`, ok: !!r.ok, message: r.ok ? undefined : (r.message || r.reason) });
+                } catch (error) {
+                    for (const id of batch) results.push({ id: `file:${backend}:${id}`, ok: false, message: error.message });
+                }
+            }
+        }
+        return results;
+    }
+
+    /** Bring deleted items back to where they were. */
+    async restoreDeleted(ids) {
+        const { documents, files, unknown } = this.#splitDeletedIds(ids);
+        const results = unknown.map((id) => ({ id, ok: false, message: 'Unknown item' }));
+        const copies = await this.#copiesOf(documents);
+        for (const list of copies.values()) for (const copy of list) {
+            const [, backend, id] = /^file:(.+):([a-f0-9-]{36,64})$/.exec(copy.id);
+            files.set(backend, [...(files.get(backend) || []), id]);
+        }
+        const fileResults = await this.#settleFiles(files, 'restore');
+        const attached = new Set([...copies.values()].flat().map((copy) => copy.id));
+        results.push(...fileResults.filter((r) => !attached.has(r.id)));
+        if (documents.length) {
+            const { restored, failed } = await this.restoreFromTrash(documents);
+            for (const id of restored) results.push({ id: `doc:${id}`, ok: true });
+            for (const failure of failed) {
+                // The filing is unknown, but the bytes went back to their
+                // folder, where a scan files them again.
+                const bytesBack = (copies.get(`doc:${failure.id}`) || []).some((copy) => fileResults.find((r) => r.id === copy.id)?.ok);
+                if (bytesBack) await this.untrashOnLink(failure.id);
+                results.push({ id: `doc:${failure.id}`, ok: bytesBack, message: bytesBack ? undefined : failure.error });
+            }
+        }
+        return { results };
+    }
+
+    /** Delete items from the Trash for good. */
+    async discardDeleted(ids) {
+        const { documents, files, unknown } = this.#splitDeletedIds(ids);
+        const results = unknown.map((id) => ({ id, ok: false, message: 'Unknown item' }));
+        const copies = await this.#copiesOf(documents);
+        if (documents.length) {
+            const { destroyed, preserved = [], failed } = await this.emptyTrash({ documentIds: documents });
+            for (const id of [...destroyed, ...preserved]) {
+                results.push({ id: `doc:${id}`, ok: true });
+                for (const copy of copies.get(`doc:${id}`) || []) {
+                    const [, backend, entry] = /^file:(.+):([a-f0-9-]{36,64})$/.exec(copy.id);
+                    files.set(backend, [...(files.get(backend) || []), entry]);
+                }
+            }
+            for (const failure of failed) results.push({ id: `doc:${failure?.id ?? failure}`, ok: false, message: failure?.error || 'Not deleted' });
+        }
+        const attached = new Set([...copies.values()].flat().map((copy) => copy.id));
+        results.push(...(await this.#settleFiles(files, 'discard')).filter((r) => !attached.has(r.id)));
+        return { results };
+    }
+
+    /**
+     * Delete trashed documents whose retention ran out. File backends expire
+     * their own Trash on the same clock. With retention off (0 days) nothing
+     * expires here: the document Trash is then emptied by hand only.
+     */
+    async sweepExpired(now = Date.now()) {
+        const { documents } = await this.listTrash({ parse: false });
+        const expired = documents
+            .filter((document) => {
+                const at = Date.parse(document.trashed?.trashedAt);
+                return Number.isFinite(at) && at + TRASH_RETENTION_DAYS * DAY_MS <= now;
+            })
+            .map((document) => document.id);
+        if (!expired.length) return { expired };
+        const { destroyed, preserved = [] } = await this.emptyTrash({ documentIds: expired });
+        return { expired: [...destroyed, ...preserved] };
+    }
+
+    #sweepTimer = null;
+
+    scheduleSweep() {
+        if (this.#sweepTimer) return;
+        const run = () => this.#workspace.sweepDeleted().catch(() => {});
+        this.#sweepTimer = setInterval(run, SWEEP_INTERVAL_MS);
+        this.#sweepTimer.unref?.();
+        setTimeout(run, 60_000).unref?.();
+    }
+
+    stopSweep() {
+        clearInterval(this.#sweepTimer);
+        this.#sweepTimer = null;
     }
 }

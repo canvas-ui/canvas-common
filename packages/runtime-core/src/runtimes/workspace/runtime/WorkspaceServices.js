@@ -93,11 +93,13 @@ export default class WorkspaceServices {
         await this.#runtime.operations.run('start.mail', () => this.#startMailIndex());
         await this.#runtime.operations.run('start.connectors', () => this.#startConnectorIndex());
         this.#workspace.trashOperations.schedule();
+        this.#runtime.trash?.scheduleSweep();
     }
 
     async stopStoredIndex() {
         await this.#runtime.state.servicesStartPromise?.catch(() => {});
         await this.#runtime.state.trashOperations?.stop();
+        this.#runtime.trash?.stopSweep();
         await this.#runtime.state.storagePolicyService?.stop();
         this.#runtime.state.storagePolicyService = null;
         await this.#stopConnectorIndex();

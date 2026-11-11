@@ -165,6 +165,15 @@ export default class Objects {
         });
     }
 
+    // A file an outside writer placed can be on disk before the watcher has
+    // indexed it. Index it now, so a delete or rename of it is retained and
+    // logged like any other instead of answering not-found.
+    async #indexPhysical(backendName, backend, key) {
+        if (backend.config?.driver !== 'file' || typeof this.#runtime.state.stored.refreshObject !== 'function') return;
+        if (await this.#runtime.state.stored.stat(`${backendName}:${key}`)) return;
+        await this.#runtime.state.stored.refreshObject(backendName, key).catch(() => null);
+    }
+
     /** Delete only `backend:key`; last-location index removal follows workspace policy. */
     async removeObject(backendName, key, options = {}) {
         const { backend, root } = this.objectsBackend(backendName, { write: true });
@@ -172,6 +181,7 @@ export default class Objects {
         return this.#index.withKeyLock(backendName, normalized, async () => {
             const pre = await this.#resolveVersionPrecondition(backendName, normalized, options);
             if (pre.failure) return pre.failure;
+            await this.#indexPhysical(backendName, backend, normalized);
             const before = await this.#index.statObject(backendName, normalized);
             const coordinated = await this.#runtime.state.policyRemove?.({ backend: backendName, key: normalized });
             if (coordinated) return { ...coordinated, key: normalized, docId: before?.docId, version: before?.version };
@@ -311,6 +321,7 @@ export default class Objects {
                     return result;
                 } finally { release(); }
             }
+            await this.#indexPhysical(backendName, backend, fromKey);
             const pre = await this.#resolveVersionPrecondition(backendName, fromKey, options);
             if (pre.failure) return pre.failure;
             const result = await this.#runtime.state.stored.renameObject(backendName, fromKey, toKey, pre.options);

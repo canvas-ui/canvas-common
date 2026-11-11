@@ -1,7 +1,7 @@
 import path from 'path';
 import Stored from 'canvas-stored';
 import OperationMonitor from '../runtime/OperationMonitor.js';
-import { HOME_STORED_BACKEND, DATA_BLOB_BACKEND, NUDGE_THROTTLE_MS, RETENTION_DAYS } from './index/contracts.js';
+import { HOME_STORED_BACKEND, DATA_BLOB_BACKEND, NUDGE_THROTTLE_MS, TRASH_RETENTION_DAYS } from './index/contracts.js';
 import { createIndexState } from './index/state.js';
 import Transfers from './index/Transfers.js';
 import Objects from './index/Objects.js';
@@ -155,7 +155,7 @@ export class WorkspaceStoredIndex {
                 // overwrite/delete replaces on a path backend stay recoverable
                 // for this many days (0 = off). The primary's only versioning;
                 // longer history is the backup system's job.
-                retention: RETENTION_DAYS > 0 ? { days: RETENTION_DAYS } : null,
+                retention: { days: TRASH_RETENTION_DAYS },
             });
             opened = true;
 

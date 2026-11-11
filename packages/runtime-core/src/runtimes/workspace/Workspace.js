@@ -548,6 +548,10 @@ class Workspace extends EventEmitter {
     listTrash(...args) { return this.#runtime.operations.run('trash.listTrash', () => this.#runtime.trash.listTrash(...args)); }
     restoreFromTrash(...args) { return this.#runtime.operations.run('trash.restoreFromTrash', () => this.#runtime.trash.restoreFromTrash(...args)); }
     emptyTrash(...args) { return this.#runtime.operations.run('trash.emptyTrash', () => this.#runtime.trash.emptyTrash(...args)); }
+    listDeleted(...args) { return this.#runtime.operations.run('trash.listDeleted', () => this.#runtime.trash.listDeleted(...args)); }
+    restoreDeleted(...args) { return this.#runtime.operations.run('trash.restoreDeleted', () => this.#runtime.trash.restoreDeleted(...args)); }
+    discardDeleted(...args) { return this.#runtime.operations.run('trash.discardDeleted', () => this.#runtime.trash.discardDeleted(...args)); }
+    sweepDeleted(...args) { return this.#runtime.operations.run('trash.sweepExpired', () => this.#runtime.trash.sweepExpired(...args)); }
     listTimelines(...args) { return this.#runtime.operations.run('timelines.listTimelines', () => this.#runtime.timelines.listTimelines(...args)); }
     createTimeline(...args) { return this.#runtime.operations.run('timelines.createTimeline', () => this.#runtime.timelines.createTimeline(...args)); }
     hasTimeline(...args) { return this.#runtime.operations.run('timelines.hasTimeline', () => this.#runtime.timelines.hasTimeline(...args)); }

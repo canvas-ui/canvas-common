@@ -43,6 +43,101 @@ const locks = new Map();
 const cleanLocks = () => { const now = Date.now(); for (const [t, l] of locks) if (l.expires < now) locks.delete(t); };
 const XML_BODY_LIMIT = 1024 * 1024;
 
+// ── Home drive as keyed objects ─────────────────────────────────────────────
+// Home is the `workspace:home` file backend. Every mutation of a file there
+// goes through the workspace's keyed-object operations, the ones the REST
+// objects API and device mirrors use: bytes are staged and renamed into place,
+// what a write or delete displaces is retained in the backend Trash, and each
+// change is logged in the feed mirrors tail.
+
+const HOME_BACKEND = 'workspace:home';
+const HOME_UNAVAILABLE = new Set(['BACKEND_NOT_FOUND', 'BACKEND_DISABLED', 'INDEX_NOT_RUNNING']);
+const HOME_REASON_STATUS = {
+  'precondition-failed': 412, 'not-found': 404, 'target-exists': 412, 'invalid-key': 400, 'same-key': 403,
+  'read-only-target': 403, 'read-only-backend': 403, 'target-offline': 502, 'source-offline': 502,
+  'source-changed': 409, 'checksum-mismatch': 422,
+};
+
+const homeKey = (homePath, abs) => path.relative(homePath, abs).split(path.sep).join('/');
+
+// Keys the index excludes (dotfiles, client sidecars) are not objects: they
+// are never indexed, retained or mirrored, so plain filesystem calls serve them.
+const isExcludedKey = (err) => err?.code === 'KEY_EXCLUDED';
+
+function homeError(err) {
+  if (HOME_UNAVAILABLE.has(err?.code)) return Object.assign(new Error('Home is not available'), { statusCode: 502, cause: err });
+  return err;
+}
+
+function homeResult(result) {
+  if (result?.ok) return result;
+  throw Object.assign(new Error(`Home operation failed: ${result?.reason || 'unknown error'}`), {
+    statusCode: HOME_REASON_STATUS[result?.reason] || 500, reason: result?.reason,
+  });
+}
+
+const asSource = (body) => (body && typeof body.pipe === 'function' ? body : Buffer.isBuffer(body) ? body : Buffer.from(body || ''));
+
+async function writeStaged(abs, source) {
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+  const part = path.join(path.dirname(abs), `.${path.basename(abs)}.${crypto.randomUUID()}.dav-part`);
+  try {
+    if (Buffer.isBuffer(source)) await fs.writeFile(part, source);
+    else await pipeline(source, createWriteStream(part));
+    await fs.rename(part, abs);
+  } catch (err) {
+    await fs.rm(part, { force: true });
+    throw err;
+  }
+}
+
+async function homeWrite(workspace, homePath, abs, body) {
+  const source = asSource(body);
+  try {
+    return homeResult(await workspace.writeBackendObject('file', HOME_BACKEND, homeKey(homePath, abs), source));
+  } catch (err) {
+    if (!isExcludedKey(err)) {
+      if (typeof source.destroy === 'function') source.destroy();
+      throw homeError(err);
+    }
+    await writeStaged(abs, source);
+    return null;
+  }
+}
+
+/** Remove a file or a whole directory; false when nothing was there. */
+async function homeRemove(workspace, homePath, abs) {
+  let stat;
+  try { stat = await fs.lstat(abs); } catch { return false; }
+  const key = homeKey(homePath, abs);
+  try {
+    if (stat.isDirectory()) await workspace.deleteBackendFolder('file', HOME_BACKEND, key);
+    else homeResult(await workspace.removeBackendObject('file', HOME_BACKEND, key));
+  } catch (err) {
+    if (!isExcludedKey(err)) throw homeError(err);
+    await fs.rm(abs, { recursive: true, force: true });
+  }
+  return true;
+}
+
+/** Move a file or a directory to a free destination, identity intact. */
+async function homeMove(workspace, homePath, abs, destAbs, isDirectory) {
+  const from = homeKey(homePath, abs);
+  const to = homeKey(homePath, destAbs);
+  try {
+    if (isDirectory) await workspace.moveBackendFolder('file', HOME_BACKEND, from, to);
+    else homeResult(await workspace.renameBackendObject('file', HOME_BACKEND, from, to));
+  } catch (err) {
+    if (!isExcludedKey(err)) throw homeError(err);
+    if (isDirectory) return fs.rename(abs, destAbs);
+    // One end is an excluded name (an editor's dot-prefixed temp file renamed
+    // into place, or the reverse): the bytes are written at the destination
+    // and the source removed, each by the rule for its own name.
+    await homeWrite(workspace, homePath, destAbs, createReadStream(abs));
+    await homeRemove(workspace, homePath, abs);
+  }
+}
+
 // ── Virtual root directories ────────────────────────────────────────────────
 
 const ROOTS = [
@@ -69,9 +164,7 @@ export class WebDAVHandler {
     const resolved = await this._resolve(userId, workspaceName);
     if (!resolved) return send(res, 404, 'Workspace not found');
 
-    const homePath = typeof resolved === 'string' ? resolved : resolved.homePath;
-    const workspace = typeof resolved === 'string' ? null : (resolved.workspace || null);
-    const contextManager = typeof resolved === 'string' ? null : (resolved.contextManager || null);
+    const { homePath, workspace = null, contextManager = null } = resolved;
 
     const decoded = decodeURIComponent(url.split('?')[0]);
     const rel = decoded.startsWith(prefix) ? (decoded.slice(prefix.length) || '/') : '/';
@@ -86,7 +179,7 @@ export class WebDAVHandler {
         return await this._handleRoot(res, { method, prefix, headers, body, workspace });
       }
 
-      // ── Route: /Home/* → raw filesystem ─────────────────────────────
+      // ── Route: /Home/* → the workspace:home backend ─────────────────
       if (rel === '/Home' || rel.startsWith('/Home/')) {
         const homeRel = rel === '/Home' ? '/' : rel.slice('/Home'.length);
         return await this._handleHome(res, {
@@ -145,7 +238,7 @@ export class WebDAVHandler {
       const abs = path.resolve(homePath, '.' + vRel);
       const relative = path.relative(homePath, abs);
       if (relative.startsWith('..') || path.isAbsolute(relative)) return { error: { code: 403, message: 'Forbidden' } };
-      return { kind: 'home', abs, vRel };
+      return { kind: 'home', abs, vRel, homePath, workspace };
     }
 
     if (inRoot('Contexts')) {
@@ -232,7 +325,7 @@ export class WebDAVHandler {
     sendXml(res, 207, `<?xml version="1.0" encoding="utf-8"?>\n<D:multistatus xmlns:D="DAV:">\n${entries.join('\n')}\n</D:multistatus>`);
   }
 
-  // ── /Home — raw filesystem methods ────────────────────────────────────
+  // ── /Home — the workspace:home backend ────────────────────────────────
 
   async _handleHome(res, { method, prefix, mountPrefix, rel, homePath, headers, body, workspace, resolveTarget }) {
     const abs = path.resolve(homePath, '.' + rel);
@@ -362,27 +455,19 @@ export class WebDAVHandler {
     res.end();
   }
 
-  async _put({ res, abs, body }) {
-    let existed = true;
-    try { await fs.stat(abs); } catch { existed = false; }
+  async _put({ res, abs, homePath, body, workspace }) {
+    let stat = null;
+    try { stat = await fs.stat(abs); } catch { /* new file */ }
+    if (stat?.isDirectory()) return send(res, 405, 'A collection is here');
 
-    await fs.mkdir(path.dirname(abs), { recursive: true });
-
-    if (body && typeof body.pipe === 'function') {
-      await pipeline(body, createWriteStream(abs));
-    } else {
-      await fs.writeFile(abs, body || '');
-    }
-
-    send(res, existed ? 204 : 201);
+    await homeWrite(workspace, homePath, abs, body);
+    send(res, stat ? 204 : 201);
   }
 
-  async _delete({ res, abs }) {
-    try {
-      const stat = await fs.stat(abs);
-      await (stat.isDirectory() ? fs.rm(abs, { recursive: true }) : fs.unlink(abs));
-      send(res, 204);
-    } catch { send(res, 404, 'Not Found'); }
+  async _delete({ res, abs, homePath, workspace }) {
+    if (abs === path.resolve(homePath)) return send(res, 403, 'Home itself cannot be deleted');
+    const removed = await homeRemove(workspace, homePath, abs);
+    send(res, removed ? 204 : 404, removed ? undefined : 'Not Found');
   }
 
   async _mkcol({ res, abs }) {
@@ -411,7 +496,7 @@ export class WebDAVHandler {
     // two places where bytes genuinely move rather than a membership changing.
     if (!destRel && mountPrefix && destDecoded.startsWith(mountPrefix)) {
       return await this._ingestFromHome(res, {
-        abs, workspace, isMove,
+        abs, homePath, workspace, isMove,
         destRel: destDecoded.slice(mountPrefix.length) || '/',
         resolveTarget,
       });
@@ -424,23 +509,42 @@ export class WebDAVHandler {
     if (destRelative.startsWith('..') || path.isAbsolute(destRelative)) return send(res, 403, 'Forbidden');
     if (isHidden(destAbs)) return send(res, 403, 'Forbidden');
 
+    const home = path.resolve(homePath);
+    if (abs === home || destAbs === home) return send(res, 403, 'Forbidden');
+    if (destAbs === abs) return send(res, 403, 'Source and destination are the same');
+
+    let stat;
+    try { stat = await fs.stat(abs); }
+    catch { return send(res, 404, 'Not Found'); }
+
     const overwrite = (headers['overwrite'] || 'T').toUpperCase() === 'T';
-    let destExisted = true;
-    try { await fs.stat(destAbs); } catch { destExisted = false; }
+    let destStat = null;
+    try { destStat = await fs.stat(destAbs); } catch { /* free */ }
 
-    if (destExisted && !overwrite) return send(res, 412, 'Destination exists and Overwrite is F');
-    if (destExisted) await fs.rm(destAbs, { recursive: true });
+    if (destStat && !overwrite) return send(res, 412, 'Destination exists and Overwrite is F');
 
+    if (stat.isFile() && destStat?.isFile()) {
+      // File over file is a new version of the destination: its document
+      // keeps its placements and the displaced bytes are retained.
+      await homeWrite(workspace, homePath, destAbs, createReadStream(abs));
+      if (isMove) await homeRemove(workspace, homePath, abs);
+      return send(res, 204);
+    }
+
+    if (destStat) await homeRemove(workspace, homePath, destAbs);
     await fs.mkdir(path.dirname(destAbs), { recursive: true });
 
     if (isMove) {
-      await fs.rename(abs, destAbs);
+      await homeMove(workspace, homePath, abs, destAbs, stat.isDirectory());
+    } else if (stat.isDirectory()) {
+      // A directory copy lands on a path that is free by now, so it cannot
+      // displace bytes; the backend watcher indexes the new files.
+      await fs.cp(abs, destAbs, { recursive: true });
     } else {
-      const stat = await fs.stat(abs);
-      await (stat.isDirectory() ? fs.cp(abs, destAbs, { recursive: true }) : fs.copyFile(abs, destAbs));
+      await homeWrite(workspace, homePath, destAbs, createReadStream(abs));
     }
 
-    send(res, destExisted ? 204 : 201);
+    send(res, destStat ? 204 : 201);
   }
 
   /**
@@ -448,7 +552,7 @@ export class WebDAVHandler {
    * store (content-addressed, so re-ingesting the same file resolves to the
    * same document) and filed at the destination path as a File document.
    */
-  async _ingestFromHome(res, { abs, workspace, destRel, isMove, resolveTarget }) {
+  async _ingestFromHome(res, { abs, homePath, workspace, destRel, isMove, resolveTarget }) {
     const target = typeof resolveTarget === 'function' ? await resolveTarget(destRel) : null;
     if (!target || target.error || target.kind === 'home') return send(res, 502, 'Destination not in an index-backed tree');
     if (typeof target.vfs?.putFile !== 'function') return send(res, 403, 'This virtual tree cannot receive files');
@@ -460,29 +564,22 @@ export class WebDAVHandler {
 
     const blob = await workspace.persistBlob(createReadStream(abs));
     await target.vfs.putFile(target.vRel, blob);
-    if (isMove) { await fs.rm(abs, { force: true }); }
+    if (isMove) await homeRemove(workspace, homePath, abs);
     send(res, 201);
   }
 
   /**
    * Trees/Contexts → Home. The document's content is written into the home
-   * drive as a real file. On MOVE the document is then unfiled with the normal
-   * mount rule, so if that was its last placement it lands in the trash and
-   * stays recoverable — and if the home backend indexes the new file, content
-   * addressing resolves it back to the same document, which un-trashes it.
+   * drive as a keyed object. Content addressing resolves that file to the same
+   * document, which thereby gains a location and a place under the home
+   * backend. On MOVE the document is then unfiled from the source path.
    */
   async _materializeToHome(res, { vfs, vRel, target, isMove, doc }) {
     const content = await vfs.getContent(vRel);
     if (!content) return send(res, 404, 'Source not found');
+    if (!content.stream && !content.buffer) return send(res, 500);
 
-    await fs.mkdir(path.dirname(target.abs), { recursive: true });
-    if (content.stream) {
-      await pipeline(content.stream, createWriteStream(target.abs));
-    } else if (content.buffer) {
-      await fs.writeFile(target.abs, content.buffer);
-    } else {
-      return send(res, 500);
-    }
+    await homeWrite(target.workspace, target.homePath, target.abs, content.stream || content.buffer);
 
     if (isMove && doc && typeof vfs.unlinkDoc === 'function') {
       await vfs.unlinkDoc(vRel, doc, { trashIfOrphaned: true });
@@ -517,7 +614,13 @@ export class WebDAVHandler {
 
     let created = false;
     try { await fs.stat(abs); }
-    catch { await fs.mkdir(path.dirname(abs), { recursive: true }); await fs.writeFile(abs, ''); created = true; }
+    catch {
+      // The placeholder a lock-null resource needs. Create-only, so it can
+      // never replace bytes; the PUT that follows is the first real version.
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      await fs.writeFile(abs, '', { flag: 'wx' }).catch((err) => { if (err.code !== 'EEXIST') throw err; });
+      created = true;
+    }
 
     sendXml(res, created ? 201 : 200, lockXml(lock, prefix, rel), { 'Lock-Token': `<${token}>` });
   }
