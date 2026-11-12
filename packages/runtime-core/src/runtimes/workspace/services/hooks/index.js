@@ -8,11 +8,12 @@ import { WORKSPACE_DIRECTORIES } from '../../config/constants.js';
 import { pathToFileURL } from 'url';
 import { createLogger } from '../../../../utils/log.js';
 import { classifyDocument } from '../../db/classifier.js';
-import { resolveRuleFiles, loadRuleFile, matchRule, executeRuleActions, resolveRuleMatch } from './rules.js';
+import { resolveRuleFiles, loadRuleFile, matchRule, ruleListensTo, executeRuleActions, resolveRuleMatch } from './rules.js';
 import { buildHookAgentPrompt } from './agent-prompt.js';
 import { resolveHookFiles, statFile } from './files.js';
 import HookRunLog, { buildReplayEnvelope, createRunTrace } from './run-log.js';
 import PendingActionStore, { applyAmendments } from './pending-actions.js';
+import { matchingAttachments } from './attachments.js';
 
 const logger = createLogger('hook-service');
 
@@ -42,6 +43,7 @@ class HookService extends EventEmitter {
     #debounce = new Map(); // key -> { timer, payloads }
     #runLog = null;
     #pending = null;
+    #bulkDecision = null;
     #paused = false;
     #inflight = new Set();
     #backfillJobs = null;
@@ -164,9 +166,10 @@ class HookService extends EventEmitter {
         }
         const automated = isAutomatedOrigin(payload?.origin);
 
+        const handlers = this.#handlersFor(workspace, eventName);
         const promises = [];
-        promises.push(this.#runWorkspaceHook(workspace, eventName, payload, automated));
-        promises.push(this.#runWorkspaceRules(workspace, eventName, payload, automated));
+        promises.push(this.#runWorkspaceHook(workspace, eventName, payload, automated, handlers));
+        promises.push(this.#runWorkspaceRules(workspace, eventName, payload, automated, handlers));
 
         // Batch fan-out: batch events additionally re-dispatch as per-document
         // singular events (full document loaded, batch:true stamped), so plain
@@ -196,6 +199,7 @@ class HookService extends EventEmitter {
     static #BATCH_FANOUT = {
         'document.inserted.batch': 'document.inserted',
         'document.updated.batch': 'document.updated',
+        'document.moved.batch': 'document.moved',
         // Bulk link/unlink. Without these a rule bound to document.linked
         // (the seeded photos-to-home rule, for one) fired when you filed ONE
         // document and silently never when you multi-selected — the batch
@@ -336,6 +340,8 @@ class HookService extends EventEmitter {
      * rule engine (`approval: true`) and exposed to JS hooks as ctx.propose().
      * The triggering payload's provenance is stored so approval executes with
      * the exact automation chain direct execution would have carried.
+     * A proposal already waiting for the same handler, document and actions
+     * is returned as it is, with no second record and no event.
      * @returns {Object|null} the pending record (null when the store is down)
      */
     async proposePending(spec = {}) {
@@ -344,7 +350,7 @@ class HookService extends EventEmitter {
         if (!store) { return null; }
         const payload = spec.payload || {};
         const ttlMs = HookService.#parseTtl(spec.ttl);
-        const record = store.propose({
+        const { record, existing } = await store.proposeOnce({
             handlerType: spec.handlerType || 'hook',
             handler: spec.handler || '?',
             event: spec.event || null,
@@ -362,7 +368,7 @@ class HookService extends EventEmitter {
             editable: Array.isArray(spec.editable) ? spec.editable : [],
             ...(ttlMs > 0 ? { expiresAt: new Date(Date.now() + ttlMs).toISOString() } : {}),
         });
-        if (!record) { return null; }
+        if (!record || existing) { return record; }
 
         this.runLog?.append({
             ...this.#baseRecord(spec.event, payload, spec.trigger || 'event'),
@@ -384,8 +390,25 @@ class HookService extends EventEmitter {
         return record;
     }
 
-    async #proposeFromRule(workspace, rule, eventName, payload, heldActions, trigger = 'event') {
+    // False when approving the action could only report that it had nothing to
+    // do. Only a loaded document can tell, a stub passes.
+    static #wouldAct(action, document) {
+        if (action?.action !== 'extractAttachments' || !document?.data || !classifyDocument(document).isEmail()) { return true; }
+        try { return matchingAttachments(document, action).length > 0; }
+        catch { return true; }
+    }
+
+    async #proposeFromRule(workspace, rule, eventName, payload, held, trigger = 'event') {
         const doc = payload?.document || null;
+        const heldActions = held.filter((action) => HookService.#wouldAct(action, doc));
+        if (!heldActions.length) {
+            this.runLog?.append({
+                ...this.#baseRecord(eventName, payload, trigger),
+                handlerType: 'rule', handler: rule.id || '?',
+                durationMs: 0, status: 'skipped', skipReason: 'No matching attachments',
+            });
+            return null;
+        }
         return this.proposePending({
             handlerType: 'rule',
             handler: rule.id || '?',
@@ -418,10 +441,18 @@ class HookService extends EventEmitter {
         if (!store) { throw new Error('Pending-action store unavailable'); }
         const record = await store.get(actionId);
         if (!record) { throw new Error(`Pending action ${actionId} not found`); }
+        return this.#decide(record, { decision, amend, decidedBy });
+    }
+
+    async #decide(record, { decision, amend = null, decidedBy = null }) {
+        const workspace = this.#workspace;
+        const store = this.pending;
+        const actionId = record.actionId;
 
         if (decision === 'decline') {
             if (record.status !== 'pending') { throw new Error(`Action ${actionId} is ${record.status}, not pending`); }
             const next = store.supersede(record, { status: 'declined', decidedAt: new Date().toISOString(), decidedBy });
+            if (!next) { throw new Error(`The decision for ${actionId} could not be recorded`); }
             workspace.emit('action.declined', { workspaceId: workspace.id, actionId, origin: 'user', depth: 0 });
             return next;
         }
@@ -476,10 +507,79 @@ class HookService extends EventEmitter {
         const next = store.supersede(amended, {
             status, decidedAt: new Date().toISOString(), decidedBy, result: actions,
         });
+        if (!next) { throw new Error(`Action ${actionId} ran, but its decision could not be recorded`); }
         workspace.emit(status === 'approved' ? 'action.approved' : 'action.failed', {
             workspaceId: workspace.id, actionId, origin: 'user', depth: 0,
         });
         return next;
+    }
+
+    /** The bulk decision that is running or ran last, or null. */
+    get bulkDecision() { return this.#bulkDecision; }
+
+    /**
+     * Decide every pending action at once, in the background. `approve` runs
+     * them one after another like single approvals. `decline` discards them;
+     * with `nothingToDo` it discards only the ones whose approval could not
+     * act: the document is gone, or no action has anything to work on.
+     * @returns {Object} the progress record, also on `bulkDecision`
+     */
+    startBulkDecision({ decision, handler = null, nothingToDo = false, decidedBy = null } = {}) {
+        if (decision !== 'approve' && decision !== 'decline') { throw new Error(`Unknown decision "${decision}"`); }
+        if (nothingToDo && decision !== 'decline') { throw new Error('Only a decline can be limited to actions with nothing to do'); }
+        if (!this.pending) { throw new Error('Pending-action store unavailable'); }
+        if (this.#bulkDecision?.state === 'running') {
+            throw Object.assign(new Error('A bulk decision is already running'), { statusCode: 409 });
+        }
+        const progress = {
+            decision, handler, nothingToDo, state: 'running', startedAt: new Date().toISOString(),
+            total: 0, decided: 0, failed: 0, kept: 0,
+        };
+        this.#bulkDecision = progress;
+        this.#runBulkDecision(progress, decidedBy).catch((err) => {
+            logger.error(`Bulk ${decision} of pending actions failed: ${err.message}`);
+            progress.error = err.message;
+        }).finally(() => {
+            progress.state = progress.error ? 'failed' : 'done';
+            progress.finishedAt = new Date().toISOString();
+            // Single approvals announce themselves; declines are announced once.
+            if (decision === 'decline') {
+                this.#workspace.emit('action.declined', { workspaceId: this.#workspace.id, origin: 'user', depth: 0 });
+            }
+        });
+        return progress;
+    }
+
+    async #runBulkDecision(progress, decidedBy) {
+        const store = this.pending;
+        const records = await store.matching({ status: 'pending', ...(progress.handler ? { handler: progress.handler } : {}) });
+        progress.total = records.length;
+        for (const record of records) {
+            if (progress.nothingToDo && await this.#couldAct(record)) { progress.kept++; continue; }
+            if (progress.decision === 'decline') {
+                if (store.supersede(record, { status: 'declined', decidedAt: new Date().toISOString(), decidedBy })) { progress.decided++; }
+                else { progress.failed++; }
+                // Yield so a long queue does not hold up requests.
+                if ((progress.decided + progress.failed) % 200 === 0) { await new Promise((resolve) => setImmediate(resolve)); }
+                continue;
+            }
+            try {
+                const next = await this.#decide(record, { decision: 'approve', decidedBy });
+                if (next.status === 'approved') { progress.decided++; } else { progress.failed++; }
+            } catch (err) {
+                logger.warn(`Bulk approve of ${record.actionId} failed: ${err.message}`);
+                progress.failed++;
+            }
+        }
+    }
+
+    // Whether approving the record could do anything.
+    async #couldAct(record) {
+        const payload = record.envelope?.payload || {};
+        const documentId = payload.document?.id ?? payload.id ?? null;
+        if (documentId == null) { return true; }
+        const document = await this.#workspace.get(documentId).catch(() => null);
+        return Boolean(document) && record.actions.some((action) => HookService.#wouldAct(action, document));
     }
 
     // Shared record skeleton for one handler execution.
@@ -507,6 +607,11 @@ class HookService extends EventEmitter {
         // enumerate up front. Same shape as buildReplayEnvelope.
         const { ids, count, documents: _documents, ...inherited } = batchPayload;
 
+        // The hook files and rules are read once for the batch, and no
+        // document is loaded when nothing listens for the event.
+        const handlers = this.#handlersFor(workspace, eventName);
+        if (!handlers.listening) { return; }
+
         for (const id of ids) {
             if (workspace.isRemovalHeld?.(id)) continue;
             let document = null;
@@ -525,15 +630,23 @@ class HookService extends EventEmitter {
                 batchCount: count ?? ids.length,
             };
             await Promise.allSettled([
-                this.#runWorkspaceHook(workspace, eventName, payload, automated),
-                this.#runWorkspaceRules(workspace, eventName, payload, automated),
+                this.#runWorkspaceHook(workspace, eventName, payload, automated, handlers),
+                this.#runWorkspaceRules(workspace, eventName, payload, automated, handlers),
             ]);
         }
     }
 
-    async #runWorkspaceHook(workspace, eventName, payload, automated = false) {
+    // What the hooks folder holds for an event right now: the JS handlers,
+    // the rule files with their rules, and whether any of them would run.
+    #handlersFor(workspace, eventName) {
         const hooksRoot = workspace.hooksPath || path.join(workspace.rootPath, 'hooks');
         const hookFiles = resolveHookFiles(hooksRoot, eventName);
+        const rulesByFile = resolveRuleFiles(hooksRoot).map((filePath) => [filePath, loadRuleFile(filePath, this.#ruleFileCache, logger, workspace)]);
+        const listening = hookFiles.length > 0 || rulesByFile.some(([, rules]) => rules.some((rule) => ruleListensTo(rule, eventName)));
+        return { hookFiles, rulesByFile, listening };
+    }
+
+    async #runWorkspaceHook(workspace, eventName, payload, automated, { hookFiles }) {
         if (hookFiles.length === 0) { return; }
 
         await Promise.allSettled(
@@ -600,11 +713,8 @@ class HookService extends EventEmitter {
         return next;
     }
 
-    async #runWorkspaceRules(workspace, eventName, payload, automated = false) {
-        const hooksRoot = workspace.hooksPath || path.join(workspace.rootPath, 'hooks');
-        const ruleFiles = resolveRuleFiles(hooksRoot);
-        if (ruleFiles.length === 0) { return; }
-        const rulesByFile = ruleFiles.map((filePath) => [filePath, loadRuleFile(filePath, this.#ruleFileCache, logger, workspace)]);
+    async #runWorkspaceRules(workspace, eventName, payload, automated, { rulesByFile }) {
+        if (!rulesByFile.some(([, rules]) => rules.some((rule) => ruleListensTo(rule, eventName)))) { return; }
         // A `path` condition asks where the document IS FILED, which is a
         // property of the document — but only events that carry a context /
         // directory selector (insert, link) put paths on the payload. Without
@@ -640,7 +750,10 @@ class HookService extends EventEmitter {
                 // (reviewed in the UI) instead of executing; the rest run now.
                 const { held, immediate } = HookService.#splitApproval(rule);
                 if (held.length) {
-                    await this.#proposeFromRule(workspace, rule, eventName, payload, held);
+                    // The matcher's document decides whether there is anything
+                    // to review; the stored event stays the one that arrived.
+                    const reviewed = enriched?.document ? { ...payload, document: enriched.document } : payload;
+                    await this.#proposeFromRule(workspace, rule, eventName, reviewed, held);
                 }
                 if (!immediate.length) { continue; }
                 // Built from the ENRICHED payload: an action reading

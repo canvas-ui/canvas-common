@@ -18,8 +18,8 @@ import crypto from 'crypto';
  * same append-only JSONL discipline as run-log.js. Records are immutable;
  * a status transition appends a superseding FULL record with the same
  * `actionId`, and reads resolve last-write-wins per actionId. This keeps the
- * file crash-safe and makes rotation harmless (every record is
- * self-contained).
+ * file crash-safe. Rotation drops the older file's decided records only: a
+ * proposal still waiting there is copied into the new live file first.
  *
  * Record shape (one line):
  *   { actionId, ts, status: 'pending'|'approved'|'declined'|'failed'|'expired',
@@ -47,11 +47,22 @@ function effectiveStatus(record, now = Date.now()) {
     return record.status;
 }
 
+// Two proposals are the same when one handler holds the same actions for the
+// same document. Proposals without a document are never the same.
+function proposalKey(record) {
+    const documentId = record.envelope?.payload?.document?.id ?? record.envelope?.payload?.id;
+    if (documentId == null) { return null; }
+    return `${record.handlerType}|${record.handler}|${documentId}|${JSON.stringify(record.actions)}`;
+}
+
 class PendingActionStore {
     #file;
     #dir;
     #maxBytes;
     #size = null;
+    #carried = 0;
+    // Open proposals by proposalKey, loaded from the log on first use.
+    #open = null;
 
     // Takes the ALREADY-RESOLVED dir (workspace.varHooksPath), not the
     // workspace root: joining the `full` layout's constant onto the root put
@@ -83,13 +94,49 @@ class PendingActionStore {
     }
 
     /**
+     * Append a new proposal unless the same one is already waiting for
+     * review. A rule can match several events for one document (insert, then
+     * every update of a mail sync); the reviewer decides once.
+     * @returns {Promise<{record: Object|null, existing: boolean}>}
+     */
+    async proposeOnce(record) {
+        const open = await this.#openProposals();
+        const key = proposalKey(record);
+        const known = key ? open.get(key) : null;
+        if (known && !(known.expiresAt && Date.parse(known.expiresAt) < Date.now())) {
+            return { record: await this.get(known.actionId), existing: true };
+        }
+        const full = this.propose(record);
+        if (full && key) { open.set(key, { actionId: full.actionId, expiresAt: full.expiresAt }); }
+        return { record: full, existing: false };
+    }
+
+    async #openProposals() {
+        if (!this.#open) {
+            const open = new Map();
+            for (const record of (await this.#latest()).values()) {
+                const key = record.status === 'pending' ? proposalKey(record) : null;
+                if (key && !open.has(key)) { open.set(key, { actionId: record.actionId, expiresAt: record.expiresAt }); }
+            }
+            this.#open ??= open;
+        }
+        return this.#open;
+    }
+
+    /**
      * Append a superseding record for a status transition. The caller passes
      * the CURRENT record (from get()) plus the fields that change.
      * @returns {Object|null} the superseding record, or null on write failure
      */
     supersede(record, changes) {
         const full = { ...record, ...changes, ts: new Date().toISOString() };
-        return this.#append(full) ? full : null;
+        if (!this.#append(full)) { return null; }
+        if (this.#open && full.status !== 'pending') {
+            for (const [key, known] of this.#open) {
+                if (known.actionId === full.actionId) { this.#open.delete(key); }
+            }
+        }
+        return full;
     }
 
     #append(full) {
@@ -111,9 +158,33 @@ class PendingActionStore {
             try { this.#size = fs.statSync(this.#file).size; }
             catch { this.#size = 0; }
         }
-        if (this.#size + incomingBytes <= this.#maxBytes) { return; }
+        // Carried proposals do not count: a queue larger than the limit must
+        // not rotate on every append.
+        if (this.#size - this.#carried + incomingBytes <= this.#maxBytes) { return; }
+        const waiting = this.#waitingInOlderFile();
         try { fs.renameSync(this.#file, `${this.#file}.1`); } catch { /* live file may be absent */ }
-        this.#size = 0;
+        fs.writeFileSync(this.#file, waiting, 'utf8');
+        this.#size = this.#carried = waiting.length;
+    }
+
+    // Lines of the older file whose proposal is still undecided and unexpired.
+    // The older file is about to be replaced, and they exist nowhere else.
+    #waitingInOlderFile() {
+        const read = (file) => {
+            try { return fs.readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()); }
+            catch { return []; }
+        };
+        const parse = (line) => { try { return JSON.parse(line); } catch { return null; } };
+        const inLive = new Set(read(this.#file).map((line) => parse(line)?.actionId));
+        const seen = new Set();
+        const waiting = [];
+        for (const line of read(`${this.#file}.1`).reverse()) {
+            const record = parse(line);
+            if (!record?.actionId || seen.has(record.actionId)) { continue; }
+            seen.add(record.actionId);
+            if (!inLive.has(record.actionId) && effectiveStatus(record) === 'pending') { waiting.push(line); }
+        }
+        return waiting.reverse().map((line) => `${line}\n`).join('');
     }
 
     /**
@@ -126,10 +197,36 @@ class PendingActionStore {
      * @param {number} opts.limit - max records (default 100, cap 500)
      * @returns {Promise<Object[]>}
      */
-    async query({ status, handler, limit = 100 } = {}) {
-        const max = Math.min(Math.max(1, Number(limit) || 100), 500);
-        const byId = new Map(); // actionId -> newest record (walk is newest-first)
+    async query(opts = {}) {
+        return (await this.page(opts)).actions;
+    }
 
+    /**
+     * One page of query() plus how many records match the filter in all.
+     * @returns {Promise<{actions: Object[], total: number}>}
+     */
+    async page({ status, handler, limit = 100 } = {}) {
+        const max = Math.min(Math.max(1, Number(limit) || 100), 500);
+        const matches = await this.matching({ status, handler });
+        return { actions: matches.slice(0, max), total: matches.length };
+    }
+
+    /** Every record that matches the filter, newest proposal first. */
+    async matching({ status, handler } = {}) {
+        const now = Date.now();
+        const matches = [];
+        for (const record of (await this.#latest()).values()) {
+            const effective = effectiveStatus(record, now);
+            if (status && effective !== status) { continue; }
+            if (handler && !(record.handler === handler || String(record.handler || '').includes(handler))) { continue; }
+            matches.push({ ...record, status: effective });
+        }
+        return matches;
+    }
+
+    // actionId -> newest record, newest proposal first.
+    async #latest() {
+        const byId = new Map();
         for (const file of [this.#file, `${this.#file}.1`]) {
             let content;
             try { content = await fs.promises.readFile(file, 'utf8'); }
@@ -145,17 +242,7 @@ class PendingActionStore {
                 byId.set(record.actionId, record);
             }
         }
-
-        const now = Date.now();
-        const out = [];
-        for (const record of byId.values()) {
-            const view = { ...record, status: effectiveStatus(record, now) };
-            if (status && view.status !== status) { continue; }
-            if (handler && !(view.handler === handler || String(view.handler || '').includes(handler))) { continue; }
-            out.push(view);
-            if (out.length >= max) { break; }
-        }
-        return out;
+        return byId;
     }
 
     /** Current state of one action (last-write-wins), or null. */
@@ -178,12 +265,6 @@ class PendingActionStore {
             }
         }
         return null;
-    }
-
-    /** Count of actionable (pending, unexpired) proposals — the UI badge. */
-    async pendingCount() {
-        const pending = await this.query({ status: 'pending', limit: 500 });
-        return pending.length;
     }
 }
 

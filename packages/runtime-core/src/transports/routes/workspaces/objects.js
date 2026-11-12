@@ -22,7 +22,8 @@ import { env } from '../../../env.js';
  * document and its row version (X-Canvas-Doc-Id / X-Canvas-Version on
  * HEAD/GET, `docId` + `version` on every mutation result) — that form also
  * catches same-content re-saves and rename-then-edit.
- *   POST   /:driver/:address/objects/rename                { from, to, ifMatch }
+ *   POST   /:driver/:address/objects/rename                { from, to, ifMatch }, or a directory
+ *                                                          { from, to, directory, operationId }: `202` while it runs
  *   GET    /:driver/:address/retained?key&limit             displaced versions kept for the retention window
  *   POST   /:driver/:address/retained/:sha256/restore      { key, ifMatch? } put a retained version back
  *
@@ -47,6 +48,14 @@ const REASON_STATUS = {
     'source-offline': [503, 'BACKEND_OFFLINE'],
     'source-not-removable': [403, 'BACKEND_READ_ONLY'],
 };
+
+// A directory rename answers `202` when it runs longer than this. The caller
+// repeats the request with the same operationId to wait for the result.
+const DIRECTORY_RENAME_WAIT_MS = 15_000;
+// A finished directory rename stays joinable this long.
+const DIRECTORY_RENAME_KEEP_MS = 5 * 60_000;
+// Directory renames by workspace, backend and operationId.
+const directoryRenames = new Map();
 
 const arg = (v) => decodeURIComponent(String(v || ''));
 // 'fs' is a UX alias for the local-folder driver; canonical name is 'file'.
@@ -102,7 +111,7 @@ function sendError(request, reply, error) {
     return send(reply, new ResponseObject().error(error?.message || 'Internal error', null, statusCode), error?.code || undefined);
 }
 
-async function readRoutes(fastify) {
+async function readRoutes(fastify, { directoryRenameWaitMs = DIRECTORY_RENAME_WAIT_MS } = {}) {
     // Listing — key order, paged by cursor.
     fastify.get('/:driver/:address/objects', {
         onRequest: [fastify.authenticate, requireWorkspaceRead()],
@@ -328,11 +337,35 @@ async function readRoutes(fastify) {
     }, async (request, reply) => {
         try {
             const { from, to, ifMatch, origin, directory, operationId } = request.body;
-            const result = await request.workspace.renameBackendObject(drv(request.params.driver), arg(request.params.address), from, to, {
+            const rename = () => request.workspace.renameBackendObject(drv(request.params.driver), arg(request.params.address), from, to, {
                 ifMatch: shortString(ifMatch),
                 ...(directory === true ? { directory, operationId } : {}),
                 origin: shortString(origin, 128) ?? shortString(request.headers['x-canvas-origin'], 128),
             });
+            let result;
+            if (directory === true) {
+                const id = JSON.stringify([request.workspace.id, drv(request.params.driver), arg(request.params.address), operationId]);
+                let entry = directoryRenames.get(id);
+                if (entry && (entry.from !== from || entry.to !== to)) return sendFailure(reply, { ok: false, reason: 'invalid-key' });
+                if (!entry) {
+                    entry = { from, to, task: rename() };
+                    directoryRenames.set(id, entry);
+                    const forget = () => setTimeout(() => directoryRenames.delete(id), DIRECTORY_RENAME_KEEP_MS).unref();
+                    entry.task.then(forget, forget);
+                }
+                let timer;
+                const running = Symbol('running');
+                const outcome = await Promise.race([
+                    entry.task,
+                    new Promise((resolve) => { timer = setTimeout(resolve, directoryRenameWaitMs, running); }),
+                ]).finally(() => clearTimeout(timer));
+                if (outcome === running) {
+                    return send(reply, new ResponseObject().success({ from, to, directory: true, state: 'running', operationId }, 'Directory rename running', 202));
+                }
+                result = outcome;
+            } else {
+                result = await rename();
+            }
             if (!result?.ok) return sendFailure(reply, result);
             return send(reply, new ResponseObject().updated({
                 from: result.from, to: result.to, sha256: result.sha256, seq: result.seq, docId: result.docId ?? null, version: result.version ?? null, state: result.state, directory: result.directory,
@@ -428,7 +461,7 @@ async function byteRoutes(fastify) {
     });
 }
 
-export default async function workspaceObjectRoutes(fastify) {
-    fastify.register(readRoutes);
+export default async function workspaceObjectRoutes(fastify, options) {
+    fastify.register(readRoutes, { directoryRenameWaitMs: options?.directoryRenameWaitMs });
     fastify.register(byteRoutes);
 }

@@ -222,6 +222,14 @@ export function explainRule(rule, eventName, c) {
     return { matched: enabled && checks.length > 0 && checks.every((chk) => chk.matched), enabled, checks };
 }
 
+/** True when an enabled rule names this event; needs no document. */
+export function ruleListensTo(rule, eventName) {
+    if (rule.enabled === false) { return false; }
+    const when = rule.when;
+    if (!when || typeof when !== 'object') { return false; }
+    return WHEN_CHECKS.event(null, when.event, eventName);
+}
+
 /**
  * @param {Object} rule
  * @param {string} eventName
@@ -229,11 +237,8 @@ export function explainRule(rule, eventName, c) {
  * @returns {boolean}
  */
 export function matchRule(rule, eventName, c) {
-    if (rule.enabled === false) { return false; }
+    if (!ruleListensTo(rule, eventName)) { return false; }
     const when = rule.when;
-    if (!when || typeof when !== 'object') { return false; }
-
-    if (!WHEN_CHECKS.event(c, when.event, eventName)) { return false; }
     for (const key of ['reason', 'schema', 'path', 'pathExact', 'eventPathExact', 'url', 'from', 'to', 'subject', 'body', 'sender', 'thread', 'channel', 'platform', 'mime', 'filename', 'attachment']) {
         if (when[key] !== undefined && !WHEN_CHECKS[key](c, when[key])) { return false; }
     }

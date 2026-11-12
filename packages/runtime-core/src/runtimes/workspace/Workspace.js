@@ -296,8 +296,14 @@ class Workspace extends EventEmitter {
             // Expire abandoned resumable uploads; finish writes a stop interrupted.
             this.uploads.sweep().catch((err) => this.#runtime.state.logger.warn({ workspaceId: this.id, error: err.message }, 'Upload sweep failed'));
             if (this.isServiceEnabled('webdav') || Object.values(this.dataBackends).some(cfg => cfg?.enabled && cfg.supported !== false)) {
-                await this.#runtime.operations.run('start.services', () => this.#runtime.integrations.startStoredIndex());
-                for (const [name, cfg] of Object.entries(this.dataBackends)) {
+                // The workspace's own database is open, so the workspace starts.
+                // Storage that cannot be opened is reported and stays off; a
+                // storage request tries to open it again and answers with the cause.
+                const storage = await this.#runtime.operations.run('start.services', () => this.#runtime.integrations.startStoredIndex()).then(() => true, (err) => {
+                    this.#runtime.state.logger.error({ workspaceId: this.id, stage: 'storage.start', err, databasePath: err.databasePath }, 'Workspace started without storage');
+                    return false;
+                });
+                for (const [name, cfg] of storage ? Object.entries(this.dataBackends) : []) {
                     if (!cfg?.enabled || !cfg.resync || cfg.supported === false || !(cfg.scanOnStart ?? (cfg.driver === 'file'))) continue;
                     // Reconcile files changed while the workspace was stopped.
                     // Keep startup responsive; cached checksums make unchanged

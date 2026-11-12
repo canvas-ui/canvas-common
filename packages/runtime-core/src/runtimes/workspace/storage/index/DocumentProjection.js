@@ -7,9 +7,14 @@ import { pickGeo } from '../../db/geo.js';
 import { BACKENDS_TREE_NAME } from '../../../../utils/backend-documents.js';
 import { CHECKSUM_PRIORITY, ORPHANED_FEATURE, objectsError } from './contracts.js';
 
+// Documents per database transaction when location changes are applied in bulk.
+const LOCATION_CHANGE_BATCH = 200;
+
 export default class DocumentProjection {
     #index;
     #runtime;
+    // Location changes held back by collectLocationChanges(): { payload, resolve, reject }.
+    #collected = null;
     constructor(index, runtime) { this.#index = index; this.#runtime = runtime; }
 
 
@@ -387,11 +392,49 @@ export default class DocumentProjection {
      * object no longer has.
      */
     async applyLocationChange(payload = {}) {
-        return this.mutateDocuments(async () => {
-            const docId = await this.#upsertDocumentNow(payload);
-            if (docId) return docId;
-            return this.#patchDocumentLocations(payload);
-        });
+        if (this.#collected) {
+            return new Promise((resolve, reject) => { this.#collected.push({ payload, resolve, reject }); });
+        }
+        return this.mutateDocuments(() => this.#applyLocationChangeNow(payload));
+    }
+
+    async #applyLocationChangeNow(payload) {
+        const docId = await this.#upsertDocumentNow(payload);
+        if (docId) return docId;
+        return this.#patchDocumentLocations(payload);
+    }
+
+    /**
+     * Run `operation` inside a document mutation and apply the location
+     * changes Stored reports meanwhile as a few database transactions instead
+     * of one per file. A folder move reports every file under it; applied one
+     * by one each is its own commit. Each caller of applyLocationChange()
+     * still gets its own result. A batch that fails is applied again file by
+     * file, so one bad file is reported for itself and the rest still land.
+     */
+    async collectLocationChanges(operation) {
+        const collected = this.#collected = [];
+        try {
+            return await operation();
+        } finally {
+            this.#collected = null;
+            const db = this.#runtime.state.getDb();
+            for (let start = 0; start < collected.length; start += LOCATION_CHANGE_BATCH) {
+                const batch = collected.slice(start, start + LOCATION_CHANGE_BATCH);
+                let results = null;
+                if (batch.length > 1 && typeof db.batch === 'function') {
+                    results = await db.batch(async () => {
+                        const ids = [];
+                        for (const { payload } of batch) ids.push(await this.#applyLocationChangeNow(payload));
+                        return ids;
+                    }).catch(() => null);
+                }
+                for (let i = 0; i < batch.length; i++) {
+                    if (results) { batch[i].resolve(results[i]); continue; }
+                    await this.#applyLocationChangeNow(batch[i].payload).then(batch[i].resolve, batch[i].reject);
+                }
+            }
+        }
     }
 
     async #patchDocumentLocations(payload = {}) {
@@ -469,14 +512,23 @@ export default class DocumentProjection {
         const active = availableLocations(doc);
         const remaining = active.filter(l => !removed.has(l.url));
         if (remaining.length === active.length) return doc.id;
-        const locations = (doc.locations || []).map(l => removed.has(l.url) && isAvailableLocation(l)
-            ? { ...l, status: options.status || (options.manualRemoval ? 'deleted' : 'not-found'), statusChangedAt: new Date().toISOString() } : l);
+        const status = options.status || (options.manualRemoval ? 'deleted' : 'not-found');
+        // An address that went missing while the same backend still holds the
+        // bytes at another address is a move nobody witnessed: the address is
+        // dropped and nothing is reported as a lost source.
+        const backendOf = l => this.#runtime.transfers.locationEndpoint(l)?.backend ?? null;
+        const holding = new Set(remaining.map(backendOf).filter(Boolean));
+        const relocated = new Set(status === 'not-found'
+            ? active.filter(l => removed.has(l.url) && holding.has(backendOf(l))).map(l => l.url) : []);
+        const locations = (doc.locations || []).filter(l => !relocated.has(l.url)).map(l => removed.has(l.url) && isAvailableLocation(l)
+            ? { ...l, status, statusChangedAt: new Date().toISOString() } : l);
         const currentBackendPaths = await db.listDocumentTreePaths(doc.id, BACKENDS_TREE_NAME).catch(() => []);
 
         // Persist removal intent before changing locations, so restart can finish
         // an interrupted observation without losing its provenance.
-        const operations = options.notify === false ? [] : await this.#runtime.state.onLocationsRemoved?.({
-            document: doc, removedLocations: active.filter(l => removed.has(l.url)),
+        const lost = active.filter(l => removed.has(l.url) && !relocated.has(l.url));
+        const operations = options.notify === false || !lost.length ? [] : await this.#runtime.state.onLocationsRemoved?.({
+            document: doc, removedLocations: lost,
             remainingLocations: remaining, ...options,
         }) || [];
         const ready = async () => { await this.#runtime.state.onRemovalReady?.(operations); return doc.id; };
@@ -722,17 +774,15 @@ export default class DocumentProjection {
         return doc;
     }
 
-    // An address the bytes left on purpose is dropped instead of kept as a
-    // location that went missing. That is the source endpoint of a move or
-    // rename (`movedFrom`), and, when a rescan finds the file after a move it
-    // did not witness, the old address on a backend that now holds the same
-    // bytes at an address the document did not have.
+    // An address the bytes left is dropped instead of kept as a location that
+    // went missing. That is the source endpoint of a move or rename
+    // (`movedFrom`), and an address Stored no longer lists on a backend that
+    // still holds the same bytes at another address: a move nobody witnessed.
+    // An address on a backend that holds no copy is kept as `not-found`.
     #mergeDocumentLocations(doc, backends, movedFrom = null) {
         const next = this.#buildDocumentLocations(backends);
         const urls = new Set(next.map((l) => l.url));
-        const had = new Set((doc?.locations || []).map((l) => l.url));
-        const relocated = new Set(next.filter((l) => !had.has(l.url))
-            .map((l) => this.#runtime.transfers.locationEndpoint(l)?.backend).filter(Boolean));
+        const holding = new Set(next.map((l) => this.#runtime.transfers.locationEndpoint(l)?.backend).filter(Boolean));
         const left = new Set();
         if (movedFrom?.backend && movedFrom?.key) {
             left.add(`stored://${movedFrom.backend}/${movedFrom.key}`);
@@ -749,7 +799,7 @@ export default class DocumentProjection {
                 continue;
             }
             const endpoint = this.#runtime.transfers.locationEndpoint(location);
-            if (endpoint && relocated.has(endpoint.backend) && isAvailableLocation(location)) continue;
+            if (endpoint && holding.has(endpoint.backend) && (isAvailableLocation(location) || location.status === 'not-found')) continue;
             // Stored's canonical list only describes its enabled backends.
             // It cannot retract IMAP/web/foreign-device or disabled locations.
             if (!urls.has(location.url)) {

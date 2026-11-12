@@ -298,7 +298,8 @@ export default class Objects {
                     // Hold document projection while Stored emits its per-content
                     // move events. Move the directory node once before those events
                     // refresh location URLs, preserving node ids and memberships.
-                    const result = await this.#runtime.projection.mutateDocuments(async () => {
+                    // The per-file location changes are then applied in batches.
+                    const result = await this.#runtime.projection.mutateDocuments(() => this.#runtime.projection.collectLocationChanges(async () => {
                         const root = this.#runtime.backends.getBackendRootPath(backendName);
                         if (root && this.#runtime.state.moveBackendPath) await this.#runtime.state.moveBackendPath(`${root}/${fromKey}`, `${root}/${toKey}`, { validateOnly: true });
                         const moved = await this.#runtime.state.stored.renameDirectory(backendName, fromKey, toKey, options);
@@ -313,7 +314,7 @@ export default class Objects {
                             if (root) await this.#runtime.state.moveBackendPath(`${root}/${fromKey}`, `${root}/${toKey}`);
                         }
                         return moved;
-                    });
+                    }));
                     // Observe the actual event promises: the queue's tail catches
                     // errors to keep running, but an API move must report them.
                     await Promise.all(projections);

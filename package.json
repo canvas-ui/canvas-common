@@ -25,7 +25,7 @@
     "globals": "^16.5.0",
     "prettier": "^3.6.2"
   },
-  "version": "0.3.47",
+  "version": "0.3.48",
   "exports": {
     "./*": "./packages/runtime-core/src/*",
     "./host": "./packages/runtime-core/src/runtimes/workspace/runtime/host.js"

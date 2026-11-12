@@ -294,10 +294,10 @@ export default async function workspaceHooksRoutes(fastify) {
         return reply.code(response.statusCode).send(response.getResponse());
       }
       const { status, handler, limit } = request.query || {};
-      const storedActions = await store.query({ status, handler, limit });
+      const { actions: storedActions, total } = await store.page({ status, handler, limit });
       const transform = rulePathMapper(request.workspace, 'decode');
       const actions = storedActions.map(record => ({ ...record, actions: mapRulePaths({ then: record.actions }, transform).then }));
-      const response = new ResponseObject().found(actions, 'Pending actions retrieved successfully', 200, actions.length);
+      const response = new ResponseObject().found(actions, 'Pending actions retrieved successfully', 200, actions.length, total);
       return reply.code(response.statusCode).send(response.getResponse());
     } catch (error) {
       request.log.error(error);
@@ -391,6 +391,41 @@ export default async function workspaceHooksRoutes(fastify) {
       const response = new ResponseObject().serverError(`Failed to apply decisions: ${error.message}`);
       return reply.code(response.statusCode).send(response.getResponse());
     }
+  });
+
+  // One decision for every pending action. It runs in the background: the
+  // answer is its progress record, which GET returns until the next one starts.
+  fastify.post('/pending/decisions/all', {
+    onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['decision'],
+        properties: {
+          decision: { type: 'string', enum: ['approve', 'decline'] },
+          handler: { type: 'string' },
+          nothingToDo: { type: 'boolean' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const progress = request.workspace.hooks.startBulkDecision({ ...request.body, decidedBy: request.user?.id ?? null });
+      const response = new ResponseObject().success(progress, 'Bulk decision started', 202);
+      return reply.code(response.statusCode).send(response.getResponse());
+    } catch (error) {
+      const response = error.statusCode === 409
+        ? new ResponseObject().conflict(error.message)
+        : new ResponseObject().badRequest(error.message);
+      return reply.code(response.statusCode).send(response.getResponse());
+    }
+  });
+
+  fastify.get('/pending/decisions/all', {
+    onRequest: [fastify.authenticate, requireWorkspaceRead()],
+  }, async (request, reply) => {
+    const response = new ResponseObject().found(request.workspace.hooks.bulkDecision, 'Bulk decision progress');
+    return reply.code(response.statusCode).send(response.getResponse());
   });
 
   // Explain: which rules and JS hooks would fire for a document + event, with
