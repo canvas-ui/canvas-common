@@ -36,8 +36,6 @@ packages/
   wallpapers             bundled wallpapers + picker metadata
 runtimes/
   edge                   device runtime: folder mirrors (canvas-stored) + edge tunnel client
-integrations/
-  kde                    desktop share bridge: Dolphin "Send to Canvas" + selected-text capture
 ```
 
 - [`runtimes/edge`](runtimes/edge/README.md) — `canvas-edge` daemon (`canvas remote mirror edge install`)
@@ -85,19 +83,9 @@ hoisted them.
 
 ## Desktop integration
 
-Canvas is backend-first: pipe your data sources in, mount context-aware apps
-(or a context as a filesystem), and let a context switch update everything
-bound to it. Until the Tauri desktop app covers this natively, small bridges
-in `integrations/` hook the OS into the same REST pipeline the web UI uses:
-
-- **`integrations/kde/`** — "Send to Canvas" in Dolphin's context menu (KIO
-  service menu), plus `canvas-share --selection` for filing any highlighted
-  text (a note, or a link when it's a bare URL) via a global shortcut or
-  Klipper action. Stdlib-python + a `.desktop` file; `./install.sh`, then set
-  the API token in `~/.config/canvas/share.conf`. See its README for why the
-  KDE *Share* submenu (Purpose) needs a compiled plugin — that, a
-  Nautilus/GNOME equivalent, and PWA `share_target` (already live for
-  Android/ChromeOS installs of the web UI) are the surrounding pieces.
+OS integrations (Dolphin "Send to Canvas", saving selected text as a note)
+live in [canvas-os](https://github.com/canvas-ui/canvas-os) and go through
+the canvas CLI.
 
 ## Licensing
 

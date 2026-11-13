@@ -337,11 +337,11 @@ canvas-server, canvas-stored), hence here.
 ```
 canvas-common            shared npm packages: protocol, api-client, schemas, wallpapers
                          runtimes/edge (JS headless/npm device runtime)
-                         integrations/kde
                          PLANNED: crates/canvas-core (versioned Rust substrate)
 canvas-cli               CLI, shell/, packages/cli-* (SDK and lazy integrations)
 canvas-web               web UI
 canvas-desktop           Rust/Tauri setup and tray app
+canvas-os                OS integrations (linux/kde), thin glue over canvas-cli
 canvas-browser-extension Chromium and Firefox extensions
 canvas-fuse              standalone Rust filesystem client
 canvas-stored            blob storage
