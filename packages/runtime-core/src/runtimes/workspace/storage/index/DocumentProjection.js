@@ -692,6 +692,9 @@ export default class DocumentProjection {
                 .map((backend) => {
                     const root = this.#runtime.backends.getBackendRootPath(backend.backend);
                     if (!root) return null;
+                    // Content-addressed blobs on a browsable backend have no
+                    // place in its tree, like the managed blob store.
+                    if (this.#runtime.state.stored.getBackend(backend.backend)?.listed(backend.key) === false) return null;
                     const filePath = backend?.source?.path || backend?.key || '';
                     const dir = filePath ? path.dirname(filePath) : null;
                     const suffix = (dir && dir !== '.') ? `/${dir}` : '';

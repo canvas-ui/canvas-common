@@ -469,6 +469,9 @@ class Workspace extends EventEmitter {
     get acl() { return this.#runtime.config.acl; }
     get publicCanvasShares() { return this.#runtime.config.publicCanvasShares; }
     get dataBackends() { return this.#runtime.config.dataBackends; }
+    get primaryStore() { return this.#runtime.config.primaryStore; }
+    get casStores() { return this.#runtime.config.casStores; }
+    setPrimaryStore(name) { return this.#runtime.config.setPrimaryStore(name); }
     get services() { return this.#runtime.config.services; }
     get inferdConfig() { return this.#runtime.config.inferdConfig; }
     imageSummaryStatus(...args) { return this.#runtime.operations.run('inference.imageSummaryStatus', () => this.#runtime.inference.imageSummaryStatus(...args)); }

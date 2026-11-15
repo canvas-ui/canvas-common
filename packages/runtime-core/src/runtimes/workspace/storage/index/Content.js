@@ -8,6 +8,7 @@ import { DATA_BLOB_BACKEND } from './contracts.js';
 export default class Content {
     #index;
     #runtime;
+    #sidecars = new Set();
     constructor(index, runtime) { this.#index = index; this.#runtime = runtime; }
 
 
@@ -18,6 +19,10 @@ export default class Content {
      * stored://workspace:data/<key> URL — keys are checksum-derived and deduped;
      * on-disk layout is opaque (the synapsd tree is the navigation).
      *
+     * The blob is also queued for upload to every S3 backend in CAS mode (the
+     * primary data store and CAS backups); the document gains each location
+     * once that upload is verified.
+     *
      * `adopt` (with a file path) moves the file in instead of copying it; the
      * caller's `checksums` (hex, computed as the bytes arrived) skip hashing.
      *
@@ -27,7 +32,9 @@ export default class Content {
      */
     async persistBlob(blob, { adopt = false, checksums } = {}) {
         if (!this.#runtime.state.stored) throw new Error('WorkspaceStoredIndex is not running');
-        const res = await this.#runtime.state.stored.put(blob, { backends: [DATA_BLOB_BACKEND], ...(adopt ? { adopt, checksums } : {}) });
+        const remote = (this.#runtime.state.getCasStores?.() || []).filter((name) => this.#runtime.state.stored.getBackend(name));
+        const backends = [DATA_BLOB_BACKEND, ...remote];
+        const res = await this.#runtime.state.stored.put(blob, { backends, ...(adopt ? { adopt, checksums } : {}) });
         if (!res?.ok) throw new Error(`Blob persist failed: ${res?.reason || 'unknown'}`);
         return {
             url: `stored://${DATA_BLOB_BACKEND}/${res.key}`,
@@ -39,6 +46,61 @@ export default class Content {
             // (blob-upload route → CLI) merges this onto the File document.
             metadata: res.custom && Object.keys(res.custom).length ? res.custom : undefined,
         };
+    }
+
+    /**
+     * `locations` plus the verified copy, in every CAS bucket, of each blob
+     * they name. A small blob can be uploaded before the client has created
+     * its document; the document then starts with all its locations.
+     */
+    async withCasLocations(locations) {
+        const stores = this.#runtime.state.getCasStores?.() || [];
+        if (!stores.length || !this.#runtime.state.stored || !Array.isArray(locations)) return locations;
+        const out = [...locations];
+        for (const location of locations) {
+            const parsed = typeof location?.url === 'string' ? parseLocationUrl(location.url) : null;
+            if (parsed?.scheme !== 'stored' || parsed.backend !== DATA_BLOB_BACKEND) continue;
+            const meta = await this.#runtime.state.stored.stat(`${DATA_BLOB_BACKEND}:${parsed.key}`);
+            for (const copy of meta?.locations || []) {
+                const url = `stored://${copy.backend}/${copy.key}`;
+                if (copy.synced && stores.includes(copy.backend) && !out.some((l) => l?.url === url)) out.push({ url });
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Write the sidecar of every blob these documents keep in a CAS bucket
+     * with `sidecar: true`: the document without what only this index knows
+     * (locations, features, timelines, row version). Written once per blob
+     * and removed with it; a later edit of the document does not rewrite it.
+     * Runs in the background and reports failures to the log.
+     */
+    writeSidecars(ids = []) {
+        const stored = this.#runtime.state.stored;
+        const stores = (this.#runtime.state.getCasStores?.() || []).filter((name) => this.#runtime.state.dataBackends[name]?.sidecar === true);
+        if (!stored || !stores.length || !ids.length) return;
+        const task = (async () => {
+            for (const id of ids) {
+                const doc = await this.#runtime.state.getDb().getDocument(Number(id)).catch(() => null);
+                if (!doc?.locations?.length) continue;
+                const { locations, features: _features, timelines: _timelines, version: _version, orphanedAt: _orphanedAt, ...sidecar } = typeof doc.toJSON === 'function' ? doc.toJSON() : doc;
+                // File name, type and size recorded with the locations (the
+                // same file wherever it is kept).
+                const file = Object.assign({}, ...(locations || []).map((location) => location?.metadata || {}));
+                if (Object.keys(file).length) sidecar.file = file;
+                for (const location of locations || []) {
+                    const parsed = typeof location?.url === 'string' ? parseLocationUrl(location.url) : null;
+                    const backend = parsed?.scheme === 'stored' && stores.includes(parsed.backend) ? stored.getBackend(parsed.backend) : null;
+                    // One writer per blob: the insert and the upload report the same document.
+                    if (!backend?.writeSidecar || this.#sidecars.has(location.url)) continue;
+                    this.#sidecars.add(location.url);
+                    try { await backend.writeSidecar(parsed.key, sidecar); }
+                    finally { this.#sidecars.delete(location.url); }
+                }
+            }
+        })().catch((error) => this.#runtime.state.logger.warn({ workspaceId: this.#runtime.state.workspaceId, error: error.message }, 'Blob sidecar was not written'));
+        this.#runtime.state.operations.run?.('content.writeSidecars', () => task);
     }
 
     /**

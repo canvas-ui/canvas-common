@@ -10,7 +10,7 @@ export const LOCAL_DRIVERS = new Set(['file', 'cacache']);
 
 export const CONTAINER_DRIVERS = new Set(['file', 'gdrive']);
 
-export const REMOTE_RESTART_KEYS = ['clientId', 'clientSecret', 'refreshToken', 'folderId', 'pollInterval', 'permanentDelete', 'bucket', 'prefix', 'region', 'endpoint', 'accessKeyId', 'secretAccessKey', 'sessionToken', 'forcePathStyle', 'readOnly'];
+export const REMOTE_RESTART_KEYS = ['clientId', 'clientSecret', 'refreshToken', 'folderId', 'pollInterval', 'permanentDelete', 'bucket', 'prefix', 'region', 'endpoint', 'accessKeyId', 'secretAccessKey', 'sessionToken', 'forcePathStyle', 'readOnly', 'versioned', 'mode', 'sidecar'];
 
 export const CHECKSUM_PRIORITY = ['sha256', 'sha1', 'md5'];
 

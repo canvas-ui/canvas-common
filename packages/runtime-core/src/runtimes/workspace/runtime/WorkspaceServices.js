@@ -69,6 +69,7 @@ export default class WorkspaceServices {
             // Orphan-GC retention (Settings > Database), -1 = keep forever.
             getOrphanRetentionDays: () => Number(this.#workspace.databaseSettings.orphanRetentionDays ?? -1),
             getOrphanPolicy: () => this.#workspace.databaseSettings.orphanPolicy,
+            getCasStores: () => this.#runtime.config.casStores,
         });
     }
 

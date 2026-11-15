@@ -113,7 +113,7 @@ export default class WorkspaceDocuments {
             ? null
             : await this.#connectorWriteThrough(record, this.#normalizeFeatureInput(features, attributes));
         if (writtenThrough) return writtenThrough.id;
-        const result = await this.#runtime.getActiveDb().put(record, {
+        const result = await this.#runtime.getActiveDb().put(await this.#withCasLocations(record), {
             ...WorkspaceDocuments.buildWriteSpec(context, directory),
             features: this.#normalizeFeatureInput(features, attributes),
             emitEvent,
@@ -122,7 +122,17 @@ export default class WorkspaceDocuments {
         // A re-put of identical content resolves to the SAME document by
         // checksum, so this is also the path a copy-then-delete move takes.
         if (!allowBackendsWrite && (context != null || directory != null)) await this.#runtime.trash.untrashOnLink(result).catch(() => {});
+        if (record?.locations?.length) this.#runtime.state.storedIndex?.writeSidecars([result]);
         return result;
+    }
+
+    // A document that names a blob also names the blob's copies in CAS
+    // buckets when those copies are already verified.
+    async #withCasLocations(record) {
+        const storedIndex = this.#runtime.state.storedIndex;
+        if (!storedIndex?.isRunning || !Array.isArray(record?.locations) || !record.locations.length) return record;
+        const locations = await storedIndex.withCasLocations(record.locations);
+        return locations.length === record.locations.length ? record : { ...record, locations };
     }
 
     async link(id, { context = '/', directory = null, features = [], attributes, emitEvent = true, allowBackendsWrite = false, provenance = null, createPath = true } = {}) {
@@ -293,7 +303,7 @@ export default class WorkspaceDocuments {
         // #connectorWriteThrough). Everything else keeps the single batched
         // write it always had — the split only happens when the batch actually
         // contains a mirrored document, which is the rare case.
-        const list = Array.isArray(records) ? records : [records];
+        const list = await Promise.all((Array.isArray(records) ? records : [records]).map((record) => this.#withCasLocations(record)));
         const normalizedFeatures = this.#normalizeFeatureInput(features, attributes);
         const writtenThrough = allowBackendsWrite ? [] : await Promise.all(
             list.map((record) => this.#connectorWriteThrough(record, normalizedFeatures)),
@@ -327,6 +337,7 @@ export default class WorkspaceDocuments {
             ? returnDetails ? { id: writtenThrough[index].id, created: false, status: 'updated' } : writtenThrough[index].id
             : null);
         localIndexes.forEach((index, i) => { out[index] = Array.isArray(localIds) ? localIds[i] : null; });
+        this.#runtime.state.storedIndex?.writeSidecars(out.filter((entry, index) => entry && list[index]?.locations?.length).map((entry) => entry.id ?? entry));
         return out;
     }
 

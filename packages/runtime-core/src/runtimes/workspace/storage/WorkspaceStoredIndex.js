@@ -22,7 +22,7 @@ export class WorkspaceStoredIndex {
     static HOME_STORED_BACKEND = HOME_STORED_BACKEND;
     static DATA_BLOB_BACKEND = DATA_BLOB_BACKEND;
 
-    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, moveBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, getOrphanPolicy = null, onBackendChanged = null, policyDirectoryMove = null, policyRemove = null, onLocationsRemoved = null, onRemovalReady = null, replicaOwnerGuard = null }) {
+    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, moveBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, getOrphanPolicy = null, getCasStores = null, onBackendChanged = null, policyDirectoryMove = null, policyRemove = null, onLocationsRemoved = null, onRemovalReady = null, replicaOwnerGuard = null }) {
         this.#runtime = { state: createIndexState() };
         this.#runtime.transfers = new Transfers(this, this.#runtime);
         this.#runtime.objects = new Objects(this, this.#runtime);
@@ -69,6 +69,7 @@ export class WorkspaceStoredIndex {
         this.#runtime.state.persistBackendConfig = persistBackendConfig;
         this.#runtime.state.getOrphanRetentionDays = getOrphanRetentionDays;
         this.#runtime.state.getOrphanPolicy = getOrphanPolicy;
+        this.#runtime.state.getCasStores = getCasStores;
         this.#runtime.state.onLocationsRemoved = onLocationsRemoved;
         this.#runtime.state.onRemovalReady = onRemovalReady;
         this.#runtime.state.replicaOwnerGuard = replicaOwnerGuard;
@@ -225,7 +226,7 @@ export class WorkspaceStoredIndex {
                 if (payload?.to?.backend && payload?.to?.key) this.#runtime.objects.trackUpsert(`${payload.to.backend}:${payload.to.key}`, promise);
                 return promise;
             },
-            'object:location:add': (payload) => this.#runtime.projection.applyLocationChange(payload),
+            'object:location:add': (payload) => this.#applyLocationAdd(payload),
             'object:location:remove': (payload) => this.#runtime.projection.applyLocationChange(payload),
             // Change-log advance → throttled `backend.changed` nudge.
             'change': (entry) => this.#nudge(entry),
@@ -244,7 +245,29 @@ export class WorkspaceStoredIndex {
         });
     }
 
+    // A blob reaches a CAS bucket in the background, and a small one can be
+    // verified there before the client has created its document. The location
+    // is applied again once the document had time to appear.
+    async #applyLocationAdd(payload, attempt = 0) {
+        const docId = await this.#runtime.projection.applyLocationChange(payload);
+        const cas = this.#runtime.state.getCasStores?.().includes(payload?.location?.backend);
+        if (docId && cas) this.writeSidecars([docId]);
+        const delay = [5_000, 60_000, 600_000][attempt];
+        if (docId || !delay || !cas) return docId;
+        const timer = setTimeout(() => {
+            this.#runtime.state.locationRetries.delete(timer);
+            if (!this.#runtime.state.stored) return;
+            this.#applyLocationAdd(payload, attempt + 1).catch((error) => this.#runtime.state.logger.warn(
+                { workspaceId: this.#runtime.state.workspaceId, error: error.message }, 'CAS store location was not recorded'));
+        }, delay);
+        timer.unref?.();
+        this.#runtime.state.locationRetries.add(timer);
+        return null;
+    }
+
     #unbindEvents() {
+        for (const timer of this.#runtime.state.locationRetries) clearTimeout(timer);
+        this.#runtime.state.locationRetries.clear();
         if (!this.#runtime.state.stored?.off) {
             this.#runtime.state.listeners = [];
             return;
@@ -291,6 +314,8 @@ export class WorkspaceStoredIndex {
     getBackendDiskUsage(...args) { return this.#runtime.backends.getBackendDiskUsage(...args); }
     persistBlob(...args) { return this.#runtime.content.persistBlob(...args); }
     statBlobByChecksum(...args) { return this.#runtime.content.statBlobByChecksum(...args); }
+    withCasLocations(...args) { return this.#runtime.content.withCasLocations(...args); }
+    writeSidecars(...args) { return this.#runtime.content.writeSidecars(...args); }
     applyBackendConfig(...args) { return this.#runtime.backends.applyBackendConfig(...args); }
     getEffectiveExclusions(...args) { return this.#runtime.backends.getEffectiveExclusions(...args); }
     deleteStoredUrl(...args) { return this.#runtime.backends.deleteStoredUrl(...args); }

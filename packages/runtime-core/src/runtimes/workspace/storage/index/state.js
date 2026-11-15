@@ -38,6 +38,8 @@ export function createIndexState() {
         persistBackendConfig: null,
         getOrphanRetentionDays: null,
         getOrphanPolicy: null,
+        getCasStores: null,
+        locationRetries: new Set(),
         onLocationsRemoved: null,
         onRemovalReady: null,
         replicaOwnerGuard: null,

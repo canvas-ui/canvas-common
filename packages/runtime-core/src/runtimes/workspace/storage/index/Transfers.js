@@ -143,7 +143,12 @@ export default class Transfers {
                 const config = this.#runtime.state.dataBackends[endpoint.backend];
                 const backend = this.#runtime.state.stored.getBackend(endpoint.backend);
                 if (!config || !backend) throw objectsError(`Backend "${endpoint.backend}" is not enabled`, 'BACKEND_DISABLED', 409);
-                if (config.readOnly || !backend.canDelete) throw objectsError(`Backend "${endpoint.backend}" is read-only`, 'BACKEND_READ_ONLY', 403);
+                if (config.readOnly) throw objectsError(`Backend "${endpoint.backend}" is read-only`, 'BACKEND_READ_ONLY', 403);
+                if (!backend.canDelete) {
+                    throw objectsError(config.driver === 's3'
+                        ? `Backend "${endpoint.backend}" cannot delete objects: the bucket is not known to be versioned. Run "Test connection" in Files & storage to detect versioning, or allow permanent deletes.`
+                        : `Backend "${endpoint.backend}" does not support deleting objects`, 'BACKEND_DELETE_DISABLED', 403);
+                }
                 const result = await this.#index.withKeyLock(endpoint.backend, endpoint.key, () => this.#runtime.state.stored.removeObject(endpoint.backend, endpoint.key, {
                     ifMatch: checksum, origin: `backend-delete:${keepDocument ? 'keep:' : ''}${randomUUID()}`,
                 }));

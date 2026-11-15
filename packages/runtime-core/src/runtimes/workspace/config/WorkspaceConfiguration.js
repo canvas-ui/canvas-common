@@ -4,6 +4,7 @@ import path from 'path';
 
 import { WorkspaceStoredIndex } from '../storage/WorkspaceStoredIndex.js';
 import { normalizeRemovalPolicy } from '../storage/removal-policy.js';
+import { getBackendCapabilities } from 'canvas-stored/src/backends/BackendManager.js';
 import { WORKSPACE_INTERNAL_DIRNAME, WORKSPACE_LAYOUTS, normalizeWorkspaceLayout, workspaceDirectories, workspaceStoredDefault, workspaceServices } from './constants.js';
 
 export default class WorkspaceConfiguration {
@@ -114,6 +115,37 @@ export default class WorkspaceConfiguration {
     // backend, it's stored's own working store (see cachePath).
     get dataBackends() {
         return this.#storedConfig().backends;
+    }
+
+    // Primary data store (services.stored.primary): where all workspace data
+    // is stored by default. Always content-addressed: null is the local blob
+    // store (workspace:data), otherwise an S3 backend in CAS mode.
+    get primaryStore() {
+        const name = this.#storedConfig().primary || null;
+        return name && this.casStores.includes(name) ? name : null;
+    }
+
+    setPrimaryStore(backendName) {
+        const name = backendName || null;
+        if (name) {
+            const config = this.dataBackends[name];
+            if (!config) throw Object.assign(new Error(`Unknown data backend: ${name}`), { statusCode: 404 });
+            if (config.enabled === false) throw Object.assign(new Error(`Data backend "${name}" is disabled`), { statusCode: 409 });
+            if (getBackendCapabilities(config).blobs !== true) {
+                throw Object.assign(new Error(`Data backend "${name}" cannot be the primary data store: it must be a writable S3 bucket in CAS mode`), { statusCode: 400 });
+            }
+        }
+        const services = this.#runtime.state.configStore.get('services') || {};
+        this.#runtime.state.configStore.set('services', this.#runtime.state.crypto.protect({ ...services, stored: { ...this.#storedConfig(), primary: name } }));
+        this.#workspace.emit('dataBackends.changed', { backend: name, primary: name });
+        return name;
+    }
+
+    /** Enabled content-addressed remote backends: every persisted blob is uploaded to each. */
+    get casStores() {
+        return Object.entries(this.dataBackends)
+            .filter(([, config]) => config.enabled !== false && config.supported !== false && getBackendCapabilities(config).blobs === true)
+            .map(([name]) => name);
     }
 
     // Single write authority for services.stored.backends. Keeps the rest of
@@ -375,6 +407,9 @@ export default class WorkspaceConfiguration {
             if (patch && 'readOnly' in patch) {
                 throw new Error(`Data backend "${backendName}" is a managed store — read-only does not apply`);
             }
+        }
+        if (backendName === this.primaryStore && (patch?.enabled === false || patch?.readOnly === true)) {
+            throw Object.assign(new Error(`Data backend "${backendName}" is the primary data store; choose another primary first`), { statusCode: 409 });
         }
         if (patch && 'scanOnStart' in patch && typeof patch.scanOnStart !== 'boolean') {
             throw new Error('scanOnStart must be a boolean');

@@ -151,6 +151,10 @@ export default class WorkspaceBackends {
             // Last on-demand disk usage ({bytes, files, computedAt}) if computed
             // this runtime — see getBackendDiskUsage.
             usage: status.diskUsage || null,
+            // The primary data store: where all workspace data is stored by
+            // default. Exactly one content-addressed backend has it: the local
+            // blob store, or an S3 CAS backend (PATCH { primary: true }).
+            primary: (this.#workspace.primaryStore || WorkspaceStoredIndex.DATA_BLOB_BACKEND) === name,
             capabilities: this.#backendCapabilities(driver, status),
             config: {
                 root: status.root || null,
@@ -189,6 +193,12 @@ export default class WorkspaceBackends {
                     region: status.region || 'us-east-1', forcePathStyle: status.forcePathStyle ?? Boolean(status.endpoint),
                     credentialsConfigured: Boolean(status.accessKeyId && status.secretAccessKey),
                     pollInterval: status.pollInterval ?? 60000, permanentDelete: status.permanentDelete === true,
+                    // null until a write probe has run against the bucket.
+                    versioned: typeof status.versioned === 'boolean' ? status.versioned : null,
+                    // 'cas': content-addressed blobs only, every workspace blob is
+                    // uploaded here. 'path': objects under chosen folders and names.
+                    mode: status.mode === 'cas' ? 'cas' : 'path',
+                    sidecar: status.sidecar === true,
                 } : {}),
                 exclude: Array.isArray(status.exclude) ? status.exclude : [],
                 effectiveExclusions: Array.isArray(status.effectiveExclusions) ? status.effectiveExclusions : undefined,
@@ -410,7 +420,11 @@ export default class WorkspaceBackends {
         }
         // An empty token explicitly clears temporary credentials; omitted keeps it.
         if (input.sessionToken === '') patch.sessionToken = '';
-        for (const key of ['forcePathStyle', 'scanOnStart', 'watch', 'readOnly', 'permanentDelete', 'enabled']) {
+        if ('mode' in input) {
+            if (!['cas', 'path'].includes(input.mode)) throw new Error("mode must be 'cas' or 'path'");
+            patch.mode = input.mode;
+        }
+        for (const key of ['forcePathStyle', 'scanOnStart', 'watch', 'readOnly', 'permanentDelete', 'enabled', 'sidecar']) {
             if (!(key in input)) continue;
             if (typeof input[key] !== 'boolean') throw new Error(`${key} must be a boolean`);
             patch[key] = input[key];
@@ -422,6 +436,10 @@ export default class WorkspaceBackends {
         }
         const merged = { ...previous, ...patch };
         if (!merged.bucket || !merged.accessKeyId || !merged.secretAccessKey) throw new Error('S3 bucket, accessKeyId and secretAccessKey are required');
+        if (merged.mode === 'cas') {
+            // Nothing to list in a CAS bucket: no scans, no polling.
+            if (patch.scanOnStart === true || patch.watch === true) throw new Error('A CAS-mode bucket holds blobs only; it is not scanned or watched');
+        } else if (patch.sidecar === true) throw new Error('Sidecars are written for CAS-mode buckets only');
         return patch;
     }
 
@@ -430,8 +448,8 @@ export default class WorkspaceBackends {
         try {
             const live = await probe.verifyRoot();
             if (!live.ok) throw new Error(`S3 check failed (${live.reason}): ${live.error || 'unknown error'}`);
-            if (config.readOnly !== true) await probe.verifyWrites();
-            return { ok: true, bucket: config.bucket, conditionalCreate: config.readOnly !== true };
+            const writes = config.readOnly !== true ? await probe.verifyWrites() : null;
+            return { ok: true, bucket: config.bucket, conditionalCreate: Boolean(writes), ...(writes ? { versioned: writes.versioned } : {}) };
         } finally { await probe.stop(); }
     }
 
@@ -440,11 +458,13 @@ export default class WorkspaceBackends {
         if (!label) throw new Error('Backend name is required');
         const name = this.#newBackendSlug(label);
         const patch = this.#s3ConfigPatch(config);
-        await this.#probeS3(patch);
+        const probed = await this.#probeS3(patch);
         await this.#workspace.setDataBackendConfig(name, {
             enabled: true, supported: true, driver: 's3', label, remote: true, transport: 's3',
-            resync: true, scanOnStart: true, watch: false, readOnly: false, ...patch,
+            mode: 'path', resync: patch.mode !== 'cas', scanOnStart: patch.mode !== 'cas', watch: false, readOnly: false, ...patch,
+            ...('versioned' in probed ? { versioned: probed.versioned } : {}),
         });
+        if (config.primary === true) this.#workspace.setPrimaryStore(name);
         return this.#workspace.getBackend('s3', name);
     }
 
@@ -577,6 +597,19 @@ export default class WorkspaceBackends {
             for (const m of targets) await this.#workspace.saveImapMailbox({ ...patch, id: m.id });
             return this.#workspace.getBackend('imap', address);
         }
+        // `primary: true` moves the role here; the local blob store takes it
+        // back when the current primary gives it up. Stored data stays put.
+        let primary;
+        if ('primary' in patch) {
+            if (typeof patch.primary !== 'boolean') throw new Error('primary must be a boolean');
+            const local = address === WorkspaceStoredIndex.DATA_BLOB_BACKEND;
+            if (!patch.primary && local) throw Object.assign(new Error('Choose another primary data store; the local blob store keeps the role until then'), { statusCode: 409 });
+            if (patch.primary || this.#workspace.primaryStore === address) primary = patch.primary && !local ? address : null;
+            const { primary: _primary, ...rest } = patch;
+            patch = rest;
+        }
+        const applyPrimary = () => { if (primary !== undefined) this.#workspace.setPrimaryStore(primary); };
+        if (driver !== 's3' && !Object.keys(patch).length) { applyPrimary(); return this.#workspace.getBackend(driver, address); }
         if (driver === 'gdrive') {
             const previous = this.#workspace.dataBackends[address];
             if (!previous || previous.driver !== 'gdrive') throw new Error(`Backend not found: gdrive/${address}`);
@@ -590,14 +623,18 @@ export default class WorkspaceBackends {
             const previous = this.#workspace.dataBackends[address];
             if (!previous || previous.driver !== 's3') throw new Error(`Backend not found: s3/${address}`);
             const normalized = this.#s3ConfigPatch(patch, previous);
-            for (const key of ['bucket', 'endpoint', 'prefix']) {
-                if (key in normalized && String(normalized[key] || '') !== String(previous[key] || '')) {
+            for (const key of ['bucket', 'endpoint', 'prefix', 'mode']) {
+                if (key in normalized && String(normalized[key] || '') !== String(previous[key] || (key === 'mode' ? 'path' : ''))) {
                     throw new Error(`Changing S3 ${key} requires adding a new backend; existing locations and pending operations keep their original destination`);
                 }
             }
             const connectionKeys = ['bucket', 'prefix', 'region', 'endpoint', 'accessKeyId', 'secretAccessKey', 'sessionToken', 'forcePathStyle', 'readOnly'];
-            if (connectionKeys.some(key => key in normalized)) await this.#probeS3({ ...previous, ...normalized });
+            if (connectionKeys.some(key => key in normalized)) {
+                const probed = await this.#probeS3({ ...previous, ...normalized });
+                if ('versioned' in probed) normalized.versioned = probed.versioned;
+            }
             patch = normalized;
+            if (!Object.keys(patch).length) { applyPrimary(); return this.#workspace.getBackend(driver, address); }
         }
         if ('exclude' in patch) {
             if (!Array.isArray(patch.exclude) || patch.exclude.some((p) => typeof p !== 'string')) {
@@ -606,6 +643,7 @@ export default class WorkspaceBackends {
             patch = { ...patch, exclude: patch.exclude.map((p) => p.trim()).filter(Boolean).slice(0, 200) };
         }
         await this.#workspace.setDataBackendConfig(address, patch);
+        applyPrimary();
         // Toggling the home backend drives the stored-index lifecycle: enabling
         // it must boot the index when it isn't running (setDataBackendConfig
         // only applies config to an already-running index), disabling stops it.
@@ -629,6 +667,9 @@ export default class WorkspaceBackends {
         // Disable first either way — it stops the watcher, unregisters the live
         // backend and releases the mirror-node enable-lock.
         const existing = this.#workspace.dataBackends[address];
+        if (this.#workspace.primaryStore === address) {
+            throw Object.assign(new Error(`"${existing?.label || address}" is the primary data store. Choose another primary before removing it; blobs already uploaded stay in the bucket.`), { statusCode: 409 });
+        }
         await this.#workspace.setDataBackendConfig(address, { enabled: false });
         if (existing && existing.managed !== true && !(address in WORKSPACE_STORAGE_BACKENDS)) {
             // User-added mount: drop the config entirely. Mirrored docs keep
@@ -695,7 +736,11 @@ export default class WorkspaceBackends {
         if (driver === 's3') {
             const config = this.#workspace.dataBackends[address];
             if (!config || config.driver !== 's3') throw new Error(`Backend not found: s3/${address}`);
-            return this.#probeS3(config);
+            const probed = await this.#probeS3(config);
+            // Versioning decides whether deletes are available; keep what the
+            // bucket reports now.
+            if ('versioned' in probed && probed.versioned !== config.versioned) await this.#workspace.setDataBackendConfig(address, { versioned: probed.versioned });
+            return probed;
         }
         if (driver !== 'imap') throw new Error(`Backend "${driver}/${address}" does not support test`);
         const target = (await this.#workspace.listImapMailboxes())
