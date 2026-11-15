@@ -2,6 +2,7 @@ import { emailListPreview } from '../../../runtimes/workspace/connectors/imap/co
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import * as arg from '../../mcp/args.js';
 import { posix } from 'node:path';
 import { authorizeTreeRequest, scopedTreeView, treeScopeBase } from '../../middleware/tree-scope.js';
 import { labelBackendTree } from '../../../utils/backend-documents.js';
@@ -377,6 +378,11 @@ export default async function workspaceTreeRoutes(fastify) {
 
   fastify.get('/', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'tree_get',
+      description: 'Get a whole tree as nested nodes, each with its name, label, color and children. Use path_list when you only need the path strings.',
+      args: { ...arg.workspace, ...arg.tree },
+    } },
   }, async (request, reply) => {
     try {
       const resolved = await getTreeInstance(request, reply);
@@ -401,6 +407,11 @@ export default async function workspaceTreeRoutes(fastify) {
 
   fastify.get('/paths', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'path_list',
+      description: 'List every path in a tree as plain strings, e.g. ["/", "/work", "/work/projects"]. Use it to find where documents can be filed and to check that a path exists.',
+      args: { ...arg.workspace, ...arg.tree },
+    } },
   }, async (request, reply) => {
     try {
       const resolved = await getTreeInstance(request, reply);
@@ -418,6 +429,11 @@ export default async function workspaceTreeRoutes(fastify) {
 
   fastify.get('/path/*', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'path_get',
+      description: 'Get one tree path: its layer id, label, description, color, saved query and child paths. For the root use tree_get. To read the documents filed under a path use document_list.',
+      args: { ...arg.workspace, ...arg.tree, ...arg.treePath },
+    } },
   }, async (request, reply) => {
     try {
       const resolved = await getTreeInstance(request, reply);
@@ -439,6 +455,16 @@ export default async function workspaceTreeRoutes(fastify) {
 
   fastify.put('/path/*', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'path_create',
+      description: 'Create a path in a tree: a folder in a directory tree, a context path in a context tree. Missing parent paths are created too, and an existing path is left unchanged. Filing a document with document_add or document_link also creates its path, so this is only needed for an empty path.',
+      args: { ...arg.workspace, ...arg.tree, ...arg.treePath,
+        type: { description: 'Kind of the last path segment. Omit for an ordinary folder or context; canvas makes a saved view that takes querySpec.' },
+        querySpec: { description: 'Saved query of a canvas path, in the same shape as the arguments of document_find.' },
+        metadata: { description: 'Free-form presentation metadata stored on the path.' },
+      },
+      only: ['type', 'querySpec', 'metadata'],
+    } },
     schema: {
       body: {
         type: 'object',
@@ -554,11 +580,53 @@ export default async function workspaceTreeRoutes(fastify) {
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     }
   };
-  fastify.patch('/path/*', updateTreePathOpts, updateTreePathHandler);
+  fastify.patch('/path/*', {
+    ...updateTreePathOpts,
+    config: { mcp: [
+      {
+        name: 'path_move',
+        description: 'Move a tree path, with everything below it, to another place in the same tree or into another tree. The documents filed under it stay filed under it. If to names an existing path the moved path goes inside it; otherwise to is the new full path. To change only the last segment name use path_rename; to move documents and not the path, use document_link and document_unlink.',
+        args: { ...arg.workspace, ...arg.tree, ...arg.treePath,
+          to: { description: 'Destination: an existing path to move into, or the new full path.' },
+          targetTreeNameOrTreeId: { name: 'targetTree', description: 'Move into this other tree. Omit to stay in the same tree.' },
+          recursive: { description: 'When moving into another tree, bring the paths below along.' },
+          mergeDown: { description: 'Context trees only: also make the moved documents members of the new parent paths.' },
+        },
+        only: ['to', 'targetTreeNameOrTreeId', 'recursive', 'mergeDown'],
+        required: ['to'],
+      },
+      {
+        name: 'path_rename',
+        description: 'Rename the last segment of a tree path in place, e.g. /work/alpha with name beta becomes /work/beta. Documents and child paths stay with it. In a context tree the segment is a shared layer, so the name changes everywhere that layer appears.',
+        args: { ...arg.workspace, ...arg.tree, ...arg.treePath, name: { description: 'New name of the last path segment, without slashes.' } },
+        only: ['name'],
+        required: ['name'],
+      },
+      {
+        name: 'path_update',
+        description: 'Change how a tree path is presented: label, description, color, saved query or metadata. This does not rename or move it; use path_rename or path_move for that.',
+        args: { ...arg.workspace, ...arg.tree, ...arg.treePath,
+          label: { description: 'Display label shown instead of the path segment name.' },
+          color: { description: 'CSS color such as #3366ff, or null to clear it.' },
+          querySpec: { description: 'Saved query of a canvas path, in the same shape as the arguments of document_find.' },
+        },
+        only: ['label', 'description', 'color', 'querySpec', 'metadata'],
+      },
+    ] },
+  }, updateTreePathHandler);
   fastify.patch('/path', updateTreePathOpts, updateTreePathHandler);
 
   fastify.post('/path/*', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'path_copy',
+      description: 'Copy a tree path to another place in the same tree or into another tree. The copy shows the same documents; no document content is duplicated. In a context tree the copy shares its layers with the original. To create a new empty path use path_create.',
+      args: { ...arg.workspace, ...arg.tree, ...arg.treePath,
+        to: { description: 'Destination path. In a context tree it must be an existing parent path.' },
+        targetTreeNameOrTreeId: { name: 'targetTree', description: 'Copy into this other tree. Omit to stay in the same tree.' },
+        recursive: { description: 'Copy the paths below too.' },
+      },
+    } },
     schema: {
       body: {
         type: 'object',
@@ -619,6 +687,12 @@ export default async function workspaceTreeRoutes(fastify) {
 
   fastify.delete('/path/*', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'path_delete',
+      description: 'Remove a path from a tree. The documents that were filed under it are kept in the workspace. Without recursive the child paths move up to the parent; with recursive the whole subtree is removed.',
+      args: { ...arg.workspace, ...arg.tree, ...arg.treePath, recursive: { description: 'Remove the paths below too instead of moving them up to the parent.' } },
+      only: ['recursive'],
+    } },
     schema: {
       querystring: {
         type: 'object',
@@ -678,6 +752,11 @@ export default async function workspaceTreeRoutes(fastify) {
 
   fastify.get('/layers', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'layer_list',
+      description: 'List the layers of a context tree. A layer is one named set of documents; every path segment in a context tree is a layer, and the same layer can appear under several paths. Most work is done with paths; use layers to rename or delete a segment everywhere at once.',
+      args: { ...arg.workspace, ...arg.tree },
+    } },
   }, async (request, reply) => {
     try {
       const resolved = await getTreeInstance(request, reply, 'context');
@@ -694,6 +773,11 @@ export default async function workspaceTreeRoutes(fastify) {
 
   fastify.get('/layers/:layerId', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'layer_get',
+      description: 'Get one layer of a context tree by id or name: label, description, color, lock state.',
+      args: { ...arg.workspace, ...arg.tree, ':layerId': { name: 'layer', description: 'Layer id or name, from layer_list.' } },
+    } },
   }, async (request, reply) => {
     try {
       const resolved = await getTreeInstance(request, reply, 'context');
@@ -796,6 +880,12 @@ export default async function workspaceTreeRoutes(fastify) {
 
   fastify.patch('/layers/:layerId', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'layer_rename',
+      description: 'Rename a layer of a context tree. Every path that contains the layer changes its segment name.',
+      args: { ...arg.workspace, ...arg.tree, ':layerId': { name: 'layer', description: 'Layer id, from layer_list.' }, name: { description: 'New layer name.' } },
+      required: ['name'],
+    } },
     schema: {
       body: {
         type: 'object',
@@ -880,6 +970,11 @@ export default async function workspaceTreeRoutes(fastify) {
 
   fastify.delete('/layers/:layerId', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'layer_delete',
+      description: 'Delete a layer of a context tree from every path it appears in. Documents are kept in the workspace but lose this membership.',
+      args: { ...arg.workspace, ...arg.tree, ':layerId': { name: 'layer', description: 'Layer id, from layer_list.' } },
+    } },
   }, async (request, reply) => {
     try {
       const resolved = await getTreeInstance(request, reply, 'context');
@@ -926,8 +1021,22 @@ export default async function workspaceTreeRoutes(fastify) {
       },
     },
   };
-  fastify.post('/paths/merge-down', pathBitmapOpOpts, pathBitmapOp('mergeDown', 'Merge down'));
-  fastify.post('/paths/subtract-down', pathBitmapOpOpts, pathBitmapOp('subtractDown', 'Subtract down'));
+  fastify.post('/paths/merge-down', {
+    ...pathBitmapOpOpts,
+    config: { mcp: {
+      name: 'path_merge_down',
+      description: 'Context trees only. Make every document of the last segment of a path a member of all its parent segments too, so the documents show up under the full path. Use it after moving or copying a context path whose documents do not appear at the new location.',
+      args: { ...arg.workspace, ...arg.tree, path: { description: 'Absolute context path whose last segment is merged into its parents, e.g. /work/projects.' } },
+    } },
+  }, pathBitmapOp('mergeDown', 'Merge down'));
+  fastify.post('/paths/subtract-down', {
+    ...pathBitmapOpOpts,
+    config: { mcp: {
+      name: 'path_subtract_down',
+      description: 'Context trees only. Remove every document of the last segment of a path from all its parent segments. This is the inverse of path_merge_down and changes what the parent paths show.',
+      args: { ...arg.workspace, ...arg.tree, path: { description: 'Absolute context path whose last segment is subtracted from its parents, e.g. /work/projects.' } },
+    } },
+  }, pathBitmapOp('subtractDown', 'Subtract down'));
 
   fastify.post('/layers/merge', {
     onRequest: [fastify.authenticate],

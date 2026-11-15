@@ -2,6 +2,7 @@ import { workspaceErrorResponse } from '../../../runtimes/workspace/runtime/erro
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import * as arg from '../../mcp/args.js';
 import { requireWorkspaceRead, requireWorkspaceWrite, requireWorkspaceAdmin } from '../../middleware/workspace-acl.js';
 
 /**
@@ -320,6 +321,12 @@ export default async function workspaceLifecycleRoutes(fastify, _options) {
   // Start workspace — any member may start it (a stopped team workspace is
   // unusable otherwise); stopping stays admin-only since it affects everyone.
   fastify.post('/start', {
+    config: { mcp: {
+      name: 'workspace_start',
+      description: 'Start a stopped workspace so its documents and trees can be used. Document and tree tools answer 503 WORKSPACE_NOT_READY until the workspace is active. Starting an active workspace is harmless.',
+      args: { ...arg.workspace, passphrase: { description: 'Only for a protected (encrypted) workspace: the passphrase that unlocks it.' } },
+      only: ['passphrase'],
+    } },
     preValidation: async (request) => { if (request.body === undefined || request.body === null) request.body = {}; },
     onRequest: [fastify.authenticate, requireWorkspaceRead()],
     schema: {
@@ -365,6 +372,11 @@ export default async function workspaceLifecycleRoutes(fastify, _options) {
 
   // Stop workspace
   fastify.post('/stop', {
+    config: { mcp: {
+      name: 'workspace_stop',
+      description: 'Stop a running workspace and close its database. Its documents and trees are unavailable to every user until it is started again. Requires admin rights on the workspace.',
+      args: { ...arg.workspace },
+    } },
     onRequest: [fastify.authenticate, requireWorkspaceAdmin()],
     schema: {
       params: {

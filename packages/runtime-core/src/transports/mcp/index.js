@@ -1,41 +1,122 @@
-import { createHash } from 'node:crypto';
 import { toolSchemas } from './schema.js';
+import { buildTool, toolRequest } from './tools.js';
 import { PROTOCOL_VERSION, rpcError, complete, requestMetadata, requestHeaders, validateRequest } from './protocol.js';
 
 const endpoint = '/rest/v2/mcp';
+const prefix = '/rest/v2';
+const passHeaders = ['content-type', 'accept', 'range', 'if-match', 'if-none-match', 'upload-offset', 'x-canvas-mtime'];
+const pattern = url => new RegExp(`^${url.split(/(:\w+|\*)/).map(part => part === '*' ? '.*' : part.startsWith(':') ? '[^/]+' : part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('')}/?$`);
 
-/** Capture the actual route registry; calls re-enter HTTP auth, validation and ACLs. */
+/**
+ * Mount a route plugin a second time under an alias URL that drops path
+ * parameters (`/tree` beside `/trees/:tree`). The alias adds no tools: each
+ * tool the first mount declared serves the alias when the dropped arguments
+ * are omitted, which makes them optional.
+ */
+export const mcpAlias = plugin => async function aliasedRoutes(instance, options) {
+    instance.decorate('mcpAlias', true);
+    await plugin(instance, options);
+};
+
+const apiTools = [
+    {
+        name: 'api_route_list',
+        description: 'List the REST routes of this server, for use with api_request. The named tools cover everyday work with workspaces, documents, trees and messages; come here only when none fits (administration, storage backends, hooks and rules, sync, tokens, timelines and more). A row with tools is already served by those tools. Pass filter to narrow by a word in the path, and schemas to see query and body fields.',
+        inputSchema: { type: 'object', additionalProperties: false, properties: {
+            filter: { type: 'string', description: 'Case-insensitive text matched against the method, path and description, e.g. "pins" or "DELETE /workspaces".' },
+            schemas: { type: 'boolean', description: 'Include each route\'s query and body JSON Schema. Use with a filter; the unfiltered catalog is large.' },
+        } },
+    },
+    {
+        name: 'api_request',
+        description: 'Call a REST route from api_route_list with your token. Prefer a named tool when one exists. Returns statusCode, headers and body (bodyBase64 for binary responses).',
+        inputSchema: { type: 'object', additionalProperties: false, required: ['method', 'path'], properties: {
+            method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] },
+            path: { type: 'string', description: 'Path as listed by api_route_list with its :parameters filled in and URL-encoded, e.g. /workspaces/universe/pins.' },
+            query: { type: 'object', description: 'Query parameters. An array value repeats the parameter.' },
+            body: { description: 'JSON request body.' },
+            bodyBase64: { type: 'string', description: 'Raw request bytes instead of body, e.g. a multipart upload. Set content-type (with boundary) in headers.' },
+            headers: { type: 'object', additionalProperties: false, properties: Object.fromEntries(passHeaders.map(name => [name, { type: 'string' }])) },
+        } },
+    },
+];
+
+/**
+ * Bridge the REST route registry to MCP. Routes that declare `config.mcp`
+ * become named tools; every other route is reachable through api_request.
+ * Calls re-enter HTTP auth, validation and ACLs.
+ */
 export function installMcp(app) {
-    const routes = new Map();
+    const tools = new Map();
+    const catalog = [];
+    const excluded = [];
     app.addHook('onRoute', function captureRoute(route) {
-        if (!route.url.startsWith('/rest/v2/') || route.url === endpoint || route.config?.mcp === false) return;
-        for (const method of [route.method].flat()) {
-            if (method === 'HEAD' || method === 'OPTIONS') continue;
-            const key = `${method} ${route.url}`;
-            const name = `${method.toLowerCase()}_${route.url.replace('/rest/v2/', '').replace(/[^a-zA-Z0-9]/g, '_').slice(0, 90)}_${createHash('sha256').update(key).digest('hex').slice(0, 12)}`;
-            const params = [...route.url.matchAll(/:([\w]+)|\*/g)].map(match => match[1] || '*');
-            const schemas = toolSchemas(route.schema, id => this.getSchema(id));
-            routes.set(name, {
-                method, url: route.url, params,
-                tool: {
-                    name,
-                    description: `${key}${route.schema?.description ? ` — ${route.schema.description}` : ''}`,
-                    inputSchema: {
-                        type: 'object', additionalProperties: false,
-                        $defs: schemas.$defs,
-                        properties: {
-                            params: { type: 'object', properties: Object.fromEntries(params.map(p => [p, { type: 'string' }])), required: params, additionalProperties: false },
-                            query: route.schema?.querystring ? schemas.query : { type: 'object', additionalProperties: true },
-                            body: schemas.body,
-                            bodyBase64: { type: 'string', description: 'Raw request bytes, including multipart bodies. Set content-type with boundary in headers.' },
-                            headers: { type: 'object', properties: Object.fromEntries(['content-type', 'accept', 'range', 'if-match', 'if-none-match', 'upload-offset', 'x-canvas-mtime'].map(h => [h, { type: 'string' }])), additionalProperties: false },
-                        },
-                        ...(params.length ? { required: ['params'] } : {}),
-                    },
-                },
-            });
+        if (!route.url.startsWith(`${prefix}/`) || route.url === endpoint) return;
+        const methods = [route.method].flat().filter(method => method !== 'HEAD' && method !== 'OPTIONS');
+        if (route.config?.mcp === false) {
+            for (const method of methods) excluded.push({ method, match: pattern(route.url) });
+            return;
+        }
+        const declarations = [route.config?.mcp ?? []].flat();
+        if (declarations.length && methods.length > 1) throw new Error(`MCP tools on ${route.url} need a route with exactly one method`);
+        for (const method of methods) {
+            const entry = { method, url: route.url, match: pattern(route.url), description: route.schema?.description, tools: [], schema: route.schema, getSchema: id => this.getSchema(id) };
+            catalog.push(entry);
+            for (const declaration of declarations) {
+                const built = buildTool({ method, url: route.url, schema: route.schema }, declaration, entry.getSchema, { alias: Boolean(this.mcpAlias) });
+                const taken = tools.get(built.tool.name) || apiTools.find(tool => tool.name === built.tool.name);
+                if (this.mcpAlias) {
+                    if (!taken?.variants || taken.method !== method) throw new Error(`MCP alias ${method} ${route.url} must be mounted after the route that declares ${built.tool.name}`);
+                    taken.variants.push(built);
+                    const dropped = taken.pathArgs.filter(name => !built.pathArgs.includes(name));
+                    taken.required = taken.required.filter(name => !dropped.includes(name));
+                    taken.tool.inputSchema.required = taken.required;
+                    continue;
+                }
+                if (taken) throw new Error(`MCP tool name ${built.tool.name} is declared twice: ${taken.method ? `${taken.method} ${taken.url}` : 'built in'} and ${method} ${route.url}`);
+                tools.set(built.tool.name, { ...built, variants: [built] });
+                entry.tools.push(built.tool.name);
+            }
         }
     });
+
+    const listing = () => [...apiTools, ...[...tools.values()].map(entry => entry.tool)].sort((a, b) => a.name.localeCompare(b.name));
+
+    function listRoutes({ filter, schemas } = {}) {
+        const needle = typeof filter === 'string' ? filter.toLowerCase() : '';
+        return catalog
+            .map(entry => ({ entry, path: entry.url.slice(prefix.length) }))
+            .filter(({ entry, path }) => !needle || `${entry.method} ${path} ${entry.description || ''} ${entry.tools.join(' ')}`.toLowerCase().includes(needle))
+            .sort((a, b) => a.path.localeCompare(b.path) || a.entry.method.localeCompare(b.entry.method))
+            .map(({ entry, path }) => {
+                const row = { method: entry.method, path, ...(entry.tools.length ? { tools: entry.tools } : {}), ...(entry.description ? { description: entry.description } : {}) };
+                if (!schemas) return row;
+                const bundled = toolSchemas(entry.schema, entry.getSchema);
+                return { ...row, ...(entry.schema?.querystring ? { query: bundled.query } : {}), ...(entry.schema?.body ? { body: bundled.body } : {}), ...(Object.keys(bundled.$defs).length ? { $defs: bundled.$defs } : {}) };
+            });
+    }
+
+    function apiRequest(args) {
+        const { method, path, query, body, bodyBase64, headers } = args;
+        if (typeof path !== 'string' || !path.startsWith('/') || /[?#]/.test(path)) return { error: 'path must start with / and carry no query string; pass query separately' };
+        if (query != null && (typeof query !== 'object' || Array.isArray(query))) return { error: 'query must be an object' };
+        if (bodyBase64 !== undefined && typeof bodyBase64 !== 'string') return { error: 'bodyBase64 must be a string' };
+        if (body !== undefined && bodyBase64 !== undefined) return { error: 'Supply body or bodyBase64, not both' };
+        const url = `${prefix}${path}`;
+        const matches = entry => entry.method === method && entry.match.test(url);
+        const route = excluded.some(matches) ? null : catalog.find(matches);
+        if (!route) return { error: `No such route: ${method} ${path}. Find routes with api_route_list` };
+        // REST validation drops query parameters it does not know, which would widen a selection silently.
+        const known = route.schema?.querystring?.properties;
+        const unknown = known ? Object.keys(query || {}).filter(key => !Object.hasOwn(known, key)) : [];
+        if (unknown.length) return { error: `Unknown query parameter ${unknown.join(', ')}. ${method} ${path} takes: ${Object.keys(known).join(', ')}` };
+        const search = new URLSearchParams();
+        for (const [key, value] of Object.entries(query || {})) {
+            for (const item of Array.isArray(value) ? value : [value]) search.append(key, String(item));
+        }
+        return { method, url: `${url}${search.size ? `?${search}` : ''}`, body: bodyBase64 === undefined ? body : Buffer.from(bodyBase64, 'base64'),
+            headers: Object.fromEntries(passHeaders.filter(name => typeof headers?.[name] === 'string').map(name => [name, headers[name]])), withHeaders: true };
+    }
 
     async function dispatch(message, authorization) {
         const { id, method, params } = message;
@@ -43,35 +124,23 @@ export function installMcp(app) {
         if (method === 'server/discover') return result({ supportedVersions: [PROTOCOL_VERSION], capabilities: { tools: {} }, ttlMs: 0, cacheScope: 'private' });
         if (method === 'tools/list') {
             if (params.cursor !== undefined) return rpcError(id, -32602, 'Invalid cursor: the tool list is not paginated');
-            return result({ tools: [...routes.values()].map(route => route.tool).sort((a, b) => a.name.localeCompare(b.name)), ttlMs: 0, cacheScope: 'private' });
+            return result({ tools: listing(), ttlMs: 0, cacheScope: 'private' });
         }
         if (method !== 'tools/call') return rpcError(id, -32601, `Method not found; supported MCP version: ${PROTOCOL_VERSION}`);
-        const route = routes.get(params.name);
-        if (!route) return rpcError(id, -32602, 'Unknown tool');
-        const args = params.arguments || {};
-        if (typeof args !== 'object' || Array.isArray(args) || (args.query != null && (typeof args.query !== 'object' || Array.isArray(args.query)))) return rpcError(id, -32602, 'Invalid arguments');
-        if (args.bodyBase64 !== undefined && typeof args.bodyBase64 !== 'string') return rpcError(id, -32602, 'Invalid bodyBase64');
-        if (route.params.some(p => typeof args.params?.[p] !== 'string')) return rpcError(id, -32602, 'Missing path parameters');
-        if (args.body !== undefined && args.bodyBase64 !== undefined) return rpcError(id, -32602, 'Supply body or bodyBase64');
-        // Encode ordinary parameters as single segments. Wildcards preserve path separators.
-        const url = route.url.replace(/:([\w]+)|\*/g, (match, p) => p
-            ? encodeURIComponent(args.params[p])
-            : args.params['*'].split('/').map(encodeURIComponent).join('/'));
-        const query = new URLSearchParams();
-        for (const [key, value] of Object.entries(args.query || {})) {
-            for (const entry of Array.isArray(value) ? value : [value]) query.append(key, String(entry));
-        }
-        const headers = { authorization };
-        for (const key of ['content-type', 'accept', 'range', 'if-match', 'if-none-match', 'upload-offset', 'x-canvas-mtime']) {
-            if (typeof args.headers?.[key] === 'string') headers[key] = args.headers[key];
-        }
+        const args = params.arguments ?? {};
+        if (typeof args !== 'object' || Array.isArray(args)) return rpcError(id, -32602, 'Invalid arguments: an object is required');
+        const structured = (payload, isError = false) => result({ structuredContent: payload, isError, content: [{ type: 'text', text: JSON.stringify(payload) }] });
+        if (params.name === 'api_route_list') return structured({ routes: listRoutes(args) });
+        const entry = tools.get(params.name);
+        if (!entry && params.name !== 'api_request') return rpcError(id, -32602, 'Unknown tool');
+        const request = entry ? toolRequest(entry, args) : apiRequest(args);
+        if (request.error) return result({ isError: true, content: [{ type: 'text', text: request.error }] });
         try {
-            const response = await app.inject({ method: route.method, url: `${url}${query.size ? `?${query}` : ''}`, headers,
-                payload: args.bodyBase64 === undefined ? args.body : Buffer.from(args.bodyBase64, 'base64') });
+            const response = await app.inject({ method: request.method, url: request.url, headers: { authorization, ...request.headers }, payload: request.body });
             const type = String(response.headers['content-type'] || '');
-            const payload = { statusCode: response.statusCode, headers: response.headers,
-                ...(type.includes('json') ? { body: response.json() } : type.startsWith('text/') ? { body: response.body } : { bodyBase64: response.rawPayload.toString('base64') }) };
-            return result({ structuredContent: payload, isError: response.statusCode >= 400, content: [{ type: 'text', text: JSON.stringify(payload) }] });
+            const payload = { statusCode: response.statusCode, ...(request.withHeaders ? { headers: response.headers } : {}),
+                ...(type.includes('json') ? { body: response.json() } : type.startsWith('text/') ? { body: response.body } : { contentType: type, bodyBase64: response.rawPayload.toString('base64') }) };
+            return structured(payload, response.statusCode >= 400);
         } catch {
             return result({ isError: true, content: [{ type: 'text', text: 'Request execution failed' }] });
         }

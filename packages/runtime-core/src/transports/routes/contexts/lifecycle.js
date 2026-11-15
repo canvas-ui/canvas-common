@@ -4,6 +4,8 @@ import ResponseObject from '../../ResponseObject.js';
 import { validateUser } from '../../auth/strategies.js';
 import { resolveContextAddress } from '../../middleware/address-resolver.js';
 
+const contextArg = { ':id': { name: 'context', description: 'Context id, from context_list.' } };
+
 export default async function lifecycleRoutes(fastify, _options) {
   // Add a pre-handler hook to ensure user is authenticated and valid for all context document routes
   fastify.addHook('preHandler', async (request, reply) => {
@@ -23,6 +25,10 @@ export default async function lifecycleRoutes(fastify, _options) {
   // List all contexts
   fastify.get('/', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'context_list',
+      description: 'List the user\'s contexts. A context is a named, movable pointer to one tree path of one workspace (its url, e.g. universe://work/projects); apps, devices and mounts bound to a context follow it when the url changes. Contexts are not tree paths: to browse or edit paths use path_list and the path tools.',
+    } },
   }, async (request, reply) => {
 
     try {
@@ -42,6 +48,12 @@ export default async function lifecycleRoutes(fastify, _options) {
   // Create new context
   fastify.post('/', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'context_create',
+      description: 'Create a context: a named pointer to a tree path of a workspace that clients can bind to and follow.',
+      args: { id: { description: 'Id for the new context, e.g. work. It is normalized (lowercased, spaces removed); use the id returned in the answer afterwards.' }, workspaceId: { name: 'workspace', description: 'Workspace name or id the context points into. Not needed when url names it.' } },
+      only: ['id', 'name', 'url', 'description', 'workspaceId'],
+    } },
     schema: {
       body: {
         type: 'object',
@@ -91,6 +103,11 @@ export default async function lifecycleRoutes(fastify, _options) {
   // Note: The prefix for this group is '/', so this becomes GET /:id
   fastify.get('/:id', {
     onRequest: [fastify.authenticate, resolveContextAddress],
+    config: { mcp: {
+      name: 'context_get',
+      description: 'Get one context: the workspace and tree path it currently points at (url), its saved filters and settings.',
+      args: contextArg,
+    } },
     schema: {
       params: {
         type: 'object',
@@ -179,6 +196,11 @@ export default async function lifecycleRoutes(fastify, _options) {
   // Note: The prefix for this group is '/', so this becomes POST /:id/url
   fastify.post('/:id/url', {
     onRequest: [fastify.authenticate, resolveContextAddress],
+    config: { mcp: {
+      name: 'context_set_url',
+      description: 'Point a context at another tree path or workspace. Everything bound to the context (apps, browser tabs, mounts) switches to the new location. A path that does not exist yet is created.',
+      args: { ...contextArg, url: { description: 'New location: workspace://path, e.g. universe://work/projects, or a bare path such as /work/projects to stay in the same workspace.' }, treeName: { name: 'tree', description: 'Tree the path is in. Omit for the default context tree.' } },
+    } },
     schema: {
       params: {
         type: 'object',
@@ -332,6 +354,11 @@ export default async function lifecycleRoutes(fastify, _options) {
   // Note: The prefix for this group is '/', so this becomes DELETE /:id
   fastify.delete('/:id', {
     onRequest: [fastify.authenticate, resolveContextAddress],
+    config: { mcp: {
+      name: 'context_delete',
+      description: 'Delete a context. Only the pointer is removed; the workspace, its tree paths and documents are untouched.',
+      args: contextArg,
+    } },
     schema: {
       params: {
         type: 'object',

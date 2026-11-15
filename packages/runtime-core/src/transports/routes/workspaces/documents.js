@@ -2,6 +2,7 @@
 
 import { downloadLink } from '../../../runtimes/workspace/services/download-link.js';
 import ResponseObject from '../../ResponseObject.js';
+import * as arg from '../../mcp/args.js';
 import Ajv from 'ajv';
 import { documentQuerySchema } from '../../document-query-schema.js';
 import { parseSpec } from '@augmentd-labs/canvas-synapsd/src/utils/spec.js';
@@ -593,6 +594,24 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
     // Fast gzip keeps complete cached emails affordable on mobile links.
     compress: { encodings: ['gzip'], threshold: 1024, zlibOptions: { level: 1 } },
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'document_list',
+      description: 'List the documents under one tree path, newest first, or search them by text when query is given. This is the simple search: one path, optional text, optional feature and date filters. Use document_find when you need several paths, relations, counts or a directory tree with exact folder membership.',
+      args: {
+        ...arg.workspace, ...arg.documentPath,
+        q: { name: 'query', description: 'Search text. Words match in any order; "double quotes" match a phrase; a leading - excludes a word. Omit to list everything under the path.' },
+        match: { description: 'exact treats the whole query as one phrase. Default any.' },
+        allOf: { description: 'Feature keys a document must have all of, e.g. data/schema/note, tag/finance, data/mime/application/pdf.' },
+        anyOf: { description: 'Feature keys of which a document must have at least one.' },
+        noneOf: { description: 'Feature keys a document must not have.' },
+        filters: { description: 'Timeline filters, e.g. t:content:2026-10-01..2026-10-31 or t:crud:updated:thisWeek.' },
+        scope: { description: 'workspace ignores path and covers every document in the workspace. Default path.' },
+        sortBy: { description: 'Timeline to sort a listing by, e.g. content, crud:created, crud:updated. Text search results stay ranked by relevance.' },
+        limit: { description: 'Page size. Default 200.' },
+        idsOnly: { description: 'Return document ids instead of full documents.' },
+      },
+      only: ['context', 'treeNameOrTreeId', 'treeType', 'q', 'match', 'allOf', 'anyOf', 'noneOf', 'filters', 'scope', 'sortBy', 'order', 'limit', 'offset', 'idsOnly'],
+    } },
     schema: {
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
       querystring: {
@@ -633,6 +652,11 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   const queryValidator = new Ajv({ coerceTypes: false, removeAdditional: false, strict: false });
   fastify.post('/search', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'document_find',
+      description: 'Find documents with a structured query. Every argument is optional and they intersect: text (query), tree paths (context, directory or paths), features, timeline filters, relations (rel) and ids. No arguments selects the whole workspace. Set countOnly for a count or idsOnly for ids without loading documents. For a plain listing or text search under one path, document_list is simpler.',
+      args: { ...arg.workspace },
+    } },
     validatorCompiler: ({ schema }) => queryValidator.compile(schema),
     schema: {
       description: 'Query workspace documents with the native Synapsd spec: bitmap paths/features/timelines/relations, text ranking, IDs or countOnly. Empty spec selects the workspace. Compound lines intersect the shared spec, then combine by op. query accepts inline @predicate:value tokens (an id, e-mail address or identity name; :out reverses the direction). PDF MIME matches attachments; use includes relations to select their emails.',
@@ -832,6 +856,26 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.post('/', {
     onRequest: [fastify.authenticateClient],
+    config: { mcp: [
+      {
+        name: 'document_add',
+        description: 'Add new documents (notes, links, tasks and other typed documents) to a workspace and file them under a tree path. Each document is { schema, data }, where schema is a full id such as data/schema/note and data holds the fields of that type; schema_get lists them. A document whose content already exists is not duplicated: the existing one is filed under the path. To file documents that already exist by id, use document_link.',
+        args: {
+          ...arg.workspace, ...arg.documentPath,
+          documents: { description: 'One document or an array of documents, each { schema, data }, e.g. { "schema": "data/schema/note", "data": { "title": "Shopping", "content": "milk" } }.' },
+          features: { description: 'Extra feature keys to set on every added document, e.g. tag/finance.' },
+        },
+        only: ['documents', 'context', 'treeNameOrTreeId', 'treeType', 'features', 'createPath', 'returnDetails'],
+        required: ['documents'],
+      },
+      {
+        name: 'document_link',
+        description: 'File existing documents under a tree path by id, without changing their content. In a context tree, linking to /a/b makes the document a member of both a and b. Linking does not remove a document from the paths it is already in; to move a document, link it to the new path and then document_unlink it from the old one.',
+        args: { ...arg.workspace, ...arg.documentPath },
+        only: ['documentIds', 'context', 'treeNameOrTreeId', 'treeType', 'createPath'],
+        required: ['documentIds', 'context'],
+      },
+    ] },
     schema: {
       description: 'Insert documents or link existing IDs into destination paths. Fetch /schemas/data/schema/<type> for required fields and examples. Missing paths are created by default; set createPath false to require existing destinations. Validation failures return INVALID_DOCUMENT with field paths.',
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
@@ -1021,6 +1065,12 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.put('/', {
     onRequest: [fastify.authenticateClient],
+    config: { mcp: {
+      name: 'document_update',
+      description: 'Change existing documents. Each item carries the id of the document and the fields to replace; data replaces the whole data object, so read the document with document_get first and send the complete new data. To change where a document is filed use document_link and document_unlink.',
+      args: { ...arg.workspace, documents: { description: 'Documents to update, each { id, data, ... }, e.g. [{ "id": 100001, "data": { "title": "New title", "content": "..." } }].' } },
+      only: ['documents'],
+    } },
     schema: {
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
       body: {
@@ -1082,6 +1132,13 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.delete('/', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'document_delete',
+      description: 'Delete documents from the workspace permanently: they disappear from every tree path and from search. This cannot be undone. To take a document out of one path and keep it, use document_unlink.',
+      args: { ...arg.workspace },
+      body: 'documentIds',
+      only: [],
+    } },
     schema: {
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
       querystring: { type: 'object', properties: { ...contextQueryProps, ...attributesQueryProps } },
@@ -1219,6 +1276,14 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.delete('/remove', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'document_unlink',
+      description: 'Remove documents from a tree path without deleting them; they stay in the workspace and in their other paths. In a context tree this clears membership of the last path segment only: unlinking from /a/b leaves the document in /a. Unlinking from / is refused.',
+      args: { ...arg.workspace, ...arg.documentPath },
+      body: 'documentIds',
+      only: ['context', 'treeNameOrTreeId', 'treeType'],
+      required: ['context'],
+    } },
     schema: {
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
       querystring: {
@@ -1462,6 +1527,12 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.get('/:docId', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'document_get',
+      description: 'Read one document by id: schema, data, features, metadata and storage locations. Notes, links, tasks, contacts and other structured documents carry their whole content in data, so this is how you read them. For the bytes of a stored file or the body of an e-mail use document_content_get.',
+      args: { ...arg.workspace, ...arg.document },
+      only: [],
+    } },
     schema: {
       params: { type: 'object', required: ['id', 'docId'], properties: { id: { type: 'string' }, docId: { type: 'string' } } },
       querystring: { type: 'object', properties: { ...contextQueryProps, ...attributesQueryProps } },
@@ -1550,6 +1621,16 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.get('/:docId/content', {
     onRequest: [authenticateContent],
+    config: { mcp: {
+      name: 'document_content_get',
+      description: 'Read the stored bytes of a file document (text is returned as body, anything else base64 in bodyBase64 with its contentType), or the parsed body of an e-mail with format "email". Only documents with a storage location have content; notes, links and tasks answer 404 here and are read with document_get. The whole file is returned, so check metadata.size with document_get first.',
+      args: {
+        ...arg.workspace, ...arg.document,
+        url: { description: 'Read one attachment or one stored copy instead of the primary content: a url from the document\'s data.attachments or locations.' },
+        format: { description: 'email returns the parsed text and HTML bodies of an e-mail document instead of the raw message.' },
+      },
+      only: ['url', 'format'],
+    } },
     schema: {
       params: { type: 'object', required: ['id', 'docId'], properties: { id: { type: 'string' }, docId: { type: 'string' } } },
       querystring: { type: 'object', properties: { download: { type: 'string' }, url: { type: 'string' }, format: { type: 'string', enum: ['email'] } } },
@@ -1696,6 +1777,12 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.get('/:docId/locations', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'document_location_list',
+      description: 'List where the bytes of a file document are stored (storage backends and devices) and whether each copy is reachable. This is about storage; for the tree paths a document is filed under use document_path_list.',
+      args: { ...arg.workspace, ...arg.document },
+      only: [],
+    } },
     schema: {
       params: { type: 'object', required: ['id', 'docId'], properties: { id: { type: 'string' }, docId: { type: 'string' } } },
     },
@@ -1727,6 +1814,11 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.get('/:docId/memberships', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'document_path_list',
+      description: 'List every tree path a document is filed under, per tree. Use it to see where a document lives before linking, unlinking or moving it.',
+      args: { ...arg.workspace, ...arg.document, tree: { description: 'Limit the answer to one tree name or id.' } },
+    } },
     schema: {
       params: { type: 'object', required: ['id', 'docId'], properties: { id: { type: 'string' }, docId: { type: 'string' } } },
       querystring: { type: 'object', properties: { tree: { type: 'string' } } },
@@ -1770,6 +1862,11 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   const RELATION_PREDICATES = listPredicates();
 
   // Body shared by POST/DELETE: which edge, and on which axis.
+  const relationArgs = {
+    p: { name: 'predicate', description: 'Relation predicate, from relation_predicate_list.' },
+    to: { description: 'Id or ids of the other document(s).' },
+    dir: { name: 'direction', description: 'out (default): this document points at the others. in: the others point at this document.' },
+  };
   const relationBodySchema = {
     type: 'object',
     required: ['p', 'to'],
@@ -1813,6 +1910,11 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   // a document id.
   fastify.get('/relations/predicates', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'relation_predicate_list',
+      description: 'List the relation predicates documents can be connected with (e.g. includes, replies-to, authored-by, mentions) and what each means. Use the names in document_relation_add and in the rel argument of document_find.',
+      args: { ...arg.workspace },
+    } },
     schema: {
       description: 'List every registered Synapsd relation predicate. Use @predicate: value in document text searches; whitespace after the colon is accepted. Values may be document IDs, email addresses or quoted identity names. The default finds documents pointing to the value; :out reverses the direction.',
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
@@ -1832,6 +1934,15 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.get('/:docId/relations', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'document_relation_list',
+      description: 'List the relations of one document in both directions (what it points at and what points at it), with the related documents.',
+      args: {
+        ...arg.workspace, ...arg.document,
+        resolve: { description: 'false returns only ids and predicates, without the related documents.' },
+        summary: { description: 'true returns a short preview of each related document instead of the full document.' },
+      },
+    } },
     schema: {
       params: { type: 'object', required: ['id', 'docId'], properties: { id: { type: 'string' }, docId: { type: 'string' } } },
       querystring: {
@@ -1883,6 +1994,11 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.post('/:docId/relations', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'document_relation_add',
+      description: 'Connect one document to others with a relation predicate, e.g. an e-mail includes its attachment, a note references a link. Adding an existing relation is harmless.',
+      args: { ...arg.workspace, ...arg.document, ...relationArgs },
+    } },
     schema: {
       params: { type: 'object', required: ['id', 'docId'], properties: { id: { type: 'string' }, docId: { type: 'string' } } },
       body: relationBodySchema,
@@ -1937,6 +2053,11 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.delete('/:docId/relations', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'document_relation_remove',
+      description: 'Remove a relation between one document and others. The documents themselves are kept.',
+      args: { ...arg.workspace, ...arg.document, ...relationArgs },
+    } },
     schema: {
       params: { type: 'object', required: ['id', 'docId'], properties: { id: { type: 'string' }, docId: { type: 'string' } } },
       body: relationBodySchema,
@@ -1980,6 +2101,16 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
 
   fastify.get('/by-hash/:algo/:hash', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'document_get_by_hash',
+      description: 'Read the document whose content has a given checksum. Use it to check whether a file is already in the workspace before adding it.',
+      args: {
+        ...arg.workspace,
+        ':algo': { name: 'algorithm', description: 'Checksum algorithm: sha1 or sha256.' },
+        ':hash': { description: 'Hex checksum of the content.' },
+      },
+      only: [],
+    } },
     schema: {
       params: { type: 'object', required: ['id', 'algo', 'hash'], properties: { id: { type: 'string' }, algo: { type: 'string' }, hash: { type: 'string' } } },
       querystring: { type: 'object', properties: { ...contextQueryProps, ...attributesQueryProps } },

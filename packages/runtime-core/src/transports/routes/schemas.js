@@ -16,6 +16,10 @@ export default async function schemaRoutes(fastify, _options) {
 
   // List all data schemas
   fastify.get('/', {
+    config: { mcp: {
+      name: 'schema_list',
+      description: 'List the document types (schemas) a document can have, e.g. data/schema/note, data/schema/link, data/schema/task. Use schema_get for the fields of one type before adding a document of that type.',
+    } },
   }, async (request, reply) => {
     try {
       const schemas = schemaRegistry.listSchemas('data');
@@ -34,8 +38,13 @@ export default async function schemaRoutes(fastify, _options) {
   // JSON Schema; the bare id serves the registration descriptor — the old
   // handler returned the CLASS, which JSON-serializes to `{}`.
   fastify.get('/data/schema/*', {
+    config: { mcp: {
+      name: 'schema_get',
+      description: 'Get one document type: required and optional fields of its data object, an example and normalization notes. Call this before document_add when you do not know the fields of a type.',
+      args: { '*': { name: 'schema', description: 'Schema id from schema_list, e.g. data/schema/note or the short form note, task, message/email.' } },
+    } },
     schema: {
-      description: 'Get document type fields, required/optional lists, JSON Schema, examples and normalization notes from Synapsd. The wildcard is the schema suffix (e.g. link, task, message/email). Append .json for JSON Schema only.',
+      description: 'Get document type fields, required/optional lists, JSON Schema, examples and normalization notes from Synapsd. The wildcard is the schema suffix (e.g. link, task, message/email); a full data/schema/ id is accepted too. Append .json for JSON Schema only.',
       params: {
         type: 'object',
         required: ['*'],
@@ -46,7 +55,7 @@ export default async function schemaRoutes(fastify, _options) {
     }
   }, async (request, reply) => {
     try {
-      const splat = request.params['*'] || '';
+      const splat = (request.params['*'] || '').replace(/^data\/schema\//, '');
       const wantsJson = splat.endsWith('.json');
       const tail = wantsJson ? splat.slice(0, -'.json'.length) : splat;
       // Closed-enum children (application/flatpak) are registered. An unknown

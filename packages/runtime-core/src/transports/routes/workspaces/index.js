@@ -3,6 +3,9 @@ import { allowsStoppedWorkspace } from '../../middleware/workspace-acl.js';
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import * as arg from '../../mcp/args.js';
+import { mcpAlias } from '../../mcp/index.js';
+import workspaceTreeRoutes from './tree.js';
 import { requireWorkspaceRead, requireWorkspaceWrite as _requireWorkspaceWrite, requireWorkspaceAdmin } from '../../middleware/workspace-acl.js';
 import { enforceAgentBinding } from '../../middleware/agent-acl.js';
 import { validateUser } from '../../auth/strategies.js';
@@ -130,7 +133,7 @@ export default async function workspaceRoutes(fastify, _options) {
     prefix: '/:id/trees/:treeNameOrTreeId',
     onRequest: [resolveWorkspaceAddress]
   });
-  fastify.register(import('./tree.js'), {
+  fastify.register(mcpAlias(workspaceTreeRoutes), {
     prefix: '/:id/tree',
     onRequest: [resolveWorkspaceAddress]
   });
@@ -235,7 +238,11 @@ export default async function workspaceRoutes(fastify, _options) {
   });
   // List all workspaces
   fastify.get('/', {
-    onRequest: [fastify.authenticate]
+    onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'workspace_list',
+      description: 'List the workspaces this token can use, with name, id and status. Start here: every other workspace, document and tree tool takes a workspace name or id. A workspace whose status is not "active" must be started with workspace_start before its documents and trees can be read.',
+    } },
   }, async (request, reply) => {
 
     try {
@@ -379,6 +386,11 @@ export default async function workspaceRoutes(fastify, _options) {
   // Get workspace details
   fastify.get('/:id', {
     onRequest: [fastify.authenticate, resolveWorkspaceAddress, requireWorkspaceRead()],
+    config: { mcp: {
+      name: 'workspace_get',
+      description: 'Get one workspace: status, description, owner, access list and storage backend configuration.',
+      args: { ...arg.workspace },
+    } },
     schema: {
       params: {
         type: 'object',

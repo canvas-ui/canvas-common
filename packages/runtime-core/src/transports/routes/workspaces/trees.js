@@ -1,6 +1,7 @@
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import * as arg from '../../mcp/args.js';
 import { treeScopeBase } from '../../middleware/tree-scope.js';
 
 export default async function workspaceTreesRoutes(fastify) {
@@ -31,6 +32,7 @@ export default async function workspaceTreesRoutes(fastify) {
 
   fastify.get('/', {
     onRequest: [fastify.authenticate],
+    config: { mcp: { name: 'tree_list', args: { ...arg.workspace } } },
     schema: { description: 'List workspace trees and their types. context trees AND node bitmaps along each path (/foo/bar/baz = foo AND bar AND baz); linking ticks every node and does not retain explicit filing locations. directory trees have filesystem-like exact folder membership; recursive queries OR descendant folders.' },
   }, async (request, reply) => {
     const workspace = await getWorkspaceInstance(request, reply);
@@ -44,6 +46,11 @@ export default async function workspaceTreesRoutes(fastify) {
 
   fastify.post('/', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'tree_create',
+      description: 'Create an additional tree in a workspace. Type "context" makes a tree of shared layers where a path selects the intersection of its segments; "directory" makes filesystem-like folders with exact membership. Every workspace already has a default tree of each type; to add a folder or context path to an existing tree use path_create.',
+      args: { ...arg.workspace, name: { description: 'Name of the new tree.' } },
+    } },
     schema: {
       body: {
         type: 'object',
@@ -69,6 +76,11 @@ export default async function workspaceTreesRoutes(fastify) {
 
   fastify.patch('/:treeNameOrTreeId', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'tree_rename',
+      description: 'Rename a whole tree. The built-in trees cannot be renamed. To rename a folder or context path inside a tree use path_rename.',
+      args: { ...arg.workspace, ':treeNameOrTreeId': { name: 'tree', description: 'Current tree name or id, from tree_list.' }, name: { description: 'New tree name.' } },
+    } },
     schema: {
       body: {
         type: 'object',
@@ -95,6 +107,11 @@ export default async function workspaceTreesRoutes(fastify) {
 
   fastify.delete('/:treeNameOrTreeId', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'tree_delete',
+      description: 'Delete a whole tree and every path in it. Documents stay in the workspace and in other trees. The built-in trees cannot be deleted. To remove one path use path_delete.',
+      args: { ...arg.workspace, ':treeNameOrTreeId': { name: 'tree', description: 'Tree name or id, from tree_list.' } },
+    } },
   }, async (request, reply) => {
     try {
       const workspace = await getWorkspaceInstance(request, reply);

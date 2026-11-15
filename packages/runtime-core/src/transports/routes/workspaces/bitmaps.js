@@ -1,6 +1,7 @@
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import * as arg from '../../mcp/args.js';
 
 export default async function workspaceBitmapRoutes(fastify, _options) {
   const parseBool = (value) => value === true || value === 'true' || value === 1 || value === '1';
@@ -37,6 +38,12 @@ export default async function workspaceBitmapRoutes(fastify, _options) {
   // Returns bitmap metadata list; optionally include bitmap IDs.
   fastify.get('/', {
     onRequest: [fastify.authenticate],
+    config: { mcp: {
+      name: 'feature_list',
+      description: 'List the feature keys present in a workspace with the number of documents carrying each: document types (data/schema/...), MIME types (data/mime/...), tags (tag/...) and markers such as feature/email/attachment. These are the keys to pass as features to document_find and as allOf, anyOf, noneOf to document_list. Keys under context/ and vfs/ are the membership sets of tree paths; address those by path instead.',
+      args: { ...arg.workspace },
+      only: [],
+    } },
     schema: {
       params: {
         type: 'object',

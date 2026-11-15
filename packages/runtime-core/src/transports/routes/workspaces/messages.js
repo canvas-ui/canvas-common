@@ -1,9 +1,17 @@
 import { requireWorkspaceRead, requireWorkspaceWrite, requireWorkspaceAdmin } from '../../middleware/workspace-acl.js';
 import { emailListPreview } from '../../../runtimes/workspace/connectors/imap/content.js';
+import * as arg from '../../mcp/args.js';
 
 export default async function messageRoutes(app) {
     const fail = (reply, error) => reply.code(error.statusCode || 400).send({ status: 'error', message: error.message });
-    app.get('/accounts', { onRequest: [app.authenticate, requireWorkspaceRead()] }, async (request) => ({
+    app.get('/accounts', {
+        onRequest: [app.authenticate, requireWorkspaceRead()],
+        config: { mcp: {
+            name: 'message_account_list',
+            description: 'List the e-mail, Slack and WhatsApp accounts connected to a workspace and whether sending through each is enabled. Call it before message_send to pick the account (driver and address).',
+            args: { ...arg.workspace },
+        } },
+    }, async (request) => ({
         status: 'success', payload: await request.workspace.messagingAccounts(),
     }));
     app.get('/thread/:docId', { onRequest: [app.authenticate, requireWorkspaceRead()] }, async (request, reply) => {
@@ -38,7 +46,14 @@ export default async function messageRoutes(app) {
         try { return { status: 'success', payload: await request.workspace.messageConnection(request.params.driver, request.params.address, true) }; }
         catch (error) { return fail(reply, error); }
     });
-    app.get('/outbox/:requestId', { onRequest: [app.authenticate, requireWorkspaceWrite()] }, async (request, reply) => {
+    app.get('/outbox/:requestId', {
+        onRequest: [app.authenticate, requireWorkspaceWrite()],
+        config: { mcp: {
+            name: 'message_send_status',
+            description: 'Check what happened to an earlier message_send by its requestId, without sending anything. Use it after a timeout or an unclear answer instead of sending again.',
+            args: { ...arg.workspace, ':requestId': { description: 'The requestId that was passed to message_send.' } },
+        } },
+    }, async (request, reply) => {
         if (request.resourceToken && request.resourceToken.type !== 'agent') return reply.code(403).send({ status: 'error', message: 'Share tokens cannot access the outbox' });
         try { return { status: 'success', payload: await request.workspace.messageSendStatus(request.params.requestId, request.resourceToken?.agentId || request.user.id) }; }
         catch (error) { return fail(reply, error); }
@@ -46,7 +61,27 @@ export default async function messageRoutes(app) {
     app.post('/send', {
         onRequest: [app.authenticate, requireWorkspaceWrite()],
         bodyLimit: 12 * 1024 * 1024,
-        config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+        config: {
+            rateLimit: { max: 20, timeWindow: '1 minute' },
+            mcp: {
+                name: 'message_send',
+                description: 'Send a message to people outside Canvas through a connected e-mail, Slack or WhatsApp account, or reply to a message document. This communicates externally as that account, so use it only when the user asked for it. For a new message give driver, address and the recipients (to for e-mail, target for Slack and WhatsApp); for a reply give replyToDocumentId and the account and thread are resolved for you. "accepted" in the answer means the provider took the message, not that it was delivered.',
+                args: {
+                    ...arg.workspace,
+                    requestId: { description: 'A new UUID for this message. After a timeout or error, retry with the same requestId so the message is not sent twice.' },
+                    text: { description: 'Plain-text message body.' },
+                    replyToDocumentId: { description: 'Id of the e-mail or chat message document to reply to.' },
+                    driver: { description: 'Account type, from message_account_list. Omit for a reply.' },
+                    address: { description: 'Account address or label, from message_account_list. Omit for a reply.' },
+                    target: { description: 'Slack channel name or id, or WhatsApp conversation id. Omit for e-mail and for a reply.' },
+                    files: { description: 'Attach stored files: [{ documentId }], or one attachment of an e-mail document with attachmentIndex.' },
+                    quote: { description: 'E-mail replies: quote the original message below the text.' },
+                    forward: { description: 'E-mail: forward the message in replyToDocumentId to new recipients.' },
+                    html: { description: 'E-mail: HTML body sent alongside text.' },
+                },
+                only: ['requestId', 'text', 'html', 'replyToDocumentId', 'replyAll', 'quote', 'forward', 'driver', 'address', 'target', 'to', 'cc', 'bcc', 'subject', 'files'],
+            },
+        },
         schema: { body: {
             type: 'object', required: ['requestId', 'text'], additionalProperties: false,
             properties: {
