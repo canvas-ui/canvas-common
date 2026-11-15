@@ -3,8 +3,10 @@ import http from 'node:http';
 /** Deterministic OpenAI-compatible Ollama/STT/Kokoro stand-in for transport tests. */
 export async function startModelService() {
     const calls = { completions: 0, transcriptions: 0, syntheses: 0 };
+    const spoken = [];
     const server = http.createServer(async (req, res) => {
-        for await (const _ of req) { /* consume JSON or multipart */ }
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
         if (req.url === '/v1/models') {
             res.setHeader('content-type', 'application/json');
             res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
@@ -20,10 +22,11 @@ export async function startModelService() {
             res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ text: 'Say hello' }));
         } else if (req.url === '/v1/audio/speech') {
             calls.syntheses++;
+            spoken.push(JSON.parse(Buffer.concat(chunks).toString()).input);
             res.setHeader('content-type', 'audio/mpeg'); res.end(Buffer.from('test-audio'));
         } else res.writeHead(404).end();
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-    return { url: `http://127.0.0.1:${server.address().port}`, calls,
+    return { url: `http://127.0.0.1:${server.address().port}`, calls, spoken,
         close: () => new Promise(resolve => server.close(resolve)) };
 }

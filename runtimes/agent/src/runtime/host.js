@@ -11,7 +11,6 @@ import staticFiles from '@fastify/static';
 import Agents from '../core/agent/index.js';
 import Voice from '../services/voice/src/index.js';
 import agentRoutes from '../transports/routes/agents/index.js';
-import voiceRoutes from '../transports/routes/voice/index.js';
 import registerAgent from '../transports/websocket/channels/agent.js';
 import { isHubCredential, verifyHubCredential } from '@augmentd-labs/canvas-api-client/hub-credential';
 
@@ -151,7 +150,6 @@ export async function createAgentHost({ root, name, model, ollamaUrl, voice = {}
     // Empty discovery lists keep the shared UI usable without a workspace service.
     for (const resource of ['workspaces', 'contexts', 'roles']) app.get(`/rest/v2/${resource}`, async () => envelope([]));
     app.register(agentRoutes, { prefix: '/rest/v2/agents' });
-    app.register(voiceRoutes, { prefix: '/rest/v2/voice' });
     app.io.use((socket, next) => {
         if (!equals(socket.handshake.auth?.token, config.token)) return next(new Error('Valid local bearer token required'));
         socket.user = user; socket.subscriptions = new Set(); next();

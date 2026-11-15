@@ -10,6 +10,9 @@ import { rejectAgentTokens } from '../../middleware/agent-acl.js';
  * Agent routes handler
  * @param {FastifyInstance} fastify
  */
+const agentArg = { ':agentIdentifier': { name: 'agent', description: 'Agent name or id, as returned by agent_list.' } };
+const mcp = (name, description, extra = {}) => ({ mcp: { name, description, args: agentArg, ...extra } });
+
 export default async function agentRoutes(fastify, _options) {
 
     // Agent tokens are data-plane only — an agent may not manage agents
@@ -214,7 +217,7 @@ export default async function agentRoutes(fastify, _options) {
     /**
      * List agents
      */
-    fastify.get('/', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    fastify.get('/', { onRequest: [fastify.authenticate], config: { mcp: { name: 'agent_list', description: 'List the agents you own or can use, with their model and whether each is running.' } } }, async (request, reply) => {
         if (!requireUser(request, reply)) return;
         try {
             const agents = await fastify.agents.listByUser(request.user.id, request.query.host);
@@ -269,7 +272,7 @@ export default async function agentRoutes(fastify, _options) {
     /**
      * Get agent
      */
-    fastify.get('/:agentIdentifier', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    fastify.get('/:agentIdentifier', { onRequest: [fastify.authenticate], config: mcp('agent_get', 'Read one agent: model, configuration, workspace binding and status.') }, async (request, reply) => {
         if (!requireUser(request, reply)) return;
         try {
             const agent = await fastify.agents.open(request.user.id, request.params.agentIdentifier, request.user.id);
@@ -289,7 +292,7 @@ export default async function agentRoutes(fastify, _options) {
     /**
      * Get agent status
      */
-    fastify.get('/:agentIdentifier/status', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    fastify.get('/:agentIdentifier/status', { onRequest: [fastify.authenticate], config: mcp('agent_status_get', 'Check whether an agent is running before prompting it.') }, async (request, reply) => {
         if (!requireUser(request, reply)) return;
         try {
             const agent = await fastify.agents.open(request.user.id, request.params.agentIdentifier, request.user.id);
@@ -715,7 +718,7 @@ export default async function agentRoutes(fastify, _options) {
     /**
      * Start agent
      */
-    fastify.post('/:agentIdentifier/start', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    fastify.post('/:agentIdentifier/start', { onRequest: [fastify.authenticate], config: mcp('agent_start', 'Start an agent. Prompting starts it on demand, so this is only needed to warm it up or after agent_stop.') }, async (request, reply) => {
         if (!requireUser(request, reply)) return;
         try {
             const agent = await fastify.agents.start(
@@ -737,7 +740,7 @@ export default async function agentRoutes(fastify, _options) {
     /**
      * Stop agent
      */
-    fastify.post('/:agentIdentifier/stop', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    fastify.post('/:agentIdentifier/stop', { onRequest: [fastify.authenticate], config: mcp('agent_stop', 'Stop a running agent and abort what it is doing. Its sessions are kept.') }, async (request, reply) => {
         if (!requireUser(request, reply)) return;
         try {
             const success = await fastify.agents.stop(
@@ -779,109 +782,113 @@ export default async function agentRoutes(fastify, _options) {
     });
 
     /**
-     * Prompt (non-streaming) — waits for completion, returns messages.
-     */
-    /**
-     * Voice round-trip: audio in -> transcript -> agent prompt -> reply text
-     * (+ synthesized audio when TTS is configured).
+     * Voice for a conversation with this agent. A client records a clip,
+     * transcribes it, sends the text as an ordinary (streaming) prompt and
+     * has the reply spoken:
      *
-     * Request: multipart with an audio file part, OR JSON { audio: <base64>, mimeType }.
-     * Query/body options: tts=false to skip synthesis, voice, format, language.
-     * Response payload: { transcript, reply, audio: <base64>|null, audioMimeType, voice }
+     *   GET  /:agent/voice            - { stt, tts }, null where not configured
+     *   POST /:agent/voice/transcribe - multipart audio file -> { text }
+     *   POST /:agent/voice/speak      - { text, voice?, format? } -> audio bytes
+     *
+     * The routes belong to the agent so a remote agent runtime serves them
+     * with its own speech models.
      */
-    fastify.post('/:agentIdentifier/voice', { onRequest: [fastify.authenticate] }, async (request, reply) => {
-        if (!requireUser(request, reply)) return;
-        if (!fastify.voice?.sttEnabled) {
-            const r = new ResponseObject().badRequest(
-                'Speech-to-text not configured (set CANVAS_VOICE_STT_URL)',
-            );
-            return reply.code(r.statusCode).send(r.getResponse());
+    const openVoiceAgent = async (request, reply, side) => {
+        if (!requireUser(request, reply)) return false;
+        const agent = await fastify.agents.open(request.user.id, request.params.agentIdentifier, request.user.id);
+        if (!agent) {
+            const r = new ResponseObject().notFound('Agent not found');
+            reply.code(r.statusCode).send(r.getResponse());
+            return false;
         }
-
-        try {
-            // 1. Extract audio (multipart file part or JSON base64)
-            let audio = null;
-            let mimeType = 'audio/webm';
-            let options = { ...request.query };
-
-            if (request.isMultipart?.()) {
-                const file = await request.file();
-                if (file) {
-                    audio = await file.toBuffer();
-                    mimeType = file.mimetype || mimeType;
-                    const field = file.fields?.viewContext;
-                    if (field && 'value' in field) {
-                        try { options.viewContext = JSON.parse(field.value); }
-                        catch { throw Object.assign(new Error('viewContext must contain valid JSON'), { statusCode: 400 }); }
-                    }
-                }
-            } else if (request.body && typeof request.body === 'object' && request.body.audio) {
-                audio = Buffer.from(String(request.body.audio), 'base64');
-                mimeType = request.body.mimeType || mimeType;
-                options = { ...options, ...request.body };
-            }
-
-            if (!audio?.length) {
-                const r = new ResponseObject().badRequest('Audio is required (multipart file or JSON base64 "audio")');
-                return reply.code(r.statusCode).send(r.getResponse());
-            }
-
-            const viewContext = validateViewContext(options.viewContext);
-
-            // 2. Transcribe
-            const { text: transcript } = await fastify.voice.transcribe(audio, {
-                mimeType,
-                language: options.language,
-            });
-            if (!transcript) {
-                const r = new ResponseObject().badRequest('Could not transcribe audio (empty transcript)');
-                return reply.code(r.statusCode).send(r.getResponse());
-            }
-
-            // 3. Prompt the agent (starts it if needed, returns flattened text)
-            const replyText = await fastify.agents.prompt(
-                request.user.id, request.params.agentIdentifier, transcript, { viewContext }, request.user.id
+        if (side && !fastify.voice?.[`${side}Enabled`]) {
+            const r = new ResponseObject().error(
+                side === 'stt' ? 'Speech-to-text is not configured' : 'Text-to-speech is not configured',
+                null, 501,
             );
+            reply.code(r.statusCode).send(r.getResponse());
+            return false;
+        }
+        return true;
+    };
 
-            // 4. Synthesize the reply (optional)
-            let audioOut = null;
-            let audioMimeType = null;
-            let voiceUsed = null;
-            const wantTts = String(options.tts ?? 'true') !== 'false';
-            if (wantTts && fastify.voice.ttsEnabled && replyText) {
-                try {
-                    const spoken = await fastify.voice.speak(replyText, {
-                        voice: options.voice,
-                        format: options.format,
-                    });
-                    audioOut = spoken.audio.toString('base64');
-                    audioMimeType = spoken.mimeType;
-                    voiceUsed = spoken.voice;
-                } catch (ttsErr) {
-                    // Reply text still useful without audio — degrade, don't fail.
-                    fastify.log.warn({ err: ttsErr }, 'voice: TTS failed, returning text only');
-                }
+    const sendVoiceError = (reply, err, fallback) => {
+        fastify.log.error(err);
+        const r = /required/.test(err.message || '')
+            ? new ResponseObject().badRequest(err.message)
+            : new ResponseObject().error(err.message || fallback, null, 502);
+        return reply.code(r.statusCode).send(r.getResponse());
+    };
+
+    fastify.get('/:agentIdentifier/voice', {
+        onRequest: [fastify.authenticate],
+        config: mcp('agent_voice_get', 'Report whether an agent can transcribe speech (stt) and speak replies (tts); a side that is null is not configured.'),
+    }, async (request, reply) => {
+        if (!await openVoiceAgent(request, reply)) return reply;
+        const r = new ResponseObject().found(fastify.voice?.status() || { stt: null, tts: null }, 'Voice status retrieved');
+        return reply.code(r.statusCode).send(r.getResponse());
+    });
+
+    fastify.post('/:agentIdentifier/voice/transcribe', {
+        onRequest: [fastify.authenticate],
+        schema: { description: 'Transcribe a recorded audio clip (multipart field "file") to text. Send the text to the agent with the prompt route.' },
+    }, async (request, reply) => {
+        if (!await openVoiceAgent(request, reply, 'stt')) return reply;
+        try {
+            const file = request.isMultipart?.() ? await request.file() : null;
+            if (!file) {
+                const r = new ResponseObject().badRequest('Send the audio clip as multipart field "file"');
+                return reply.code(r.statusCode).send(r.getResponse());
             }
-
-            const r = new ResponseObject().success({
-                transcript,
-                reply: replyText,
-                audio: audioOut,
-                audioMimeType,
-                voice: voiceUsed,
-            }, 'Voice prompt completed');
+            const result = await fastify.voice.transcribe(await file.toBuffer(), {
+                mimeType: file.mimetype,
+                filename: file.filename,
+                language: request.query?.language,
+            });
+            const r = new ResponseObject().success(result, 'Audio transcribed');
             return reply.code(r.statusCode).send(r.getResponse());
         } catch (err) {
-            fastify.log.error(err);
-            const r = err.message?.includes('not found') || err.message?.includes('not configured')
-                ? new ResponseObject().badRequest(err.message)
-                : new ResponseObject().error(err.message || 'Voice prompt failed', null, err.statusCode || 500);
-            return reply.code(r.statusCode).send(r.getResponse());
+            return sendVoiceError(reply, err, 'Transcription failed');
         }
     });
 
+    fastify.post('/:agentIdentifier/voice/speak', {
+        onRequest: [fastify.authenticate],
+        schema: {
+            description: 'Synthesize speech for a reply. Accepts the reply as written (markdown); returns audio bytes.',
+            body: {
+                type: 'object',
+                required: ['text'],
+                additionalProperties: false,
+                properties: {
+                    text: { type: 'string', minLength: 1, description: 'Text or markdown to read aloud' },
+                    voice: { type: 'string', description: 'Voice id of the speech server; default is the configured voice' },
+                    format: { type: 'string', enum: ['mp3', 'wav', 'opus', 'flac'] },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        if (!await openVoiceAgent(request, reply, 'tts')) return reply;
+        try {
+            const { audio, mimeType } = await fastify.voice.speak(request.body.text, {
+                voice: request.body.voice,
+                format: request.body.format,
+            });
+            return reply.code(200).header('Content-Type', mimeType).send(audio);
+        } catch (err) {
+            return sendVoiceError(reply, err, 'Speech synthesis failed');
+        }
+    });
+
+    /**
+     * Prompt (non-streaming): waits for completion, returns messages.
+     */
     fastify.post('/:agentIdentifier', { onRequest: [fastify.authenticate] }, handlePromptRequest);
-    fastify.post('/:agentIdentifier/prompt', { onRequest: [fastify.authenticate] }, handlePromptRequest);
+    fastify.post('/:agentIdentifier/prompt', {
+        onRequest: [fastify.authenticate],
+        config: mcp('agent_prompt', 'Send a message to an agent and wait for its complete reply. The agent keeps its conversation, so follow-up messages continue it.', { only: ['message'], required: ['message'] }),
+        schema: { body: { type: 'object', properties: { message: { type: 'string', description: 'What to ask or tell the agent.' } } } },
+    }, handlePromptRequest);
 
     /**
      * Prompt streaming (SSE)

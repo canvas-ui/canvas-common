@@ -9,7 +9,9 @@ for (const [from, to] of [['tools/index.js', 'tools/index.js'], ['tools/client.j
     ['../../hub/agents/runtime-env.js', 'runtime-env.js'], ['../../hub/agents/AgentTokens.js', 'lib/AgentTokens.js'],
     ['../../hub/agents/validation.js', 'validation.js'], ['config/models.js', 'config/models.js'], ['config/generation.js', 'config/generation.js'],
     ['runtime/view-context.js', 'view-context.js'], ['../../utils/private-file.js', '../../utils/private-file.js'],
-    ['../../transports/routes/agents/index.js', '../../transports/routes/agents/index.js']]) {
+    ['../../transports/routes/agents/index.js', '../../transports/routes/agents/index.js'],
+    ['../../services/voice/src/index.js', '../../services/voice/src/index.js'],
+    ['../../../tests/hub/local-host/model-service.js', '../../../tests/model-service.js']]) {
     let code = fs.readFileSync(new URL(from, source), 'utf8');
     // The standalone package has a flat agent directory and its own auth entry.
     if (from === 'Agent.js') code = code.replaceAll('./runtime/worker-session.js', './worker-session.js')

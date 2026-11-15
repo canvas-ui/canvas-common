@@ -9,7 +9,7 @@ export async function runRuntime({ kind, createHost, exportsFor, script, version
   const { values: flags, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
     foreground: { type: 'boolean' }, 'init-only': { type: 'boolean' }, name: { type: 'string' }, model: { type: 'string' },
     'ollama-url': { type: 'string' }, 'server-url': { type: 'string' }, 'token-file': { type: 'string' },
-    'stt-url': { type: 'string' }, 'tts-url': { type: 'string' }, 'stt-model': { type: 'string' }, voice: { type: 'string' },
+    'stt-url': { type: 'string' }, 'tts-url': { type: 'string' }, 'stt-model': { type: 'string' }, 'tts-model': { type: 'string' }, voice: { type: 'string' },
     host: { type: 'string' }, port: { type: 'string' }, 'no-web': { type: 'boolean' },
   } });
   if (positionals.length > 1) throw new Error('Specify one runtime folder');
@@ -25,8 +25,8 @@ export async function runRuntime({ kind, createHost, exportsFor, script, version
   try {
     host = await createHost({ root, kind, name: flags.name, model: flags.model, ollamaUrl: flags['ollama-url'],
       webRoot: flags['no-web'] ? false : process.env.CANVAS_WEB_ROOT,
-      voice: { stt: flags['stt-url'] ? { baseUrl: flags['stt-url'], model: flags['stt-model'] || 'whisper-1' } : null,
-        tts: flags['tts-url'] ? { baseUrl: flags['tts-url'], model: 'kokoro', voice: flags.voice || 'af_heart' } : null } });
+      voice: { stt: flags['stt-url'] ? { baseUrl: flags['stt-url'], model: flags['stt-model'] } : null,
+        tts: flags['tts-url'] ? { baseUrl: flags['tts-url'], model: flags['tts-model'], voice: flags.voice } : null } });
     if (flags.host) host.config.host = flags.host;
     if (flags.port !== undefined) host.config.port = Number(flags.port);
     host.save();
