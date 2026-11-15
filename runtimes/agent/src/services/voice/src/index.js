@@ -71,6 +71,22 @@ export class Voice {
         this.#logger = options.logger || console;
     }
 
+    /**
+     * This service with an agent's own settings laid over it. Each side takes
+     * the agent's fields where set and these settings otherwise, so an agent
+     * can name only a voice or a language and keep the shared speech server.
+     * @param {Object} [overrides] - { stt?, tts? } in the constructor's shape
+     * @returns {Voice}
+     */
+    for(overrides) {
+        if (!overrides?.stt && !overrides?.tts) return this;
+        return new Voice({
+            stt: { ...this.#stt, ...defined(overrides.stt || {}) },
+            tts: { ...this.#tts, ...defined(overrides.tts || {}) },
+            logger: this.#logger,
+        });
+    }
+
     get sttEnabled() { return Boolean(this.#stt); }
     get ttsEnabled() { return Boolean(this.#tts); }
 

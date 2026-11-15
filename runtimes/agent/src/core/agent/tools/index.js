@@ -99,7 +99,7 @@ async function createScopedTools(env) {
     };
 
     // Every feature/tag/schema bitmap key the workspace has, with its document
-    // count. A filter on a key that is not here matches nothing, so canvas_doc_find
+    // count. A filter on a key that is not here matches nothing, so canvas_document_find
     // rejects it instead of returning an empty page that reads as "no results".
     async function listFeatureKeys(workspace, signal) {
         const result = await client.get(`/workspaces/${encodeURIComponent(workspace)}/bitmaps`, { signal });
@@ -117,7 +117,7 @@ async function createScopedTools(env) {
         });
         const valid = [...new Set(suggestions.length ? suggestions : known.filter((k) => k.key.startsWith('feature/')).map((k) => k.key))].sort();
         const error = new Error(`Unknown feature${unknown.length > 1 ? 's' : ''} in this workspace: ${unknown.join(', ')}. `
-            + `Valid names${valid.length ? `: ${valid.join(', ')}` : ' — none under that prefix'}. Use canvas_features to list every feature with its document count.`);
+            + `Valid names${valid.length ? `: ${valid.join(', ')}` : ' — none under that prefix'}. Use canvas_feature_list to list every feature with its document count.`);
         error.statusCode = 400;
         throw error;
     }
@@ -149,7 +149,7 @@ async function createScopedTools(env) {
                 const lines = [`Scope: ${scopeDescription}`, `permissions: ${JSON.stringify(permissions)}`, permissions === null ? 'Permissions unavailable; write tools are disabled until the binding can be verified.' : permissions.includes('write') ? 'Writes permitted.' : 'Read-only: document mutation tools are unavailable.'];
                 if (isGlobal) {
                     lines.push('There is no single current context in global mode. Use canvas_workspace_list to list '
-                        + 'workspaces, then pass "workspace" to canvas_tree_paths / canvas_doc_find / canvas_doc_get_by_id / canvas_doc_insert / canvas_link.');
+                        + 'workspaces, then pass "workspace" to canvas_path_list / canvas_document_find / canvas_document_get / canvas_document_add / canvas_document_link.');
                     return toolResult(lines.join('\n'));
                 }
                 lines.push(`Workspace: ${workspaceName}${workspaceName !== workspaceId ? ` (${workspaceId})` : ''}`);
@@ -188,9 +188,9 @@ async function createScopedTools(env) {
     });
 
     const canvasFind = defineTool({
-        name: 'canvas_doc_find',
+        name: 'canvas_document_find',
         label: 'Canvas Document Find',
-        description: 'Query documents using the complete native Synapsd spec. Paths in spec are workspace-absolute; your token scope is independently ANDed before counting, ranking and pagination. Use features allOf/anyOf/noneOf, filters such as t:content:2026-10-01..2026-10-31, relations, named context/directory trees, idsOnly or countOnly. query is text or vectors; match: exact preserves verbatim string search; a leading - or ! excludes a word, a "phrase" or a @predicate token; @predicate:value tokens inside query filter by relation (e.g. @authored-by:someone@example.com). Compound lines use native OR/AND. Call canvas_features for valid bitmap keys. Each hit is a compact summary (id, schema, title, from, date, preview, attachments); pass fields for other document properties or raw for whole documents, then canvas_doc_get_by_id to read one. count, totalCount and per-line counts come from the server without client filtering.',
+        description: 'Query documents using the complete native Synapsd spec. Paths in spec are workspace-absolute; your token scope is independently ANDed before counting, ranking and pagination. Use features allOf/anyOf/noneOf, filters such as t:content:2026-10-01..2026-10-31, relations, named context/directory trees, idsOnly or countOnly. query is text or vectors; match: exact preserves verbatim string search; a leading - or ! excludes a word, a "phrase" or a @predicate token; @predicate:value tokens inside query filter by relation (e.g. @authored-by:someone@example.com). Compound lines use native OR/AND. Call canvas_feature_list for valid bitmap keys. Each hit is a compact summary (id, schema, title, from, date, preview, attachments); pass fields for other document properties or raw for whole documents, then canvas_document_get to read one. count, totalCount and per-line counts come from the server without client filtering.',
         parameters: Type.Object({
             spec: { ...querySchema, description: 'Native search request. Omit query for bitmap-only listing or count. limit 0 returns every match.' },
             fields: Type.Optional(Type.Array(Type.String(), { description: 'Dotted document paths to return per hit instead of the summary, e.g. ["data.subject", "data.attachments", "metadata.contentType"]. id and schema are always included.' })),
@@ -249,14 +249,14 @@ async function createScopedTools(env) {
         },
     });
 
-    const docIdProperty = { docId: Type.Integer({ minimum: 1, description: 'Document ID' }) };
-    const canvasGet = documentGetter('canvas_doc_get_by_id', docIdProperty, params => `/by-id/${params.docId}`);
-    const canvasGetByHash = documentGetter('canvas_doc_get_by_hash', {
+    const documentIdProperty = { documentId: Type.Integer({ minimum: 1, description: 'Document ID' }) };
+    const canvasGet = documentGetter('canvas_document_get', documentIdProperty, params => `/by-id/${params.documentId}`);
+    const canvasGetByHash = documentGetter('canvas_document_get_by_hash', {
         algorithm: Type.String({ description: 'Checksum algorithm, e.g. sha256' }), hash: Type.String(),
     }, params => `/by-hash/${encodeURIComponent(params.algorithm)}/${encodeURIComponent(params.hash)}`);
 
     const canvasSchema = defineTool({
-        name: 'canvas_schema',
+        name: 'canvas_schema_get',
         label: 'Canvas Schema',
         description: 'Get the authoritative document schema: required and optional fields, JSON Schema, an input example when available, and normalization rules. Use before inserting unfamiliar types. Link fields are uri/label; tab fields are url/title.',
         parameters: Type.Object({ schema: Type.String({ description: `Document type: ${SCHEMA_HELP}` }) }),
@@ -270,15 +270,15 @@ async function createScopedTools(env) {
     });
 
     const canvasInsert = defineTool({
-        name: 'canvas_doc_insert',
+        name: 'canvas_document_add',
         label: 'Canvas Insert',
         description:
             'Insert a document into your scope. Provide "schema" (short name such as note, task, tab, link, '
             + 'event or a full data/schema/... id) and "data" (e.g. note: { title, content }; task: { title, '
-            + 'description, status, dueDate (ISO timestamp or YYYY-MM-DD), priority (1 highest to 9 lowest) }; tab: { url, title }; link: { uri, label, tags }) plus an optional path relative to your scope. Call canvas_schema for fields and an example. The tasks timeline is derived automatically. Missing paths are created unless createPath is false. Returns id, created (true only for a new document), status and path. Changed content can create a new document; use canvas_link to file existing IDs without rewriting. Requires write permission.',
+            + 'description, status, dueDate (ISO timestamp or YYYY-MM-DD), priority (1 highest to 9 lowest) }; tab: { url, title }; link: { uri, label, tags }) plus an optional path relative to your scope. Call canvas_schema_get for fields and an example. The tasks timeline is derived automatically. Missing paths are created unless createPath is false. Returns id, created (true only for a new document), status and path. Changed content can create a new document; use canvas_document_link to file existing IDs without rewriting. Requires write permission.',
         parameters: Type.Object({
             schema: Type.String({ description: `Document type: ${SCHEMA_HELP}` }),
-            data: Type.Object({}, { additionalProperties: true, description: 'Schema-specific document payload as a JSON object, not a JSON-encoded string. Call canvas_schema for required fields.' }),
+            data: Type.Object({}, { additionalProperties: true, description: 'Schema-specific document payload as a JSON object, not a JSON-encoded string. Call canvas_schema_get for required fields.' }),
             path: Type.Optional(Type.String({ description: 'Context path relative to your scope (default: scope root)' })),
             createPath: Type.Optional(Type.Boolean({ description: 'Create missing paths (default true). False returns 404 when the destination is missing; never inserts at root instead.' })),
             ...workspaceParams,
@@ -287,7 +287,7 @@ async function createScopedTools(env) {
             try {
                 const workspace = resolveWorkspace(params);
                 const currentPermissions = await readPermissions(workspace, signal);
-                if (!currentPermissions?.includes('write')) throw new Error('Read-only token: canvas_doc_insert requires write permission.');
+                if (!currentPermissions?.includes('write')) throw new Error('Read-only token: canvas_document_add requires write permission.');
                 const schema = resolveSchema(params.schema);
                 const contextPath = scopedPath(isGlobal ? '/' : basePath, params.path);
                 const result = await client.post(documentsBase(workspace), {
@@ -309,11 +309,11 @@ async function createScopedTools(env) {
     });
 
     const canvasLink = defineTool({
-        name: 'canvas_link',
+        name: 'canvas_document_link',
         label: 'Canvas Link',
         description: 'File existing documents at another path in your scope, preserving their content, dates, checksums and versions. Use this instead of re-inserting document data. Returns linked IDs for new memberships and alreadyLinked IDs for existing memberships (context paths use AND-ed layer bitmaps, not filing history). Missing paths are created by default; created reports whether this call created the path. Requires write permission; documents must already be accessible within your scope.',
         parameters: Type.Object({
-            docIds: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, description: 'Existing document IDs to attach; never sends document content.' }),
+            documentIds: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, description: 'Existing document IDs to attach; never sends document content.' }),
             path: Type.String({ description: 'Destination path relative to your scope' }),
             createPath: Type.Optional(Type.Boolean({ description: 'Create missing destination paths (default true); false returns 404 if missing.' })),
             ...workspaceParams,
@@ -322,9 +322,9 @@ async function createScopedTools(env) {
             try {
                 const workspace = resolveWorkspace(params);
                 const currentPermissions = await readPermissions(workspace, signal);
-                if (!currentPermissions?.includes('write')) throw new Error('Read-only token: canvas_link requires write permission.');
+                if (!currentPermissions?.includes('write')) throw new Error('Read-only token: canvas_document_link requires write permission.');
                 const result = await client.post(documentsBase(workspace), { signal, body: {
-                    documentIds: params.docIds,
+                    documentIds: params.documentIds,
                     context: scopedPath(isGlobal ? '/' : basePath, params.path),
                     createPath: params.createPath ?? true,
                 } });
@@ -344,41 +344,41 @@ async function createScopedTools(env) {
             } catch (error) { return toolError(error); }
         },
     });
-    const idsProperty = { docIds: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1 }) };
-    const canvasUpdate = documentTool('canvas_doc_update',
+    const idsProperty = { documentIds: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1 }) };
+    const canvasUpdate = documentTool('canvas_document_update',
         'Update an existing document by ID, without checksum-based insertion. Omitted fields stay unchanged. data replaces the entire schema-specific data object: read it first when editing individual fields. metadata, comment, features and timelines use the existing document update contract. Connector-backed documents write through to their source. Requires write permission.',
-        { ...docIdProperty, changes: Type.Object({
+        { ...documentIdProperty, changes: Type.Object({
             data: Type.Optional(Type.Object({}, { additionalProperties: true })),
             metadata: Type.Optional(Type.Object({}, { additionalProperties: true })),
             comment: Type.Optional(Type.String()), features: Type.Optional(Type.Array(Type.String())),
             timelines: Type.Optional(Type.Array(Type.Object({}, { additionalProperties: true }))),
         }, { minProperties: 1, additionalProperties: false }) }, 'PUT', () => '',
-        params => ({ body: { documents: [{ ...params.changes, id: params.docId }], context: basePath } }), true);
-    const canvasUnlink = documentTool('canvas_unlink',
+        params => ({ body: { documents: [{ ...params.changes, id: params.documentId }], context: basePath } }), true);
+    const canvasUnlink = documentTool('canvas_document_unlink',
         'Remove document membership at a context path, preserving content and other memberships. Context nodes are shared bitmaps: unticking a layer affects every context path using that layer, not an explicit filing record. Requires write permission.',
         { ...idsProperty, path: Type.String() }, 'DELETE', () => '/remove',
-        params => ({ body: params.docIds, query: { context: scopedPath(isGlobal ? '/' : basePath, params.path) } }), true);
-    const canvasContent = documentTool('canvas_doc_content',
+        params => ({ body: params.documentIds, query: { context: scopedPath(isGlobal ? '/' : basePath, params.path) } }), true);
+    const canvasContent = documentTool('canvas_document_content_get',
         'Read document or attachment bytes for summarisation. Text is returned as text and binary as base64, with MIME type. Limited to 1 MiB; use the authenticated REST content endpoint for larger files. url must identify one of this document’s locations or attachments. format: email returns parsed email bodies.',
-        { ...docIdProperty, url: Type.Optional(Type.String()), format: Type.Optional(Type.Literal('email')) },
-        'GET', params => `/${params.docId}/content`, params => ({ query: { url: params.url, format: params.format }, responseType: 'content' }));
-    const canvasLocations = documentTool('canvas_doc_locations', 'Describe the available backend locations for a document.',
-        docIdProperty, 'GET', params => `/${params.docId}/locations`, () => ({}));
-    const canvasDownload = documentTool('canvas_doc_download', 'Fetch a linked remote resource into the workspace using its existing download workflow. Requires write permission.',
-        docIdProperty, 'POST', params => `/${params.docId}/download`, () => ({}), true);
-    const transfer = mode => documentTool(`canvas_doc_${mode}_to_backend`,
+        { ...documentIdProperty, url: Type.Optional(Type.String()), format: Type.Optional(Type.Literal('email')) },
+        'GET', params => `/${params.documentId}/content`, params => ({ query: { url: params.url, format: params.format }, responseType: 'content' }));
+    const canvasLocations = documentTool('canvas_document_location_list', 'Describe the available backend locations for a document.',
+        documentIdProperty, 'GET', params => `/${params.documentId}/locations`, () => ({}));
+    const canvasDownload = documentTool('canvas_document_download', 'Fetch a linked remote resource into the workspace using its existing download workflow. Requires write permission.',
+        documentIdProperty, 'POST', params => `/${params.documentId}/download`, () => ({}), true);
+    const transfer = mode => documentTool(`canvas_document_${mode}_to_backend`,
         `${mode === 'move' ? 'Move' : 'Copy'} existing documents to backend locations using the native transfer service. A move releases sources only after the destination copy is durable. Supports transfers within or between backends. Inspect per-document failures before retrying. Requires write permission.`,
         { ...idsProperty, to: Type.Array(Type.String(), { minItems: 1, ...(mode === 'move' ? { maxItems: 1 } : {}) }),
             folder: Type.Optional(Type.String()), filename: Type.Optional(Type.String()),
             onConflict: Type.Optional(Type.Union(['rename', 'overwrite', 'error'].map(value => Type.Literal(value)))),
             deleteFrom: Type.Optional(Type.Object({ backend: Type.String(), folder: Type.String() })),
-        }, 'POST', () => '/transfer', params => ({ body: { documentIds: params.docIds, to: params.to, mode,
+        }, 'POST', () => '/transfer', params => ({ body: { documentIds: params.documentIds, to: params.to, mode,
             folder: params.folder, filename: params.filename, onConflict: params.onConflict, deleteFrom: params.deleteFrom } }), true);
     const canvasCopyBackend = transfer('copy');
     const canvasMoveBackend = transfer('move');
 
     const canvasNotify = defineTool({
-        name: 'canvas_notify',
+        name: 'canvas_notification_send',
         label: 'Canvas Notify',
         description:
             'Send a notification message to your user over their configured channel '
@@ -405,7 +405,7 @@ async function createScopedTools(env) {
     });
 
     const canvasMessageAccounts = defineTool({
-        name: 'canvas_message_accounts', label: 'Canvas Message Accounts',
+        name: 'canvas_message_account_list', label: 'Canvas Message Accounts',
         description: 'List email, Slack and WhatsApp accounts and whether sending is enabled for agents. Sending communicates externally as that account.',
         parameters: Type.Object({ ...workspaceParams }),
         async execute(_id, params, signal) {
@@ -414,7 +414,7 @@ async function createScopedTools(env) {
         },
     });
     const canvasMessageStatus = defineTool({
-        name: 'canvas_message_status', label: 'Canvas Message Status',
+        name: 'canvas_message_send_status', label: 'Canvas Message Status',
         description: 'Check your previously attempted send by requestId, without delivering another message. An unknown result must be checked in the provider conversation before starting another send.',
         parameters: Type.Object({ ...workspaceParams, requestId: Type.String() }),
         async execute(_id, params, signal) {
@@ -423,7 +423,7 @@ async function createScopedTools(env) {
         },
     });
     const canvasSendMessage = defineTool({
-        name: 'canvas_send_message', label: 'Canvas Send Message',
+        name: 'canvas_message_send', label: 'Canvas Send Message',
         description: 'Send an external message through a configured account, or reply to a message document. Use only when the user has authorized communicating with these recipients. Supply a stable UUID requestId and reuse it unchanged after a timeout; never create another ID to retry an unknown result. accepted means provider acceptance, not recipient delivery. Reply resolves its account and thread automatically. Path-bound agents may reply only to in-scope messages.',
         parameters: Type.Object({
             ...workspaceParams,
@@ -431,7 +431,7 @@ async function createScopedTools(env) {
             text: Type.String({ maxLength: 32000 }),
             replyToDocumentId: Type.Optional(Type.Integer({ minimum: 1 })),
             driver: Type.Optional(Type.Union([Type.Literal('imap'), Type.Literal('slack'), Type.Literal('whatsapp')])),
-            address: Type.Optional(Type.String({ description: 'Account label from canvas_message_accounts; omitted for replies' })),
+            address: Type.Optional(Type.String({ description: 'Account label from canvas_message_account_list; omitted for replies' })),
             target: Type.Optional(Type.String({ description: 'Configured Slack channel name/ID or WhatsApp conversation ID; omitted for replies' })),
             to: Type.Optional(Type.Array(Type.String())), cc: Type.Optional(Type.Array(Type.String())), bcc: Type.Optional(Type.Array(Type.String())),
             subject: Type.Optional(Type.String()), replyAll: Type.Optional(Type.Boolean()),
@@ -447,12 +447,12 @@ async function createScopedTools(env) {
     });
 
     const canvasFeatures = defineTool({
-        name: 'canvas_features',
+        name: 'canvas_feature_list',
         label: 'Canvas Features',
         description:
             'List the feature keys a workspace has, with document counts: schemas (data/schema/*), '
             + 'features (feature/email/attachment, feature/email/received, ...), tags (tag/*) and other '
-            + 'bitmap facets. Use these keys in canvas_doc_find spec.features. Narrow with "prefix" (e.g. "feature/email").',
+            + 'bitmap facets. Use these keys in canvas_document_find spec.features. Narrow with "prefix" (e.g. "feature/email").',
         parameters: Type.Object({
             prefix: Type.Optional(Type.String({ description: 'Only keys under this prefix, e.g. feature, feature/email, tag' })),
             ...workspaceParams,
