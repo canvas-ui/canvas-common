@@ -73,10 +73,12 @@ export default class StoragePolicyService {
         await this.#logicalQueue.catch(() => {});
     }
     status() {
-        const operations = this.#stored.replicas.list({ limit: 1000, active: true });
-        const state = this.#status.error || operations.operations.some(o => o.state === 'blocked') ? 'blocked'
-            : operations.operations.length ? 'pending' : 'idle';
-        return { ...this.#status, state, operations };
+        // `operations` is a page of the unfinished work; `counts` covers all of it.
+        const operations = this.#stored.replicas.list({ limit: 200, active: true });
+        const counts = this.#stored.replicas.counts();
+        const state = this.#status.error || counts.blocked ? 'blocked'
+            : counts.pending + counts.running ? 'pending' : 'idle';
+        return { ...this.#status, state, operations, counts };
     }
     async reconcile({ dryRun = false } = {}) {
         if (this.#stopped) throw fault('STOPPED', 'Storage policy service is stopping');

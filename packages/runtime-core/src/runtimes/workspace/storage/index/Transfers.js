@@ -146,7 +146,7 @@ export default class Transfers {
                 if (config.readOnly) throw objectsError(`Backend "${endpoint.backend}" is read-only`, 'BACKEND_READ_ONLY', 403);
                 if (!backend.canDelete) {
                     throw objectsError(config.driver === 's3'
-                        ? `Backend "${endpoint.backend}" cannot delete objects until "Allow deletes" is turned on for it in Files & storage.`
+                        ? `Backend "${endpoint.backend}" cannot delete objects: "Allow deletes" is turned off for it in Files & storage.`
                         : `Backend "${endpoint.backend}" does not support deleting objects`, 'BACKEND_DELETE_DISABLED', 403);
                 }
                 const result = await this.#index.withKeyLock(endpoint.backend, endpoint.key, () => this.#runtime.state.stored.removeObject(endpoint.backend, endpoint.key, {

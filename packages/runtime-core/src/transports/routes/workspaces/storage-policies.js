@@ -33,6 +33,24 @@ export default async function storagePoliciesRoutes(fastify) {
             return send(reply, await workspace.storagePolicyService.reconcile({ dryRun: request.body?.dryRun === true }), 'Policy placement planned');
         } catch (error) { return fail(reply, error); }
     });
+    // Every blocked copy at once: `retry` queues them again, `cancel` gives up
+    // the copy-only ones (uploads and rule copies; policy placements stay).
+    fastify.post('/operations/retry', { onRequest: [fastify.authenticate, requireWorkspaceWrite()] }, async (request, reply) => {
+        try { return send(reply, { retried: request.workspace.storageOperations.retryBlocked() }, 'Blocked operations queued again'); }
+        catch (error) { return fail(reply, error); }
+    });
+    fastify.post('/operations/cancel', { onRequest: [fastify.authenticate, requireWorkspaceWrite()] }, async (request, reply) => {
+        try { return send(reply, { cancelled: await request.workspace.storageOperations.cancelBlocked() }, 'Blocked copies cancelled'); }
+        catch (error) { return fail(reply, error); }
+    });
+    fastify.post('/operations/:operationId/cancel', { onRequest: [fastify.authenticate, requireWorkspaceWrite()] }, async (request, reply) => {
+        try { return send(reply, await request.workspace.storageOperations.cancel(request.params.operationId), 'Copy cancelled'); }
+        catch (error) {
+            if (error.code === 'UNSUPPORTED_CANCEL') error.statusCode = 409;
+            if (error.code === 'NOT_FOUND') error.statusCode = 404;
+            return fail(reply, error);
+        }
+    });
     fastify.post('/operations/:operationId/retry', { onRequest: [fastify.authenticate, requireWorkspaceWrite()] }, async (request, reply) => {
         try { return send(reply, await request.workspace.storageOperations.retry(request.params.operationId), 'Operation retried'); }
         catch (error) { return fail(reply, error); }

@@ -195,7 +195,7 @@ export default class WorkspaceBackends {
                     bucket: status.bucket, prefix: status.prefix || '', endpoint: status.endpoint || '',
                     region: status.region || 'us-east-1', forcePathStyle: status.forcePathStyle ?? Boolean(status.endpoint),
                     credentialsConfigured: Boolean(status.accessKeyId && status.secretAccessKey),
-                    pollInterval: status.pollInterval ?? 60000, permanentDelete: status.permanentDelete === true,
+                    pollInterval: status.pollInterval ?? 60000, permanentDelete: status.permanentDelete !== false,
                     // 'cas': content-addressed blobs only, every workspace blob is
                     // uploaded here. 'path': objects under chosen folders and names.
                     mode: status.mode === 'cas' ? 'cas' : 'path',
