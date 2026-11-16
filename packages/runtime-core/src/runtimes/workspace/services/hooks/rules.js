@@ -511,11 +511,17 @@ const ACTIONS = {
      *   { "action": "store", "to": "workspace:home", "folder": "Projects/Canvas/UI",
      *     "recursive": true }
      *
+     * `to` and `from` take a backend address, optionally qualified by its
+     * driver: "s3:Universe", "gdrive:Work-Drive".
+     *
      * filed under dir:/projects/canvas/UI/mobile → home:Projects/Canvas/UI/mobile/<name>.
      * Context paths use the explicit filing event, never ancestor membership.
      * Prefix rules append its relative path; eventPathExact with pathMode:'full'
      * recreates the full selected path beneath folder.
      * The three parts are joined with `..`/leading-slash segments dropped.
+     *
+     * On a content store (an S3 backend in CAS mode) the object is named by its
+     * checksum: `folder` and `key` do not apply, and `recursive` is refused.
      *
      * Copy is the default. A move requires one explicit `from` backend and
      * exactly one location there. Once that copy has moved, re-runs cannot
@@ -607,8 +613,10 @@ const ACTIONS = {
         const render = (template) => interpolate(expandKeyTemplate(String(template), { doc, sourceKey: source.key }), scope);
         const folder = action.autoLink === true ? String(action.folder || '') : action.folder != null && String(action.folder).trim() !== '' ? render(action.folder) : '';
         const recursive = action.recursive === true;
+        // A content store names every object by its checksum.
+        const named = !workspace.casStores?.includes(to);
         let key;
-        if (action.key || folder || recursive || action.autoLink === true) {
+        if (named && (action.key || folder || recursive || action.autoLink === true)) {
             const name = action.autoLink === true
                 ? path.posix.basename(filenameOf(doc, source.key).replaceAll('\\', '/')) || String(doc.id)
                 : action.key ? render(action.key) : render('{{basename}}{{ext}}');
@@ -989,6 +997,30 @@ function matchedPath(rule, context) {
  */
 const TARGET_OCCUPIED = new Set(['target-exists', 'TARGET_CONFLICT']);
 
+// Actions name a storage backend by its address ("workspace:home", "Universe")
+// or qualified by driver ("s3:Universe"), which a reader can tell apart from a
+// folder or another backend of the same name elsewhere. The driver must match.
+const BACKEND_FIELDS = { store: ['to', 'from'], unstore: ['from', 'backends', 'ifOn'], download: ['to'], extractAttachments: ['to'] };
+export function backendAddress(reference, backends) {
+    const text = String(reference ?? '').trim();
+    if (!text || backends[text]) return text;
+    const at = text.indexOf(':');
+    const driver = text.slice(0, at), address = text.slice(at + 1);
+    if (at < 1 || !backends[address]) return text;
+    if (backends[address].driver !== driver) throw new Error(`Backend "${address}" uses the ${backends[address].driver} driver: write "${backends[address].driver}:${address}"`);
+    return address;
+}
+function withBackendAddresses(action, backends) {
+    const fields = BACKEND_FIELDS[action.action];
+    if (!fields) return action;
+    const next = { ...action };
+    for (const field of fields) {
+        if (Array.isArray(next[field])) next[field] = next[field].map(value => backendAddress(value, backends));
+        else if (typeof next[field] === 'string') next[field] = backendAddress(next[field], backends);
+    }
+    return next;
+}
+
 export async function executeRuleActions(rule, context, logger) {
     const { workspace, payload, eventName } = context;
     rule = mapRulePaths(rule, rulePathMapper(workspace, 'decode'));
@@ -1028,7 +1060,7 @@ export async function executeRuleActions(rule, context, logger) {
             });
             // A handler may return { status: 'skipped', error } to say why it
             // did nothing; anything else is a plain success.
-            const outcome = await handler(action, { workspace, doc, payload, context, scope, logger, provenance });
+            const outcome = await handler(withBackendAddresses(action, workspace.dataBackends || {}), { workspace, doc, payload, context, scope, logger, provenance });
             if (action.action === 'download' && outcome?.documentId) scope.downloads.push(outcome.documentId);
             results.push(outcome && typeof outcome === 'object' && outcome.status === 'skipped'
                 ? { action: action.action, status: 'skipped', ...(outcome.error ? { error: String(outcome.error) } : {}) }

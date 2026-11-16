@@ -8,6 +8,7 @@ const logger = createLogger('hooks:backfill-jobs');
 
 const KEEP_FINISHED = 20;
 const PROGRESS_EVERY_MS = 1000;
+const SAME_FAILURE_LIMIT = 25;
 const JOBS_FILE = 'backfill-jobs.json';
 
 // Whole-rule backfills running inside the workspace. A job is saved after each
@@ -87,10 +88,18 @@ export default class BackfillJobs {
     async #run(job) {
         const shouldStop = () => this.#stopping || this.#cancelling.has(job.id);
         let lastEvent = Date.now();
-        const onResult = ({ status, actions = [] }) => {
+        // A rule that fails the same way on every document is misconfigured;
+        // stop instead of walking the whole workspace.
+        let repeated = { error: null, count: 0 };
+        const onResult = ({ status, actions = [], error }) => {
             job.checked++;
             job.processed++;
-            if (status === 'error') job.failed++;
+            if (status === 'error') {
+                job.failed++;
+                const message = actions.find((action) => action.status === 'error')?.error || error || 'unknown error';
+                repeated = { error: message, count: repeated.error === message ? repeated.count + 1 : 1 };
+                if (repeated.count >= SAME_FAILURE_LIMIT) throw new Error(`Stopped: ${SAME_FAILURE_LIMIT} documents in a row failed with "${message}"`);
+            } else if (status !== 'skipped') repeated = { error: null, count: 0 };
             else if (status === 'skipped') { /* the rule does not apply to this document */ }
             else if (actions.some((action) => action.status === 'skipped')) job.skipped++;
             else job.applied++;

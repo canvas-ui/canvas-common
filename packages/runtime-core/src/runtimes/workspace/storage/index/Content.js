@@ -5,10 +5,13 @@ import { createReadStream } from 'fs';
 import { parseLocationUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-helpers.js';
 import { DATA_BLOB_BACKEND } from './contracts.js';
 
+const BACKFILL_BATCH = 20;
+
 export default class Content {
     #index;
     #runtime;
     #sidecars = new Set();
+    #backfills = new Map();
     constructor(index, runtime) { this.#index = index; this.#runtime = runtime; }
 
 
@@ -104,10 +107,63 @@ export default class Content {
     }
 
     /**
+     * With an S3 bucket as the primary data store, `workspace:data` only holds
+     * a blob until the bucket has a verified copy: drop the local copy of
+     * every blob these documents keep in both places. `keepCopy` on
+     * `workspace:data` keeps local copies instead. Runs in the background.
+     */
+    releaseLocalCopies(ids = []) {
+        const stored = this.#runtime.state.stored;
+        const primary = this.#runtime.state.getPrimaryStore?.();
+        if (!stored || !primary || !ids.length || this.#runtime.state.dataBackends[DATA_BLOB_BACKEND]?.keepCopy === true) return;
+        const task = (async () => {
+            for (const id of ids) {
+                const doc = await this.#runtime.state.getDb().getDocument(Number(id)).catch(() => null);
+                const local = (doc?.locations || []).map((location) => parseLocationUrl(location?.url || ''))
+                    .filter((parsed) => parsed?.scheme === 'stored' && parsed.backend === DATA_BLOB_BACKEND);
+                for (const { key } of local) {
+                    const meta = await stored.stat(`${DATA_BLOB_BACKEND}:${key}`);
+                    if (!meta?.locations?.some((copy) => copy.backend === primary && copy.synced)) continue;
+                    const result = await stored.deleteByUrl(`stored://${DATA_BLOB_BACKEND}/${key}`);
+                    if (!result?.ok) throw new Error(`workspace:data/${key}: ${result?.reason || 'delete failed'}`);
+                }
+            }
+        })().catch((error) => this.#runtime.state.logger.warn({ workspaceId: this.#runtime.state.workspaceId, error: error.message }, 'Local blob copy was not released'));
+        this.#runtime.state.operations.run?.('content.releaseLocalCopies', () => task);
+    }
+
+    /**
+     * Upload to a CAS bucket every blob `workspace:data` holds that the bucket
+     * does not: the blobs stored before the bucket was connected. Uploads go
+     * through the durable executor in batches; returns how many were queued.
+     */
+    async backfillCasStore(name) {
+        const stored = this.#runtime.state.stored;
+        if (!stored?.getBackend(name) || !(this.#runtime.state.getCasStores?.() || []).includes(name)) throw new Error(`"${name}" is not an enabled content store`);
+        if (this.#backfills.has(name)) return this.#backfills.get(name);
+        const task = (async () => {
+            let queued = 0, failed = 0;
+            for await (const meta of stored.list()) {
+                if (!this.#runtime.state.stored) break;
+                const local = meta.locations?.find((copy) => copy.backend === DATA_BLOB_BACKEND);
+                if (!local || meta.locations.some((copy) => copy.backend === name)) continue;
+                const result = await stored.copy(meta.id, { to: name, from: `stored://${DATA_BLOB_BACKEND}/${local.key}` });
+                if (result?.ok) queued++; else failed++;
+                // Each queued upload holds a staged copy; let a batch finish first.
+                if (result?.ok && queued % BACKFILL_BATCH === 0) await stored.replicas.drain();
+            }
+            this.#runtime.state.logger.info({ workspaceId: this.#runtime.state.workspaceId, backend: name, queued, failed }, 'Content store backfill queued');
+            return { backend: name, queued, failed };
+        })().finally(() => this.#backfills.delete(name));
+        this.#backfills.set(name, task);
+        return task;
+    }
+
+    /**
      * Look up an already-persisted blob by its sha256 (hex). The resumable-
      * upload seam: clients hash locally, ask here first, and skip the byte
      * transfer when the content-addressed store already holds the bytes in
-     * workspace:data. Returns the same shape persistBlob would have returned,
+     * workspace:data or the primary bucket. Returns the same shape persistBlob would have returned,
      * or null when the blob is absent (or lives only on other backends —
      * a file:// mount hit must not satisfy an upload-into-data check).
      *
@@ -117,10 +173,14 @@ export default class Content {
     async statBlobByChecksum(sha256) {
         if (!this.#runtime.state.stored) throw new Error('WorkspaceStoredIndex is not running');
         const meta = await this.#runtime.state.stored.stat(`sha256:${sha256}`);
-        const location = meta?.locations?.find((l) => l.backend === DATA_BLOB_BACKEND);
+        // The local copy, or the verified one in the primary bucket once the
+        // local copy has been released.
+        const primary = this.#runtime.state.getPrimaryStore?.();
+        const location = meta?.locations?.find((l) => l.backend === DATA_BLOB_BACKEND)
+            || meta?.locations?.find((l) => primary && l.backend === primary && l.synced);
         if (!location) return null;
         return {
-            url: `stored://${DATA_BLOB_BACKEND}/${location.key}`,
+            url: `stored://${location.backend}/${location.key}`,
             key: location.key,
             checksum: meta.checksums?.sha256 || sha256,
             size: meta.size,

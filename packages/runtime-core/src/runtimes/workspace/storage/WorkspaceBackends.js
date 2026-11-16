@@ -114,7 +114,7 @@ export default class WorkspaceBackends {
         const features = config.capabilities || getBackendCapabilities({ ...config, driver });
         return {
             ...features,
-            sync: Boolean(config.resync) && supported,
+            sync: (Boolean(config.resync) || features.blobs === true) && supported,
             test: ['gdrive', 's3'].includes(driver) && supported,
             containers: false,
             mutableContainers: features.mutableContainers === true && config.readOnly !== true && supported,
@@ -155,6 +155,9 @@ export default class WorkspaceBackends {
             // default. Exactly one content-addressed backend has it: the local
             // blob store, or an S3 CAS backend (PATCH { primary: true }).
             primary: (this.#workspace.primaryStore || WorkspaceStoredIndex.DATA_BLOB_BACKEND) === name,
+            // workspace:data while another store is primary: true keeps a local
+            // copy of every blob, false releases it once the primary has it.
+            ...(name === WorkspaceStoredIndex.DATA_BLOB_BACKEND ? { keepCopy: status.keepCopy === true } : {}),
             capabilities: this.#backendCapabilities(driver, status),
             config: {
                 root: status.root || null,
@@ -193,8 +196,6 @@ export default class WorkspaceBackends {
                     region: status.region || 'us-east-1', forcePathStyle: status.forcePathStyle ?? Boolean(status.endpoint),
                     credentialsConfigured: Boolean(status.accessKeyId && status.secretAccessKey),
                     pollInterval: status.pollInterval ?? 60000, permanentDelete: status.permanentDelete === true,
-                    // null until a write probe has run against the bucket.
-                    versioned: typeof status.versioned === 'boolean' ? status.versioned : null,
                     // 'cas': content-addressed blobs only, every workspace blob is
                     // uploaded here. 'path': objects under chosen folders and names.
                     mode: status.mode === 'cas' ? 'cas' : 'path',
@@ -449,7 +450,9 @@ export default class WorkspaceBackends {
             const live = await probe.verifyRoot();
             if (!live.ok) throw new Error(`S3 check failed (${live.reason}): ${live.error || 'unknown error'}`);
             const writes = config.readOnly !== true ? await probe.verifyWrites() : null;
-            return { ok: true, bucket: config.bucket, conditionalCreate: Boolean(writes), ...(writes ? { versioned: writes.versioned } : {}) };
+            return { ok: true, bucket: config.bucket, conditionalCreate: Boolean(writes),
+                // How the endpoint checks uploads: its own SHA-256 check, or Content-MD5.
+                ...(writes ? { uploadChecksum: writes.sha256 ? 'sha256' : 'md5' } : {}) };
         } finally { await probe.stop(); }
     }
 
@@ -458,11 +461,10 @@ export default class WorkspaceBackends {
         if (!label) throw new Error('Backend name is required');
         const name = this.#newBackendSlug(label);
         const patch = this.#s3ConfigPatch(config);
-        const probed = await this.#probeS3(patch);
+        await this.#probeS3(patch);
         await this.#workspace.setDataBackendConfig(name, {
             enabled: true, supported: true, driver: 's3', label, remote: true, transport: 's3',
             mode: 'path', resync: patch.mode !== 'cas', scanOnStart: patch.mode !== 'cas', watch: false, readOnly: false, ...patch,
-            ...('versioned' in probed ? { versioned: probed.versioned } : {}),
         });
         if (config.primary === true) this.#workspace.setPrimaryStore(name);
         return this.#workspace.getBackend('s3', name);
@@ -609,6 +611,9 @@ export default class WorkspaceBackends {
             patch = rest;
         }
         const applyPrimary = () => { if (primary !== undefined) this.#workspace.setPrimaryStore(primary); };
+        if ('keepCopy' in patch && (address !== WorkspaceStoredIndex.DATA_BLOB_BACKEND || typeof patch.keepCopy !== 'boolean')) {
+            throw new Error('keepCopy is a boolean setting of cacache/workspace:data');
+        }
         if (driver !== 's3' && !Object.keys(patch).length) { applyPrimary(); return this.#workspace.getBackend(driver, address); }
         if (driver === 'gdrive') {
             const previous = this.#workspace.dataBackends[address];
@@ -629,10 +634,7 @@ export default class WorkspaceBackends {
                 }
             }
             const connectionKeys = ['bucket', 'prefix', 'region', 'endpoint', 'accessKeyId', 'secretAccessKey', 'sessionToken', 'forcePathStyle', 'readOnly'];
-            if (connectionKeys.some(key => key in normalized)) {
-                const probed = await this.#probeS3({ ...previous, ...normalized });
-                if ('versioned' in probed) normalized.versioned = probed.versioned;
-            }
+            if (connectionKeys.some(key => key in normalized)) await this.#probeS3({ ...previous, ...normalized });
             patch = normalized;
             if (!Object.keys(patch).length) { applyPrimary(); return this.#workspace.getBackend(driver, address); }
         }
@@ -692,6 +694,15 @@ export default class WorkspaceBackends {
     async syncBackend(driver, address, { background = true } = {}) {
         if (driver === 'imap') return (await this.#runtime.integrations.mail()).resyncAccount(address);
         if (isConnectorDriver(driver)) return (await this.#runtime.integrations.connectors()).resync(driver, address);
+        // A content store is never scanned; its sync uploads the blobs the
+        // local store holds that it does not.
+        if (this.#workspace.casStores.includes(address)) {
+            if (!this.#runtime.state.storedIndex?.isRunning) await this.#runtime.integrations.startStoredIndex();
+            const run = this.#runtime.state.storedIndex.backfillCasStore(address);
+            if (!background) return run;
+            run.catch((error) => this.#workspace.logger?.warn?.(`Content store backfill failed: ${error.message}`));
+            return { backend: address, backfill: true };
+        }
         // Storage: address is the backend name / config key verbatim
         // (workspace:home, or a user mount's case-preserving slug).
         return this.#resyncDataBackend(address, { background });
@@ -736,11 +747,7 @@ export default class WorkspaceBackends {
         if (driver === 's3') {
             const config = this.#workspace.dataBackends[address];
             if (!config || config.driver !== 's3') throw new Error(`Backend not found: s3/${address}`);
-            const probed = await this.#probeS3(config);
-            // Versioning decides whether deletes are available; keep what the
-            // bucket reports now.
-            if ('versioned' in probed && probed.versioned !== config.versioned) await this.#workspace.setDataBackendConfig(address, { versioned: probed.versioned });
-            return probed;
+            return this.#probeS3(config);
         }
         if (driver !== 'imap') throw new Error(`Backend "${driver}/${address}" does not support test`);
         const target = (await this.#workspace.listImapMailboxes())

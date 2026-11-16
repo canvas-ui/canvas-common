@@ -122,7 +122,7 @@ export default class WorkspaceDocuments {
         // A re-put of identical content resolves to the SAME document by
         // checksum, so this is also the path a copy-then-delete move takes.
         if (!allowBackendsWrite && (context != null || directory != null)) await this.#runtime.trash.untrashOnLink(result).catch(() => {});
-        if (record?.locations?.length) this.#runtime.state.storedIndex?.writeSidecars([result]);
+        if (record?.locations?.length) { this.#runtime.state.storedIndex?.writeSidecars([result]); this.#runtime.state.storedIndex?.releaseLocalCopies([result]); }
         return result;
     }
 
@@ -337,7 +337,9 @@ export default class WorkspaceDocuments {
             ? returnDetails ? { id: writtenThrough[index].id, created: false, status: 'updated' } : writtenThrough[index].id
             : null);
         localIndexes.forEach((index, i) => { out[index] = Array.isArray(localIds) ? localIds[i] : null; });
-        this.#runtime.state.storedIndex?.writeSidecars(out.filter((entry, index) => entry && list[index]?.locations?.length).map((entry) => entry.id ?? entry));
+        const withBytes = out.filter((entry, index) => entry && list[index]?.locations?.length).map((entry) => entry.id ?? entry);
+        this.#runtime.state.storedIndex?.writeSidecars(withBytes);
+        this.#runtime.state.storedIndex?.releaseLocalCopies(withBytes);
         return out;
     }
 

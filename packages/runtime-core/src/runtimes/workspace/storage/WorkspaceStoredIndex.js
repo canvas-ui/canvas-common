@@ -22,7 +22,7 @@ export class WorkspaceStoredIndex {
     static HOME_STORED_BACKEND = HOME_STORED_BACKEND;
     static DATA_BLOB_BACKEND = DATA_BLOB_BACKEND;
 
-    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, moveBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, getOrphanPolicy = null, getCasStores = null, onBackendChanged = null, policyDirectoryMove = null, policyRemove = null, onLocationsRemoved = null, onRemovalReady = null, replicaOwnerGuard = null }) {
+    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, moveBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, getOrphanPolicy = null, getCasStores = null, getPrimaryStore = null, onBackendChanged = null, policyDirectoryMove = null, policyRemove = null, onLocationsRemoved = null, onRemovalReady = null, replicaOwnerGuard = null }) {
         this.#runtime = { state: createIndexState() };
         this.#runtime.transfers = new Transfers(this, this.#runtime);
         this.#runtime.objects = new Objects(this, this.#runtime);
@@ -70,6 +70,7 @@ export class WorkspaceStoredIndex {
         this.#runtime.state.getOrphanRetentionDays = getOrphanRetentionDays;
         this.#runtime.state.getOrphanPolicy = getOrphanPolicy;
         this.#runtime.state.getCasStores = getCasStores;
+        this.#runtime.state.getPrimaryStore = getPrimaryStore;
         this.#runtime.state.onLocationsRemoved = onLocationsRemoved;
         this.#runtime.state.onRemovalReady = onRemovalReady;
         this.#runtime.state.replicaOwnerGuard = replicaOwnerGuard;
@@ -227,7 +228,8 @@ export class WorkspaceStoredIndex {
                 return promise;
             },
             'object:location:add': (payload) => this.#applyLocationAdd(payload),
-            'object:location:remove': (payload) => this.#runtime.projection.applyLocationChange(payload),
+            // The copy is gone for good: the document drops the location.
+            'object:location:remove': (payload) => this.#runtime.projection.applyLocationChange({ ...payload, from: { backend: payload.backend, key: payload.key } }),
             // Change-log advance → throttled `backend.changed` nudge.
             'change': (entry) => this.#nudge(entry),
         };
@@ -251,7 +253,7 @@ export class WorkspaceStoredIndex {
     async #applyLocationAdd(payload, attempt = 0) {
         const docId = await this.#runtime.projection.applyLocationChange(payload);
         const cas = this.#runtime.state.getCasStores?.().includes(payload?.location?.backend);
-        if (docId && cas) this.writeSidecars([docId]);
+        if (docId && cas) { this.writeSidecars([docId]); this.releaseLocalCopies([docId]); }
         const delay = [5_000, 60_000, 600_000][attempt];
         if (docId || !delay || !cas) return docId;
         const timer = setTimeout(() => {
@@ -316,6 +318,8 @@ export class WorkspaceStoredIndex {
     statBlobByChecksum(...args) { return this.#runtime.content.statBlobByChecksum(...args); }
     withCasLocations(...args) { return this.#runtime.content.withCasLocations(...args); }
     writeSidecars(...args) { return this.#runtime.content.writeSidecars(...args); }
+    releaseLocalCopies(...args) { return this.#runtime.content.releaseLocalCopies(...args); }
+    backfillCasStore(...args) { return this.#runtime.content.backfillCasStore(...args); }
     applyBackendConfig(...args) { return this.#runtime.backends.applyBackendConfig(...args); }
     getEffectiveExclusions(...args) { return this.#runtime.backends.getEffectiveExclusions(...args); }
     deleteStoredUrl(...args) { return this.#runtime.backends.deleteStoredUrl(...args); }

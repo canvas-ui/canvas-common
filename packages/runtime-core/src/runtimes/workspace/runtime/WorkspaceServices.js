@@ -70,6 +70,7 @@ export default class WorkspaceServices {
             getOrphanRetentionDays: () => Number(this.#workspace.databaseSettings.orphanRetentionDays ?? -1),
             getOrphanPolicy: () => this.#workspace.databaseSettings.orphanPolicy,
             getCasStores: () => this.#runtime.config.casStores,
+            getPrimaryStore: () => this.#runtime.config.primaryStore,
         });
     }
 

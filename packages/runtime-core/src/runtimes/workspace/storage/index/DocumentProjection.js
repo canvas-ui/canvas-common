@@ -793,7 +793,12 @@ export default class DocumentProjection {
             if (twin) left.add(twin);
         }
         for (const location of doc?.locations || []) {
-            if (left.has(location.url) && !urls.has(location.url)) continue;
+            if (left.has(location.url) && !urls.has(location.url)) {
+                // File name, type and size describe the file, not the copy
+                // that went away: the remaining copies keep them.
+                for (const item of next) item.metadata = { ...location.metadata, ...item.metadata };
+                continue;
+            }
             if (urls.has(location.url)) {
                 const index = next.findIndex(item => item.url === location.url);
                 const { status: _status, statusChangedAt: _changed, ...details } = location;
