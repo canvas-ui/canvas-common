@@ -4,6 +4,7 @@ import { parseLocationUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-h
 import { deleteDocumentsInBatches } from './bulk-delete.js';
 import { exportSubtree as exportTreeSubtree, importSubtree as importTreeSubtree } from '../portability/subtree.js';
 import Workspace from '../Workspace.js';
+import { STORED_DRIVERS } from '../storage/index/contracts.js';
 
 export default class WorkspaceTrees {
     #workspace;
@@ -97,8 +98,12 @@ export default class WorkspaceTrees {
             throw new Error('Cannot remove the backends root directory');
         }
 
-        const node = tree.getLayerForPath(normalizedPath);
+        let node = tree.getLayerForPath(normalizedPath);
         if (!node) return { data: null, count: 0, error: `Path not found: ${normalizedPath}`, purged: 0 };
+        if (node.locked) {
+            await this.#releaseRemovedBackendLocks(tree, normalizedPath, node);
+            node = tree.getLayerForPath(normalizedPath);
+        }
         if (node.locked) throw new Error(`Path is locked: ${normalizedPath}`);
         if (!recursive && (await tree.listDirectories(normalizedPath)).length) {
             return { data: null, count: 0, error: 'Directory is not empty', purged: 0 };
@@ -210,6 +215,30 @@ export default class WorkspaceTrees {
      * system:backend:<holder> entry, so shared nodes (two mailboxes on one
      * account) stay locked until the last holder releases.
      */
+    // A storage backend locks its tree node while it is configured. A lock
+    // left by a backend whose config is gone holds nothing.
+    async #releaseRemovedBackendLocks(tree, treePath, node) {
+        if (!STORED_DRIVERS.has(treePath.split('/').filter(Boolean)[0])) return;
+        const prefix = Workspace.BACKEND_NODE_LOCK_PREFIX;
+        for (const holder of [...(node.lockedBy || [])]) {
+            if (holder.startsWith(prefix) && !(holder.slice(prefix.length) in this.#workspace.dataBackends)) {
+                await tree.unlockPath(treePath, holder, { system: true });
+            }
+        }
+    }
+
+    /** Drop a removed backend's tree root once no document is filed under it. */
+    async removeEmptyBackendRoot(treePath) {
+        const tree = this.#workspace.getBackendsTree();
+        if (!tree?.pathExists(treePath)) return false;
+        const documents = await tree.findRecursive(treePath);
+        if (documents && !documents.isEmpty) return false;
+        await this.#releaseRemovedBackendLocks(tree, treePath, tree.getLayerForPath(treePath));
+        await tree.removePath(treePath, true);
+        this.#workspace.emit('backend.tree.changed', { workspaceId: this.#workspace.id, treeName: Workspace.BACKENDS_TREE_NAME, path: treePath });
+        return true;
+    }
+
     async lockBackendTreeNode(backendPath, holder) {
         const tree = this.#workspace.getBackendsTree();
         await tree.insertPath(backendPath, { ignoreLocks: true });

@@ -145,7 +145,7 @@ export const HOOK_ACTIONS = Object.freeze([
         ],
         snippet: [
             '    // Fire-and-forget a script from Git/internal/scripts.',
-            "    const script = path.join(workspace.rootPath, 'git', 'scripts', 'my-script.sh'); // TODO",
+            "    const script = path.join(workspace.scriptsPath, 'my-script.sh'); // TODO",
             '    if (existsSync(script)) {',
             "        const child = spawn('bash', [script, String(doc.id)], { stdio: 'ignore', detached: true });",
             "        child.on('error', (err) => logger.debug(`spawn failed: ${err.message}`));",

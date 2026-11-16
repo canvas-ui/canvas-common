@@ -496,6 +496,7 @@ class Workspace extends EventEmitter {
     get rolesPath() { return this.#runtime.config.rolesPath; }
     get varPath() { return this.#runtime.config.varPath; }
     get varHooksPath() { return this.#runtime.config.varHooksPath; }
+    get tmpPath() { return this.#runtime.config.tmpPath; }
     get internalPaths() { return this.#runtime.config.internalPaths; }
     isDataBackendEnabled(...args) { return this.#runtime.operations.run('config.isDataBackendEnabled', () => this.#runtime.config.isDataBackendEnabled(...args)); }
     isServiceEnabled(...args) { return this.#runtime.operations.run('config.isServiceEnabled', () => this.#runtime.config.isServiceEnabled(...args)); }
@@ -593,6 +594,7 @@ class Workspace extends EventEmitter {
     getDefaultDirectoryTree(...args) { return this.#runtime.operations.run('trees.getDefaultDirectoryTree', () => this.#runtime.trees.getDefaultDirectoryTree(...args)); }
     exportSubtree(...args) { return this.#runtime.operations.run('trees.exportSubtree', () => this.#runtime.trees.exportSubtree(...args)); }
     importSubtree(...args) { return this.#runtime.operations.run('trees.importSubtree', () => this.#runtime.trees.importSubtree(...args)); }
+    removeEmptyBackendRoot(...args) { return this.#runtime.operations.run('trees.removeEmptyBackendRoot', () => this.#runtime.trees.removeEmptyBackendRoot(...args)); }
     removeBackendsTreePath(...args) { return this.#runtime.operations.run('trees.removeBackendsTreePath', () => this.#runtime.trees.removeBackendsTreePath(...args)); }
     destroyBackendsTreePath(...args) { return this.#runtime.operations.run('trees.destroyBackendsTreePath', () => this.#runtime.trees.destroyBackendsTreePath(...args)); }
     lockBackendTreeNode(...args) { return this.#runtime.operations.run('trees.lockBackendTreeNode', () => this.#runtime.trees.lockBackendTreeNode(...args)); }

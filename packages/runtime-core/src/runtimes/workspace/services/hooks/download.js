@@ -3,7 +3,6 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { WORKSPACE_DIRECTORIES } from '../../config/constants.js';
 import { sanitizeSegment, joinKey, mimeForFilename } from './key-utils.js';
 import { resolveKind, getFetcher } from '../fetchers/index.js';
 import { listFiles } from '../fetchers/lib.js';
@@ -112,7 +111,7 @@ export async function download(action, { workspace, doc, context, scope, logger,
     }
 
     // Reuse a completed download for this source, rule and destination.
-    const ledgerFile = path.join(workspace.rootPath, WORKSPACE_DIRECTORIES.var || 'var', LEDGER_FILE);
+    const ledgerFile = path.join(workspace.varPath, LEDGER_FILE);
     const ledger = readLedger(ledgerFile);
     const ledgerKey = JSON.stringify([scope.rule?.id || 'rule', doc.id, url, to, destRel, action.insert || null]);
     const previous = ledger[ledgerKey];
@@ -138,7 +137,7 @@ export async function download(action, { workspace, doc, context, scope, logger,
 
     const eventId = scope.payload?.eventId || crypto.randomUUID();
     const handlerId = String(scope.rule?.id || 'rule').replace(/[^a-zA-Z0-9._-]+/g, '-');
-    const workDir = path.join(workspace.rootPath, WORKSPACE_DIRECTORIES.varTmp || 'var/tmp', handlerId, `download-${eventId}`);
+    const workDir = path.join(workspace.tmpPath, handlerId, `download-${eventId}`);
     fs.mkdirSync(workDir, { recursive: true });
 
     const title = String(doc?.data?.title || '').trim();

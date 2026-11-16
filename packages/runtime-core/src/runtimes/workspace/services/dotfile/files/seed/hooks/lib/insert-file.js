@@ -35,7 +35,7 @@ function sha256(filePath) {
  * @returns {Promise<number|null>} document id or null
  */
 export async function insertHomeFile({ insert, workspace, logger }, filePath, { linkPath = '/', source } = {}) {
-    const homeRoot = path.resolve(workspace.rootPath, 'home');
+    const homeRoot = path.resolve(workspace.homePath);
     const resolved = path.resolve(filePath);
     if (!resolved.startsWith(`${homeRoot}${path.sep}`)) {
         logger.debug(`insertHomeFile: refusing path outside home/: ${filePath}`);

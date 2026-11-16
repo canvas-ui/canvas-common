@@ -18,13 +18,13 @@ export default async function hook(ctx) {
   if (!c.isLink() || !c.inPath('/to-sort')) { return; }
   if (!HOSTS.some((h) => c.hostMatches(h)) && !c.isImageUrl()) { return; }
 
-  const script = path.join(workspace.rootPath, 'git', 'scripts', 'fetch-url.sh');
+  const script = path.join(workspace.scriptsPath, 'fetch-url.sh');
   if (!existsSync(script)) {
     logger.debug('pinterest-downloader: git/scripts/fetch-url.sh missing, skipping');
     return;
   }
 
-  const targetDir = path.join(workspace.rootPath, 'home', 'Pictures');
+  const targetDir = path.join(workspace.homePath, 'Pictures');
   const filePath = await new Promise((resolve) => {
     const child = spawn('bash', [script, c.url, targetDir], { stdio: ['ignore', 'pipe', 'ignore'] });
     let out = '';

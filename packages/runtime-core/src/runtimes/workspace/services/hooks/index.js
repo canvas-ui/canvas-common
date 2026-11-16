@@ -4,7 +4,6 @@ import BackfillJobs from './backfill-jobs.js';
 import EventEmitter from 'eventemitter2';
 import fs from 'fs';
 import path from 'path';
-import { WORKSPACE_DIRECTORIES } from '../../config/constants.js';
 import { pathToFileURL } from 'url';
 import { createLogger } from '../../../../utils/log.js';
 import { classifyDocument } from '../../db/classifier.js';
@@ -91,8 +90,8 @@ class HookService extends EventEmitter {
     // Detached scripts clean nothing up themselves — lazily drop var/tmp
     // work dirs older than 24h whenever a workspace is (re)tracked.
     #sweepStaleWorkDirs(workspace) {
-        if (!workspace.rootPath) { return; }
-        const tmpRoot = path.join(workspace.rootPath, WORKSPACE_DIRECTORIES.varTmp);
+        const tmpRoot = workspace.tmpPath;
+        if (!tmpRoot) { return; }
         const cutoff = Date.now() - 24 * 60 * 60 * 1000;
         (async () => {
             let handlers;

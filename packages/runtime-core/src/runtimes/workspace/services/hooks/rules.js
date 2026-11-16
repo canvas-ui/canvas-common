@@ -6,7 +6,6 @@ import path from 'path';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
 import { isDisabledFile } from './naming.js';
-import { WORKSPACE_DIRECTORIES } from '../../config/constants.js';
 import { sanitizeSegment, joinKey, MIME_EXTENSIONS } from './key-utils.js';
 import { download } from './download.js';
 import { extractAttachments, emailDate } from './attachments.js';
@@ -830,7 +829,7 @@ const ACTIONS = {
     //            leak into workspace-synced scripts.
     //   stdin  — the full JSON event envelope ({ event, eventId, payload,
     //            workspace, rule }); argv carries action.args.
-    //   cwd    — {WORKSPACE_ROOT}/var/tmp/<ruleId>/<eventId> (CANVAS_WORK_DIR),
+    //   cwd    — <workspace tmp>/<ruleId>/<eventId> (CANVAS_WORK_DIR),
     //            created per run; removed after a clean captured run.
     //   output — without `output` the script is fire-and-forget (detached);
     //            with `output` stdout is captured (default 60s timeout,
@@ -838,10 +837,10 @@ const ACTIONS = {
     //            through the same pipeline as agent replies (note/file/notify).
     async script(action, { context, workspace, scope, logger }) {
         if (!action.path) { return; }
-        const gitRoot = path.resolve(workspace.rootPath, 'git');
+        const gitRoot = path.resolve(workspace.gitInternalPath);
         const scriptPath = path.resolve(gitRoot, String(action.path));
         if (scriptPath !== gitRoot && !scriptPath.startsWith(`${gitRoot}${path.sep}`)) {
-            logger.debug(`rule script: refusing path outside git/: ${action.path}`);
+            logger.debug(`rule script: refusing path outside the workspace git folder: ${action.path}`);
             return;
         }
         if (!fs.existsSync(scriptPath)) {
@@ -852,7 +851,7 @@ const ACTIONS = {
 
         const eventId = scope.payload?.eventId || crypto.randomUUID();
         const handlerId = String(scope.rule?.id || 'rule').replace(/[^a-zA-Z0-9._-]+/g, '-');
-        const workDir = path.join(workspace.rootPath, WORKSPACE_DIRECTORIES.varTmp, handlerId, eventId);
+        const workDir = path.join(workspace.tmpPath, handlerId, eventId);
         try { fs.mkdirSync(workDir, { recursive: true }); }
         catch (err) { logger.warn(`rule script: work dir creation failed: ${err.message}`); return; }
 

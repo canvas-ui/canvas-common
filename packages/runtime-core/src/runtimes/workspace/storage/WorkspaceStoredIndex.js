@@ -321,6 +321,7 @@ export class WorkspaceStoredIndex {
     releaseLocalCopies(...args) { return this.#runtime.content.releaseLocalCopies(...args); }
     backfillCasStore(...args) { return this.#runtime.content.backfillCasStore(...args); }
     applyBackendConfig(...args) { return this.#runtime.backends.applyBackendConfig(...args); }
+    forgetBackend(...args) { return this.#runtime.backends.forgetBackend(...args); }
     getEffectiveExclusions(...args) { return this.#runtime.backends.getEffectiveExclusions(...args); }
     deleteStoredUrl(...args) { return this.#runtime.backends.deleteStoredUrl(...args); }
     reconcileRemovedLocations(...args) { return this.#runtime.projection.reconcileRemovedLocations(...args); }

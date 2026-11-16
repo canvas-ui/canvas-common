@@ -674,12 +674,16 @@ export default class WorkspaceBackends {
         }
         await this.#workspace.setDataBackendConfig(address, { enabled: false });
         if (existing && existing.managed !== true && !(address in WORKSPACE_STORAGE_BACKENDS)) {
-            // User-added mount: drop the config entirely. Mirrored docs keep
-            // their tree nodes until purged via tree-rm or swept as
-            // dead-backend locations on the next resync.
+            // User-added mount: drop the config entirely. Documents lose the
+            // locations that pointed at it and its emptied tree node goes; the
+            // bytes on the backend are not touched.
             const dataBackends = this.#workspace.dataBackends;
             delete dataBackends[address];
             this.#runtime.config.writeStoredBackends(dataBackends);
+            if (this.#runtime.state.storedIndex?.isRunning) {
+                const root = await this.#runtime.state.storedIndex.forgetBackend(address);
+                if (root) await this.#workspace.removeEmptyBackendRoot(root);
+            }
             this.#workspace.emit('dataBackends.changed', { backend: address, config: null });
         }
         return true;

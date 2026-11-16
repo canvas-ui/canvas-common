@@ -2,6 +2,7 @@ import path from 'path';
 import { randomUUID } from 'node:crypto';
 import getFolderSize from 'get-folder-size';
 import { parseLocationUrl, deviceFileUrl } from '@augmentd-labs/canvas-synapsd/src/utils/path-helpers.js';
+import { getBackendCapabilities } from 'canvas-stored/src/backends/BackendManager.js';
 import { normalizeSegment } from '../../../../utils/backend-documents.js';
 import { DEFAULT_SYNC_EXCLUSIONS, WORKSPACE_INTERNAL_EXCLUSIONS } from '../../config/constants.js';
 import { HOME_STORED_BACKEND, DATA_BLOB_BACKEND, STORED_DRIVERS, LOCAL_DRIVERS, CONTAINER_DRIVERS, REMOTE_RESTART_KEYS, objectsError } from './contracts.js';
@@ -335,6 +336,21 @@ export default class Backends {
             this.#runtime.state.logger.warn({ workspaceId: this.#runtime.state.workspaceId, backend: backendName, error: err.message }, 'Backend node lock update failed'));
     }
 
+    /**
+     * A backend's config was deleted. Its tree node is unlocked, the engine
+     * stops tracking replicas on it, documents lose the locations that pointed
+     * at it (the last-location policy applies). Returns its tree root, if any.
+     */
+    async forgetBackend(backendName) {
+        const root = this.getBackendRootPath(backendName);
+        await this.#applyBackendNodeLock(backendName, false);
+        const { [backendName]: removed, ...rest } = this.#runtime.state.dataBackends;
+        this.#runtime.state.dataBackends = rest;
+        await this.#runtime.state.stored?.replicas.forgetBackend(backendName);
+        await this.#runtime.projection.purgeDeadBackendLocations();
+        return removed ? root : null;
+    }
+
     resolveBackendRoot(backendName, config = {}) {
         const configuredRoot = config.root || '';
         if (configuredRoot.includes('{WORKSPACE_ROOT}')) {
@@ -365,7 +381,7 @@ export default class Backends {
         const live = this.#runtime.state.stored?.getBackend(backendName);
         // Offline/disabled backends fall back to the driver's static answer so
         // the disable-then-destroy flow still resolves the mirror subtree.
-        const canEnumerate = live ? live.capabilities?.canEnumerate === true : CONTAINER_DRIVERS.has(driver);
+        const canEnumerate = live ? live.capabilities?.canEnumerate === true : getBackendCapabilities({ ...config, driver }).canEnumerate === true;
         if (!canEnumerate) return null;
         // Case/unicode-preserving: the mount slug is user-facing ("Fotky" must
         // not become "fotky" in the tree). Only path-hostile chars are squashed.

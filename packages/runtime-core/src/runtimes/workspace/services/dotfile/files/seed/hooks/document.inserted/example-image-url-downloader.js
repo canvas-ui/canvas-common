@@ -14,13 +14,13 @@ export default async function hook(ctx) {
   const c = classify();
   if (!c.isLink() || !c.isImageUrl()) { return; }
 
-  const script = path.join(workspace.rootPath, 'git', 'scripts', 'fetch-url.sh');
+  const script = path.join(workspace.scriptsPath, 'fetch-url.sh');
   if (!existsSync(script)) {
     logger.debug('image-url-downloader: git/scripts/fetch-url.sh missing, skipping');
     return;
   }
 
-  const targetDir = path.join(workspace.rootPath, 'home', 'Pictures');
+  const targetDir = path.join(workspace.homePath, 'Pictures');
   const linkPath = c.paths[0] || '/';
 
   // The script prints the downloaded file's absolute path on stdout.

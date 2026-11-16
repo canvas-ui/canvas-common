@@ -18,13 +18,13 @@ export default async function run(ctx) {
     const c = classify();
     if (!c.isTab() || !c.isYoutube()) { return; }
 
-    const script = path.join(workspace.rootPath, 'git', 'scripts', 'ytdl.sh');
+    const script = path.join(workspace.scriptsPath, 'ytdl.sh');
     if (!existsSync(script)) {
         logger.debug('youtube hook: git/scripts/ytdl.sh missing, skipping');
         return;
     }
 
-    const targetDir = path.join(workspace.rootPath, 'home', 'Videos');
+    const targetDir = path.join(workspace.homePath, 'Videos');
     const linkPath = c.paths[0] || '/';
 
     // The script prints the downloaded file's absolute path on stdout.

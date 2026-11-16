@@ -335,6 +335,12 @@ export default class WorkspaceConfiguration {
         return this.#resolveDir('var');
     }
 
+    /** Scratch space for rule scripts and downloads (`internals.tmp`). */
+    get tmpPath() {
+        const internals = this.#runtime.state.configStore.get('internals', {}) || {};
+        return this.#resolveWorkspacePath(internals.tmp ?? workspaceDirectories(this.#workspace.layout).varTmp);
+    }
+
     /** Hook/rule run + pending-action logs (runs.jsonl, pending.jsonl). */
     get varHooksPath() {
         return this.#resolveDir('varHooks');
@@ -358,6 +364,7 @@ export default class WorkspaceConfiguration {
             this.#workspace.gitPath,
             this.#workspace.configDir,
             this.#workspace.varPath,
+            this.#workspace.tmpPath,
             this.#workspace.rolesPath,
         ].filter(Boolean);
     }
