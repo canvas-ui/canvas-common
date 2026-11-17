@@ -116,7 +116,8 @@ function extractPaths(spec) {
     if (typeof spec === 'string') return spec ? [spec] : [];
     if (Array.isArray(spec)) return spec.flatMap(extractPaths);
     if (!spec || typeof spec !== 'object') { return []; }
-    const paths = Array.isArray(spec.paths) ? spec.paths : (spec.path ? [spec.path] : []);
+    // A selector names one path (`path: '/a'`) or several (`paths`, or `path` as a list).
+    const paths = Array.isArray(spec.paths) ? spec.paths : (spec.path ? [spec.path].flat() : []);
     return paths.filter((p) => typeof p === 'string' && p.length > 0);
 }
 

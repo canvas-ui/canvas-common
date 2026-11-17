@@ -79,6 +79,14 @@ export default class WorkspaceBackends {
         if (!config.supported) throw new Error(`Data backend "${backendName}" is not supported yet`);
         if (!config.resync) throw new Error(`Data backend "${backendName}" does not support resync`);
         if (!this.#runtime.state.storedIndex?.isRunning) await this.#runtime.integrations.startStoredIndex();
+        // A share's files are walked on the machine that holds them: ask it to
+        // walk now, and the listing runs when that pass is done. An offline
+        // share takes the ordinary path, which records it as offline.
+        const share = config.driver === 'share' ? this.#runtime.state.storedIndex.stored?.getBackend(backendName) : null;
+        if (share?.online) {
+            await share.rescanSource();
+            return { backend: backendName, started: true, resyncing: true };
+        }
         // A resync is a potentially slow full scan (large/remote backends); by
         // default it runs in the background and progress is reported via the
         // backend status. Pass { background: false } to await completion.
