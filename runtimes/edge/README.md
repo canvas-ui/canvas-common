@@ -74,6 +74,8 @@ keeps its catalog.
 The daemon walks and hashes the folder into its own index (resumable: an
 unchanged file keeps its checksum), follows changes with a watcher unless
 `--no-watch`, rescans every six hours and answers the workspace's requests.
+A rescan of the backend in the workspace (web UI, `POST …/backends/share/<name>/sync`)
+starts the same walk as `share scan` does on the machine.
 It only dials out (`POST …/backends/share/<name>/poll`, see canvas-server
 `docs/storage-shares.md`), so the machine needs no open port.
 
