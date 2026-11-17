@@ -18,6 +18,7 @@ export const EDGE_HOME = process.env.CANVAS_EDGE_HOME
 export const EDGE_PATHS = Object.freeze({
     home: EDGE_HOME,
     mirrors: path.join(EDGE_HOME, 'config', 'mirrors.json'),
+    shares: path.join(EDGE_HOME, 'config', 'shares.json'),
     remotes: path.join(EDGE_HOME, 'config', 'remotes.json'),
     device: process.env.CANVAS_DEVICE_FILE || (process.platform === 'win32'
         ? path.join(os.homedir(), 'Canvas', 'device.json')
@@ -69,21 +70,32 @@ export function resolveStateDir(mirror, stateRoot = STATE_ROOT) {
  *   CANVAS_CONFLICTS       prompt | rename        CANVAS_DELETES  propagate | keep
  *   CANVAS_PINS / CANVAS_IGNORE   comma-separated globs
  */
-export function ensureEnvConfig(env = process.env) {
+const envList = (v) => String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+
+// The remote the environment names, written to remotes.json: `{ hubId, workspace }`, or null when the environment names none.
+function seedEnvRemote(env) {
     const url = env.CANVAS_HUB_URL && String(env.CANVAS_HUB_URL).trim().replace(/\/+$/, '');
     const token = env.CANVAS_HUB_TOKEN && String(env.CANVAS_HUB_TOKEN).trim();
     const workspace = env.CANVAS_WORKSPACE && String(env.CANVAS_WORKSPACE).trim();
     if (!url || !token || !workspace) return null;
     const hubId = (env.CANVAS_HUB_ID && String(env.CANVAS_HUB_ID).trim()) || 'hub';
-    const list = (v) => String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-    const oneOf = (v, allowed, fallback) => (allowed.includes(String(v ?? '').trim()) ? String(v).trim() : fallback);
-
     const remotes = readJson(EDGE_PATHS.remotes, {}) || {};
     const prior = remotes[hubId] || {};
     // A device token minted for this remote stays authoritative; env only
     // seeds the user/API token it started from.
     remotes[hubId] = { ...prior, url, apiBase: prior.apiBase || '/rest/v2', auth: { ...(prior.auth || {}), token }, source: 'env', ...(resolveTls(prior.url && new URL(prior.url).origin !== new URL(url).origin ? undefined : prior.tls, env) ? { tls: resolveTls(prior.url && new URL(prior.url).origin !== new URL(url).origin ? undefined : prior.tls, env) } : { tls: undefined }) };
     writeJson(EDGE_PATHS.remotes, remotes);
+    return { hubId, workspace };
+}
+
+export function ensureEnvConfig(env = process.env) {
+    // A container that serves a share does not also mirror the workspace into it.
+    if (env.CANVAS_SHARE_NAME) return null;
+    const seeded = seedEnvRemote(env);
+    if (!seeded) return null;
+    const { hubId, workspace } = seeded;
+    const list = envList;
+    const oneOf = (v, allowed, fallback) => (allowed.includes(String(v ?? '').trim()) ? String(v).trim() : fallback);
 
     const cfg = readJson(EDGE_PATHS.mirrors, { version: 1, mirrors: [] }) || { version: 1, mirrors: [] };
     const mirrors = Array.isArray(cfg.mirrors) ? cfg.mirrors : [];
@@ -111,6 +123,58 @@ export function ensureEnvConfig(env = process.env) {
     cfg.mirrors = [...mirrors.filter((m) => m?.id !== id), mirror];
     writeJson(EDGE_PATHS.mirrors, { version: cfg.version || 1, ...cfg, mirrors: cfg.mirrors });
     return mirror;
+}
+
+/*
+ * Env-driven share (a NAS container exporting one folder): with CANVAS_HUB_URL
+ * + CANVAS_HUB_TOKEN + CANVAS_WORKSPACE and CANVAS_SHARE_NAME set, the daemon
+ * writes (or refreshes) one remote and one share in its own config files.
+ *
+ *   CANVAS_SHARE_NAME      <share>.<site>, e.g. nas-accounting.home
+ *   CANVAS_SHARE_PATH      folder to serve (default /data); mount it read-only
+ *   CANVAS_SHARE_LABEL     display name (default: the share name)
+ *   CANVAS_SHARE_WATCH     false = no live changes, rescans only (default true)
+ *   CANVAS_SHARE_EXCLUDE   comma-separated globs on top of the defaults
+ */
+export function ensureEnvShare(env = process.env) {
+    const name = env.CANVAS_SHARE_NAME && String(env.CANVAS_SHARE_NAME).trim().toLowerCase();
+    if (!name) return null;
+    const seeded = seedEnvRemote(env);
+    if (!seeded) throw new Error('CANVAS_SHARE_NAME needs CANVAS_HUB_URL, CANVAS_HUB_TOKEN and CANVAS_WORKSPACE');
+    const workspaceName = seeded.workspace.toLowerCase();
+    const id = shareId(seeded.hubId, workspaceName, name);
+    const cfg = readJson(EDGE_PATHS.shares, { version: 1, shares: [] }) || { version: 1, shares: [] };
+    const shares = Array.isArray(cfg.shares) ? cfg.shares : [];
+    const existing = shares.find((s) => s?.id === id) || {};
+    const share = {
+        ...existing,
+        id, remote: seeded.hubId, workspaceName, name,
+        label: env.CANVAS_SHARE_LABEL ? String(env.CANVAS_SHARE_LABEL).trim() : (existing.label || name),
+        path: path.resolve(env.CANVAS_SHARE_PATH ? String(env.CANVAS_SHARE_PATH) : (existing.path || '/data')),
+        watch: env.CANVAS_SHARE_WATCH != null ? !['false', '0', 'no'].includes(String(env.CANVAS_SHARE_WATCH).trim().toLowerCase()) : existing.watch !== false,
+        exclude: env.CANVAS_SHARE_EXCLUDE != null ? envList(env.CANVAS_SHARE_EXCLUDE) : (existing.exclude || []),
+        paused: false,
+        createdAt: existing.createdAt || new Date().toISOString(),
+        source: 'env',
+    };
+    writeJson(EDGE_PATHS.shares, { version: cfg.version || 1, ...cfg, shares: [...shares.filter((s) => s?.id !== id), share] });
+    return share;
+}
+
+/** A share's id in shares.json: one share name per workspace per hub. */
+export function shareId(remote, workspaceName, name) { return `${remote}/${workspaceName}/${name}`; }
+
+/**
+ * Shares this daemon serves (shares.json, written by `canvas workspace <ws>
+ * share add`). A share's index lives in `stateDir`: the entry's own, or
+ * `<CANVAS_EDGE_STATE_ROOT>/<id>`, or `~/.canvas/var/shares/<id>`. Never in
+ * the shared folder, which is only ever read.
+ */
+export function edgeShares() {
+    const cfg = readJson(EDGE_PATHS.shares, { shares: [] }) || {};
+    return (Array.isArray(cfg.shares) ? cfg.shares : [])
+        .filter((s) => s && s.id && s.name && s.path && s.remote && s.workspaceName && !s.paused)
+        .map((s) => ({ ...s, stateDir: resolveStateDir(s) || path.join(EDGE_HOME, 'var', 'shares', String(s.id).replace(/[^a-zA-Z0-9._@-]+/g, '_')) }));
 }
 
 /**

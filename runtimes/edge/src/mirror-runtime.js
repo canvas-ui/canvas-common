@@ -144,6 +144,8 @@ export class MirrorRuntime {
     }
 
     nudge() { this.#engine?.nudge?.(); }
+    /** Rebuild both views from full listings, then reconcile. */
+    async resync() { return this.#engine?.resync(); }
     heldDeletes() { return this.#engine?.heldDeletes() ?? []; }
     approveDeletes() { return this.#engine?.approveDeletes() ?? 0; }
     restoreDeletes() { return this.#engine?.restoreDeletes() ?? 0; }

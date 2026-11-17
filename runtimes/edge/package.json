@@ -1,7 +1,7 @@
 {
   "name": "@augmentd-labs/canvas-edge",
-  "version": "0.7.2",
-  "description": "Canvas device runtime: folder mirrors (canvas-stored Mirror engine) + edge tunnel client",
+  "version": "0.8.0",
+  "description": "Canvas device runtime: folder mirrors, read-only folder shares (canvas-stored) and the edge tunnel client",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "bin": {

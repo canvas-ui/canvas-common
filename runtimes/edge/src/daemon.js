@@ -3,9 +3,10 @@
 import fs from 'fs';
 import path from 'path';
 import pino from 'pino';
-import { EDGE_PATHS, STATE_ROOT, daemonMirrors, deviceIdentity, ensureDeviceToken, ensureEnvConfig, fuseMirrors, hubFor } from './env.js';
+import { EDGE_PATHS, STATE_ROOT, daemonMirrors, deviceIdentity, edgeShares, ensureDeviceToken, ensureEnvConfig, ensureEnvShare, fuseMirrors, hubFor } from './env.js';
 import { MirrorRuntime } from './mirror-runtime.js';
 import { FuseRuntime } from './fuse-runtime.js';
+import { ShareRuntime } from './share-runtime.js';
 import { startControl } from './control.js';
 
 const START_RETRY_MS = 60_000;
@@ -15,7 +16,9 @@ const START_RETRY_MS = 60_000;
  * client of the sync protocol, for macOS/Windows and anyone who wants a plain
  * folder). One process per device runs every `client: 'daemon'` mirror from
  * ~/.canvas/config/mirrors.json; the CLI (`canvas mirror`) writes that file and
- * talks to this process over the control socket.
+ * talks to this process over the control socket. The same process serves the
+ * shares of ~/.canvas/config/shares.json (`canvas workspace <ws> share`): local
+ * folders a workspace lists and reads in place.
  */
 export async function main(argv = process.argv.slice(2)) {
     const foreground = argv.includes('--foreground') || argv.includes('-f');
@@ -33,6 +36,12 @@ export async function main(argv = process.argv.slice(2)) {
     } catch (err) {
         logger.error({ err: err?.message }, 'env-driven mirror config failed');
     }
+    try {
+        const seeded = ensureEnvShare();
+        if (seeded) logger.info({ share: seeded.id, folder: seeded.path, watch: seeded.watch }, 'share configured from environment');
+    } catch (err) {
+        logger.error({ err: err?.message }, 'env-driven share config failed');
+    }
 
     // A mirror that cannot start (its drive is not mounted yet) is tried again.
     let retry = null;
@@ -43,9 +52,10 @@ export async function main(argv = process.argv.slice(2)) {
         let failed = false;
         const wanted = daemonMirrors();
         const fuse = fuseMirrors();
-        const wantedIds = new Set([...wanted, ...fuse].map((m) => m.id));
+        const shares = edgeShares();
+        const wantedIds = new Set([...wanted, ...fuse, ...shares].map((m) => m.id));
         for (const [id, rt] of runtimes) {
-            if (!wantedIds.has(id)) { await rt.stop().catch(() => {}); runtimes.delete(id); logger.info({ mirror: id }, 'mirror stopped (removed from config)'); }
+            if (!wantedIds.has(id)) { await rt.stop().catch(() => {}); runtimes.delete(id); logger.info({ unit: id }, 'unit stopped (removed from config)'); }
         }
         for (const mirror of wanted) {
             if (runtimes.has(mirror.id)) continue;
@@ -77,6 +87,26 @@ export async function main(argv = process.argv.slice(2)) {
                 logger.error({ unit: mirror.id, err: err?.message }, 'fuse unit failed to start');
             }
         }
+        // share units: local folders served to a workspace. One whose drive is
+        // not plugged in yet has nothing to bind to and is tried again.
+        for (const share of shares) {
+            if (runtimes.has(share.id)) continue;
+            let hub = hubFor(share.remote);
+            if (!hub?.token) { logger.warn({ share: share.id, remote: share.remote }, 'no credentials for hub — skipped'); continue; }
+            if (!hub.deviceId) {
+                try { hub = await ensureDeviceToken(share.remote, { logger }); }
+                catch (err) { logger.warn({ share: share.id, remote: share.remote, err: err?.message }, 'device registration failed — serving under the user token'); }
+            }
+            const rt = new ShareRuntime({ share, hub, identity: deviceIdentity(hub), logger });
+            try {
+                await rt.start();
+                runtimes.set(share.id, rt);
+            } catch (err) {
+                failed = true;
+                await rt.stop().catch(() => {});
+                logger.error({ share: share.id, err: err?.message }, 'share failed to start');
+            }
+        }
         if (failed && !stopping) {
             retry = setTimeout(() => load().catch((err) => logger.error({ err: err?.message }, 'reload failed')), START_RETRY_MS);
             retry.unref?.();
@@ -97,5 +127,6 @@ export async function main(argv = process.argv.slice(2)) {
 
     const control = await startControl({ runtimes, reload: load, shutdown, logger });
     await load();
-    logger.info({ device: deviceIdentity().deviceId, mirrors: runtimes.size, fuse: [...runtimes.values()].filter((r) => r.unit === 'fuse').length }, 'canvas-edge running');
+    const count = (unit) => [...runtimes.values()].filter((r) => r.unit === unit).length;
+    logger.info({ device: deviceIdentity().deviceId, mirrors: runtimes.size - count('fuse') - count('share'), fuse: count('fuse'), shares: count('share') }, 'canvas-edge running');
 }

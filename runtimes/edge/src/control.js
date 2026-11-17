@@ -19,6 +19,16 @@ export async function startControl({ runtimes, reload, shutdown, logger }) {
     };
     app.get('/status', async () => ({ pid: process.pid, mirrors: await snapshot() }));
     app.get('/mirrors', async () => snapshot());
+    // Units by kind: `mirrors` above lists every unit, shares included.
+    app.get('/shares', async () => (await snapshot()).filter((unit) => unit.unit === 'share'));
+    // Walk and hash a share's folder now. `{ ok:false, reason }` when the folder is not there,
+    // `{ ok, count, complete }` when the pass is over within two seconds, else `{ ok:true, running:true }`.
+    app.post('/shares/:id/scan', async (req, reply) => {
+        const r = runtimes.get(req.params.id);
+        if (r?.unit !== 'share') return reply.code(404).send({ error: 'no such share' });
+        const scan = r.resync();
+        return Promise.race([scan, new Promise((resolve) => { setTimeout(() => resolve({ ok: true, running: true }), 2000).unref?.(); })]);
+    });
     app.post('/mirrors/:id/resync', async (req, reply) => {
         const r = byId(req.params.id);
         if (!r) return reply.code(404).send({ error: 'no such mirror' });
