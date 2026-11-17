@@ -36,6 +36,68 @@ export default async function workspaceBackendRoutes(fastify) {
         return requireWorkspaceAdmin()(request, reply);
     };
 
+    // Shares: the machine that holds the folder (the canvas-edge share unit)
+    // dials in. It registers the share with POST /share { name, label, watch },
+    // then repeats POST /share/<name>/poll and answers each request it is
+    // handed with POST /share/<name>/requests/<id>. DELETE /share/<name>/poll
+    // says it stops; without it the share goes offline after 60 s of silence.
+    fastify.addContentTypeParser('application/octet-stream', { bodyLimit: 8 * 1024 * 1024 }, (_req, payload, done) => done(null, payload));
+
+    // Body { source: { epoch, fsid?, head, scanning?, files?, device?, version? }, wait? (ms, at most 50000) }.
+    // Answers { requests: [{ id, op: 'list'|'changes'|'shape'|'stat'|'read', … }] } at once
+    // when requests are queued, otherwise when one arrives or `wait` is over.
+    fastify.post('/share/:address/poll', {
+        onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+        schema: {
+            body: {
+                type: 'object',
+                required: ['source'],
+                properties: {
+                    source: { type: 'object', required: ['epoch'], properties: { epoch: { type: 'string', minLength: 1, maxLength: 128 } } },
+                    wait: { type: 'integer', minimum: 0, maximum: 50000 },
+                },
+            },
+        },
+    }, async (request, reply) => {
+        try {
+            return ok(reply, await request.workspace.pollShare(arg(request.params.address), request.body.source, { wait: request.body.wait ?? 25000 }));
+        } catch (error) {
+            if (error.statusCode && error.statusCode < 500) {
+                const response = new ResponseObject().error(error.message, null, error.statusCode);
+                response.code = error.code;
+                return reply.code(response.statusCode).send(response.getResponse());
+            }
+            return fail(request, reply, error);
+        }
+    });
+
+    // The machine stops serving the share (daemon shutdown, share removed
+    // there): it shows offline at once instead of after a minute of silence.
+    fastify.delete('/share/:address/poll', {
+        onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+    }, async (request, reply) => {
+        try { return ok(reply, await request.workspace.leaveShare(arg(request.params.address))); }
+        catch (error) { return fail(request, reply, error); }
+    });
+
+    // The answer to one polled request. JSON { body } for list/changes/shape/stat,
+    // JSON { error, code } when the request failed, or the raw bytes of a read as
+    // application/octet-stream. Answers { taken: false } when the request is
+    // no longer waited for.
+    fastify.post('/share/:address/requests/:requestId', {
+        onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+    }, async (request, reply) => {
+        try {
+            const raw = String(request.headers['content-type'] || '').startsWith('application/octet-stream');
+            const answer = raw ? { stream: request.body } : {
+                body: request.body?.body ?? null,
+                error: request.body?.error ?? null,
+                code: request.body?.code ?? null,
+            };
+            return ok(reply, { taken: await request.workspace.answerShare(arg(request.params.address), arg(request.params.requestId), answer) });
+        } catch (error) { return fail(request, reply, error); }
+    });
+
     // List every backend across all drivers.
     fastify.get('/', {
         onRequest: [fastify.authenticate, requireWorkspaceRead()],

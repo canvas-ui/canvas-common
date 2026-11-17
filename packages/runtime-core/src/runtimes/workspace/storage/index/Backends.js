@@ -121,7 +121,8 @@ export default class Backends {
                 await this.#registerBackend(name, fullConfig);
                 this.#runtime.state.backendStatus.set(name, { lastScanAt: null, lastError: null });
                 await this.#applyBackendNodeLock(name, true);
-                if (fullConfig.resync) {
+                // A share is listed when its machine connects, not when it is added.
+                if (fullConfig.resync && fullConfig.driver !== 'share') {
                     // Initial/catch-up scan can be slow (a whole external
                     // folder) — never block the enable/add call on it.
                     try { this.#index.resyncInBackground(name); } catch (err) { this.setBackendError(name, err); }
@@ -147,7 +148,12 @@ export default class Backends {
             }
         }
 
-        if ('watch' in patch) {
+        // A share has no watcher to start or stop: the setting only decides
+        // whether it tails its source's change log.
+        if ('watch' in patch && fullConfig.driver === 'share') {
+            const live = this.#runtime.state.stored.getBackend(name);
+            if (live) live.config.watch = fullConfig.watch === true;
+        } else if ('watch' in patch) {
             const live = this.#runtime.state.stored.getBackend(name);
             if (live) {
                 if (patch.watch && !live.watching) {
@@ -241,6 +247,8 @@ export default class Backends {
             account: config.account || backendName,
             container: config.container || config.folderId || 'root',
             algorithms: ['sha256'],
+            // A share's name is the authority of its file:// URLs.
+            ...(config.driver === 'share' ? { share: backendName } : {}),
         };
     }
 
@@ -391,7 +399,13 @@ export default class Backends {
         //   /workspace/<store>        workspace-anchored (workspace:home → /workspace/home)
         //   /device/<device>/<mount>  device-anchored fs mounts (device segment is
         //                             the config snapshot — stable across renames)
+        //   /device/<site>/<share>    shares: a folder on another machine, named
+        //                             <share>.<site> (wd1t.home → /device/home/wd1t)
         //   /<driver>/<address>       connectors/remotes (imap, s3, …)
+        if (driver === 'share') {
+            const [share, site] = backendName.split('.');
+            return `/device/${site}/${share}`;
+        }
         const deviceSegment = config.device?.name
             ? String(config.device.name).replace(/[^\p{L}\p{N}._@-]+/gu, '-')
             : null;

@@ -18,6 +18,7 @@ export { normalizeObjectKey } from './index/contracts.js';
 // are collaborators with explicit access to the adapter's runtime state.
 export class WorkspaceStoredIndex {
     #runtime;
+    #shareRescans = new Map();
 
     static HOME_STORED_BACKEND = HOME_STORED_BACKEND;
     static DATA_BLOB_BACKEND = DATA_BLOB_BACKEND;
@@ -100,6 +101,9 @@ export class WorkspaceStoredIndex {
             // and clients can warn before triggering an expensive full resync.
             remote: backend?.remote === true,
             transport: backend?.transport || null,
+            // Shares: is the machine holding the folder connected, and what
+            // it last said about itself ({ epoch, fsid, head, scanning, files, device, seenAt }).
+            ...(typeof backend?.poll === 'function' ? { online: backend.online, source: backend.source } : {}),
         };
     }
 
@@ -232,6 +236,7 @@ export class WorkspaceStoredIndex {
             'object:location:remove': (payload) => this.#runtime.projection.applyLocationChange({ ...payload, from: { backend: payload.backend, key: payload.key } }),
             // Change-log advance → throttled `backend.changed` nudge.
             'change': (entry) => this.#nudge(entry),
+            'backend:state': (state) => this.#shareState(state),
         };
 
         this.#runtime.state.listeners = Object.entries(eventMap).map(([eventName, handler]) => {
@@ -267,7 +272,42 @@ export class WorkspaceStoredIndex {
         return null;
     }
 
+    // A share's source connected, disconnected, or has more to list than its
+    // change log tells (first contact, a new index, its first hashing pass
+    // done). Clients get the same notice a resync sends, and a listing is run
+    // when one is due. Other backends' state events belong to their services.
+    #shareState(state = {}) {
+        const name = state.backend;
+        if (typeof this.#runtime.state.stored?.getBackend(name)?.poll !== 'function') return;
+        const online = state.online === true;
+        const status = { ...(this.#runtime.state.backendStatus.get(name) || {}), offline: !online };
+        if (online && /^mount unavailable/.test(status.lastError || '')) status.lastError = null;
+        this.#runtime.state.backendStatus.set(name, status);
+        try {
+            this.#runtime.state.onResyncStateChange?.({
+                backend: name, treePath: this.#runtime.backends.getBackendRootPath(name), online,
+                resyncing: status.resyncing === true, progress: status.progress || null,
+                lastScanAt: status.lastScanAt || null, lastError: status.lastError || null,
+            });
+        } catch { /* an observer must never break the backend */ }
+        if (online && state.rescan) this.#shareRescan(name);
+    }
+
+    // One listing after the one in flight, however many were asked for.
+    #shareRescan(name) {
+        if (!this.#runtime.state.stored?.getBackend(name)) return;
+        try {
+            if (!this.resyncInBackground(name).alreadyRunning) return;
+        } catch (error) { this.#runtime.backends.setBackendError(name, error); return; }
+        if (this.#shareRescans.has(name)) return;
+        const timer = setTimeout(() => { this.#shareRescans.delete(name); this.#shareRescan(name); }, 15_000);
+        timer.unref?.();
+        this.#shareRescans.set(name, timer);
+    }
+
     #unbindEvents() {
+        for (const timer of this.#shareRescans.values()) clearTimeout(timer);
+        this.#shareRescans.clear();
         for (const timer of this.#runtime.state.locationRetries) clearTimeout(timer);
         this.#runtime.state.locationRetries.clear();
         if (!this.#runtime.state.stored?.off) {

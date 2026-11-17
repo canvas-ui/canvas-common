@@ -4,7 +4,7 @@ export const HOME_STORED_BACKEND = 'workspace:home';
 
 export const DATA_BLOB_BACKEND = 'workspace:data';
 
-export const STORED_DRIVERS = new Set(['file', 'cacache', 'gdrive', 's3']);
+export const STORED_DRIVERS = new Set(['file', 'cacache', 'gdrive', 's3', 'share']);
 
 export const LOCAL_DRIVERS = new Set(['file', 'cacache']);
 

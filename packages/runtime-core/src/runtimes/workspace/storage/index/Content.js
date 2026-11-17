@@ -213,12 +213,19 @@ export default class Content {
 
         if (scheme === 'stored') {
             if (!this.#runtime.state.stored) throw new Error('WorkspaceStoredIndex is not running');
-            if (!options.stream) return { data: await this.#runtime.state.stored.getByUrl(url), ranged: false };
-            if (options.range) {
-                const r = await this.#runtime.state.stored.getRangeStreamByUrl(url, options.range);
-                return { data: r?.stream ?? null, ranged: !!r?.ranged };
+            try {
+                if (!options.stream) return { data: await this.#runtime.state.stored.getByUrl(url), ranged: false };
+                if (options.range) {
+                    const r = await this.#runtime.state.stored.getRangeStreamByUrl(url, options.range);
+                    return { data: r?.stream ?? null, ranged: !!r?.ranged };
+                }
+                return { data: await this.#runtime.state.stored.getStreamByUrl(url), ranged: false };
+            } catch (error) {
+                // A share whose machine is not connected: the bytes are
+                // somewhere else right now, which is a miss, not a fault.
+                if (!['OFFLINE', 'TIMEOUT', 'STOPPED'].includes(error?.code)) throw error;
+                throw Object.assign(new Error(`${backend} is offline: ${error.message}`), { code: 'DEVICE_NOT_REACHABLE' });
             }
-            return { data: await this.#runtime.state.stored.getStreamByUrl(url), ranged: false };
         }
 
         if (scheme === 'file') {

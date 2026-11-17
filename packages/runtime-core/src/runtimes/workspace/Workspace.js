@@ -639,6 +639,10 @@ class Workspace extends EventEmitter {
     listBackendsByDriver(...args) { return this.#runtime.operations.run('backends.listBackendsByDriver', () => this.#runtime.backends.listBackendsByDriver(...args)); }
     getBackend(...args) { return this.#runtime.operations.run('backends.getBackend', () => this.#runtime.backends.getBackend(...args)); }
     addBackend(...args) { return this.#runtime.operations.run('backends.addBackend', () => this.#runtime.backends.addBackend(...args)); }
+    // Long polls and byte streams: not operations to time or serialize.
+    pollShare(...args) { return this.#runtime.backends.pollShare(...args); }
+    answerShare(...args) { return this.#runtime.backends.answerShare(...args); }
+    leaveShare(...args) { return this.#runtime.backends.leaveShare(...args); }
     transferBackendObject(...args) { return this.#runtime.operations.run('objects.transferBackendObject', () => this.#runtime.objects.transferBackendObject(...args)); }
     writeBackendObject(...args) { return this.#runtime.operations.run('objects.writeBackendObject', () => this.#runtime.objects.writeBackendObject(...args)); }
     removeBackendObject(...args) { return this.#runtime.operations.run('objects.removeBackendObject', () => this.#runtime.objects.removeBackendObject(...args)); }

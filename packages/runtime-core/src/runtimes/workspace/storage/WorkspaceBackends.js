@@ -56,6 +56,8 @@ export default class WorkspaceBackends {
                 cancelledAt: runtime.cancelledAt || null,
                 lastScanAt: runtime.lastScanAt || null,
                 lastError: this.#runtime.state.withoutSecrets && containsSecrets(config) ? 'Credentials locked — start with PIN/password' : runtime.lastError || null,
+                online: runtime.online,
+                source: runtime.source || null,
                 cacheStats: runtime.cacheStats || null,
                 // Runtime truth (kernel mount table) beats the stored config —
                 // a folder can become a mountpoint, or stop being one, between
@@ -128,9 +130,13 @@ export default class WorkspaceBackends {
 
     #storageBackendDescriptor(name, status = {}) {
         const driver = status.driver || 'file';
+        // A share whose machine is not connected is offline, which is a state
+        // and not an error: its catalog stays, its bytes are unreachable.
+        const offline = driver === 'share' && status.running && status.online !== true;
         const state = status.resyncing
             ? 'syncing'
-            : (status.lastError ? 'error' : (status.running ? (status.watching ? 'running' : 'idle') : 'stopped'));
+            : offline ? 'offline'
+                : (status.lastError ? 'error' : (status.running ? (status.watching ? 'running' : 'idle') : 'stopped'));
         return {
             driver,
             address: name,
@@ -147,7 +153,7 @@ export default class WorkspaceBackends {
             // device-scoped mounts) so clients never re-derive path grammar.
             treePath: this.#runtime.state.storedIndex?.getBackendTreeRoot(name) || null,
             lastSyncAt: status.lastScanAt || null,
-            lastError: status.lastError || null,
+            lastError: offline ? null : status.lastError || null,
             // Last on-demand disk usage ({bytes, files, computedAt}) if computed
             // this runtime — see getBackendDiskUsage.
             usage: status.diskUsage || null,
@@ -200,6 +206,18 @@ export default class WorkspaceBackends {
                     // uploaded here. 'path': objects under chosen folders and names.
                     mode: status.mode === 'cas' ? 'cas' : 'path',
                     sidecar: status.sidecar === true,
+                } : {}),
+                // A share: `mode` is what the machine holding the folder allows
+                // ('ro'), `online` whether it is connected, `source` what it
+                // last reported ({ head, scanning, files, device, version, seenAt }).
+                ...(driver === 'share' ? {
+                    mode: status.mode || 'ro',
+                    online: status.online === true,
+                    source: status.source ? {
+                        head: status.source.head, scanning: status.source.scanning, files: status.source.files,
+                        device: status.source.device, version: status.source.version,
+                        seenAt: status.source.seenAt ? new Date(status.source.seenAt).toISOString() : null,
+                    } : null,
                 } : {}),
                 exclude: Array.isArray(status.exclude) ? status.exclude : [],
                 effectiveExclusions: Array.isArray(status.effectiveExclusions) ? status.effectiveExclusions : undefined,
@@ -308,6 +326,7 @@ export default class WorkspaceBackends {
         if (driver === 'file') return this.#addFileBackend(config);
         if (driver === 'gdrive') return this.#addGdriveBackend(config);
         if (driver === 's3') return this.#addS3Backend(config);
+        if (driver === 'share') return this.#addShareBackend(config);
         const name = config.name || config.address;
         if (!name) throw new Error('Storage backend name is required');
         await this.#workspace.setDataBackendConfig(name, config);
@@ -406,6 +425,72 @@ export default class WorkspaceBackends {
             device: { id: device.deviceId, name: device.name },
         });
         return this.#workspace.getBackend('file', name);
+    }
+
+    static #SHARE_NAME = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+    /**
+     * Register a share: a folder on another machine, served to this workspace
+     * by the canvas-edge share unit running there (`canvas workspace <ws>
+     * share add <folder>`). The name is `<share>.<site>` ("wd1t.home"): it is
+     * the backend address, the authority of the files' `file://wd1t.home/…`
+     * URLs and the tree node `/device/home/wd1t`. `label` is the display name.
+     * Registering a share that exists updates its label and watch setting, so
+     * the unit can announce itself on every start.
+     */
+    async #addShareBackend(config = {}) {
+        const name = String(config.name || config.address || '').trim();
+        if (!WorkspaceBackends.#SHARE_NAME.test(name)) {
+            throw Object.assign(new Error(`Share name must be <share>.<site> in lowercase letters, digits and dashes (e.g. "nas-accounting.home"), got "${name}"`), { statusCode: 400 });
+        }
+        const mode = config.mode ?? 'ro';
+        if (mode !== 'ro') throw Object.assign(new Error(`Share mode "${mode}" is not available; shares are read-only ("ro")`), { statusCode: 400 });
+        const existing = this.#workspace.dataBackends[name];
+        if (existing && existing.driver !== 'share') throw Object.assign(new Error(`Backend "${name}" already exists and is not a share`), { statusCode: 409 });
+        const [share, site] = name.split('.');
+        const node = `/device/${site}/${share}`;
+        const taken = this.listStorageBackends().find((b) => b.address !== name && b.treePath && b.treePath.toLowerCase() === node);
+        if (taken) throw Object.assign(new Error(`${node} in the backends tree belongs to backend "${taken.address}"; choose another share name`), { statusCode: 409 });
+        await this.#workspace.setDataBackendConfig(name, existing ? {
+            ...('label' in config ? { label: String(config.label || name).trim() } : {}),
+            ...('watch' in config ? { watch: config.watch === true } : {}),
+        } : {
+            enabled: true, supported: true, driver: 'share',
+            label: String(config.label || name).trim(), mode,
+            remote: true, transport: 'canvas-edge', readOnly: true,
+            // Listed when its machine connects, never on workspace start.
+            resync: true, scanOnStart: false,
+            watch: config.watch !== false,
+        });
+        return this.#workspace.getBackend('share', name);
+    }
+
+    #shareBackend(address) {
+        if (this.#workspace.dataBackends[address]?.driver !== 'share') throw Object.assign(new Error(`Share not found: ${address}`), { statusCode: 404 });
+        const backend = this.#runtime.state.storedIndex?.stored?.getBackend(address);
+        if (!backend) throw Object.assign(new Error(`Share "${address}" is disabled`), { statusCode: 409 });
+        return backend;
+    }
+
+    /**
+     * The machine holding a share checks in (`source`: `{ epoch, fsid, head,
+     * scanning, files, device, version }`) and collects the requests queued
+     * for it: `{ requests: [{ id, op, … }] }`, at once or after `wait` ms.
+     */
+    async pollShare(address, source = {}, { wait } = {}) {
+        try { return await this.#shareBackend(address).poll(source, { wait }); }
+        catch (error) { throw Object.assign(error, { statusCode: error.statusCode || ({ SHARE_REPLACED: 409, INVALID_SOURCE: 400, STOPPED: 409 })[error.code] || 500 }); }
+    }
+
+    /** The machine holding a share stops serving it: offline at once. */
+    async leaveShare(address) {
+        this.#shareBackend(address).leave();
+        return { online: false };
+    }
+
+    /** The answer to one polled request: `{ body }`, `{ stream }` or `{ error, code }`. False when nobody waits for it any more. */
+    async answerShare(address, id, answer = {}) {
+        return this.#shareBackend(address).respond(id, answer);
     }
 
     static #GDRIVE_SECRETS = ['clientSecret', 'refreshToken'];
@@ -615,6 +700,16 @@ export default class WorkspaceBackends {
             throw new Error('keepCopy is a boolean setting of cacache/workspace:data');
         }
         if (driver !== 's3' && !Object.keys(patch).length) { applyPrimary(); return this.#workspace.getBackend(driver, address); }
+        if (driver === 'share') {
+            if (this.#workspace.dataBackends[address]?.driver !== 'share') throw Object.assign(new Error(`Share not found: ${address}`), { statusCode: 404 });
+            const unknown = Object.keys(patch).filter((key) => !['label', 'watch', 'enabled'].includes(key));
+            if (unknown.length) throw Object.assign(new Error(`A share takes label, watch and enabled; got ${unknown.join(', ')}. Its folder, mode and exclusions are set on the machine that holds it (canvas workspace <ws> share …)`), { statusCode: 400 });
+            patch = {
+                ...('label' in patch ? { label: String(patch.label || address).trim() } : {}),
+                ...('watch' in patch ? { watch: patch.watch === true } : {}),
+                ...('enabled' in patch ? { enabled: patch.enabled === true } : {}),
+            };
+        }
         if (driver === 'gdrive') {
             const previous = this.#workspace.dataBackends[address];
             if (!previous || previous.driver !== 'gdrive') throw new Error(`Backend not found: gdrive/${address}`);
