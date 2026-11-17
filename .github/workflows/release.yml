@@ -54,4 +54,15 @@ jobs:
       - run: node scripts/install-public.mjs
         working-directory: .
       - run: node --test scripts/tests/*.test.mjs
+      # The edge package bundles canvas-stored at the commit the lockfile pins.
+      # A daemon that cannot start (a stale pin missing an export the edge
+      # imports) must fail here, not on the devices that update to it.
+      - name: Smoke-test the edge package from its tarball
+        run: |
+          set -e
+          node scripts/pack-dist.mjs edge --out edge-artifacts --pack
+          tgz=$(ls "$PWD"/edge-artifacts/augmentd-labs-canvas-edge-*.tgz)
+          consumer=$(mktemp -d); cd "$consumer"; npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund "$tgz"
+          CANVAS_USER_HOME=/tmp/edge-release timeout 8 node node_modules/.bin/canvas-edge --foreground || [ $? -eq 124 ]
       - run: node scripts/publish-npm.mjs

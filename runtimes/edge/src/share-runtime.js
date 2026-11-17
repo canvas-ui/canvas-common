@@ -133,7 +133,7 @@ export class ShareRuntime {
     }
 
     async #register() {
-        await this.#post('', { json: { name: this.#share.name, label: this.#share.label || this.#share.name, watch: this.#share.watch !== false, mode: 'ro' }, signal: this.#abort.signal });
+        await this.#post('', { json: { name: this.#share.name, label: this.#share.label || this.#share.name, watch: this.#share.watch !== false, mode: this.#share.mode || 'ro' }, signal: this.#abort.signal });
         this.#state.registered = true;
     }
 

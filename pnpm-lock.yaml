@@ -16,7 +16,7 @@ importers:
         version: 0.4.0
       '@augmentd-labs/canvas-synapsd':
         specifier: github:canvas-ui/canvas-synapsd#main
-        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#946e0ef20d7dab52949ffac377b71ed6962ab72b(@types/node@26.6.4)
+        version: https://codeload.github.com/canvas-ui/canvas-synapsd/tar.gz/895f3ed9064dbafddfbd23887abf03cab6eb928d(@types/node@26.6.4)
       '@augmentd-labs/canvas-web':
         specifier: ^2.15.0
         version: 2.15.0
@@ -46,7 +46,7 @@ importers:
         version: 3.0.3
       canvas-stored:
         specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/6b15927d75022606e7488907baea9c9d6b3c5248
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/8a2797d3bc5eb536a366ffec1bdecc1bd6eac427
       conf:
         specifier: ^14.0.0
         version: 14.0.0
@@ -164,7 +164,7 @@ importers:
         version: 0.4.0
       '@augmentd-labs/canvas-synapsd':
         specifier: github:canvas-ui/canvas-synapsd#main
-        version: git+https://git@github.com:canvas-ui/canvas-synapsd.git#946e0ef20d7dab52949ffac377b71ed6962ab72b(@types/node@26.6.4)
+        version: https://codeload.github.com/canvas-ui/canvas-synapsd/tar.gz/895f3ed9064dbafddfbd23887abf03cab6eb928d(@types/node@26.6.4)
       '@augmentd-labs/canvas-web':
         specifier: ^2.15.0
         version: 2.15.0
@@ -191,7 +191,7 @@ importers:
         version: 3.0.3
       canvas-stored:
         specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/6b15927d75022606e7488907baea9c9d6b3c5248
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/8a2797d3bc5eb536a366ffec1bdecc1bd6eac427
       conf:
         specifier: ^14.0.0
         version: 14.0.0
@@ -321,7 +321,7 @@ importers:
         version: link:../../packages/protocol
       canvas-stored:
         specifier: github:canvas-ui/canvas-stored#main
-        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/6b15927d75022606e7488907baea9c9d6b3c5248
+        version: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/8a2797d3bc5eb536a366ffec1bdecc1bd6eac427
       fastify:
         specifier: ^4.29.1
         version: 4.29.1
@@ -365,9 +365,9 @@ packages:
     resolution: {integrity: sha512-cmPU1k8qcSR9H0klQIbq1hmI22rhbC+1n7XXUkn2ctwjAmk7qDuc9ao3P/nH3XlaUoMJkiTsHgHfMwU+aMad/Q==}
     engines: {node: '>=20'}
 
-  '@augmentd-labs/canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#946e0ef20d7dab52949ffac377b71ed6962ab72b':
-    resolution: {commit: 946e0ef20d7dab52949ffac377b71ed6962ab72b, repo: git@github.com:canvas-ui/canvas-synapsd.git, type: git}
-    version: 3.25.2
+  '@augmentd-labs/canvas-synapsd@https://codeload.github.com/canvas-ui/canvas-synapsd/tar.gz/895f3ed9064dbafddfbd23887abf03cab6eb928d':
+    resolution: {tarball: https://codeload.github.com/canvas-ui/canvas-synapsd/tar.gz/895f3ed9064dbafddfbd23887abf03cab6eb928d}
+    version: 3.28.1
     engines: {node: '>=22.0.0'}
 
   '@augmentd-labs/canvas-web@2.15.0':
@@ -1604,9 +1604,9 @@ packages:
     resolution: {integrity: sha512-L28STB170nwWS63UjtlEOE3dldQApaJXZkOI1uMFfzf3rRuPegHaHesyee+YxQ+W6SvRDQV6UrdOdRiR153wJg==}
     engines: {node: '>=6'}
 
-  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/6b15927d75022606e7488907baea9c9d6b3c5248:
-    resolution: {tarball: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/6b15927d75022606e7488907baea9c9d6b3c5248}
-    version: 1.20.0
+  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/8a2797d3bc5eb536a366ffec1bdecc1bd6eac427:
+    resolution: {tarball: https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/8a2797d3bc5eb536a366ffec1bdecc1bd6eac427}
+    version: 1.21.0
     engines: {node: '>=22.0.0'}
 
   chalk-template@0.4.0:
@@ -3206,7 +3206,7 @@ snapshots:
 
   '@augmentd-labs/canvas-protocol@0.4.0': {}
 
-  '@augmentd-labs/canvas-synapsd@git+https://git@github.com:canvas-ui/canvas-synapsd.git#946e0ef20d7dab52949ffac377b71ed6962ab72b(@types/node@26.6.4)':
+  '@augmentd-labs/canvas-synapsd@https://codeload.github.com/canvas-ui/canvas-synapsd/tar.gz/895f3ed9064dbafddfbd23887abf03cab6eb928d(@types/node@26.6.4)':
     dependencies:
       '@lancedb/lancedb': 0.40.0(@types/node@26.6.4)(apache-arrow@18.1.0)
       apache-arrow: 18.1.0
@@ -4584,7 +4584,7 @@ snapshots:
 
   camelcase@5.3.1: {}
 
-  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/6b15927d75022606e7488907baea9c9d6b3c5248:
+  canvas-stored@https://codeload.github.com/canvas-ui/canvas-stored/tar.gz/8a2797d3bc5eb536a366ffec1bdecc1bd6eac427:
     dependencies:
       '@aws-sdk/client-s3': 3.1152.0
       cacache: 20.0.4
