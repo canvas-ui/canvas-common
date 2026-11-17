@@ -49,6 +49,7 @@ export class ShareRuntime {
     #identity;
     #logger;
     #transport;
+    #refresh;
     #source = null;
     #stopped = false;
     #abort = new AbortController();
@@ -57,7 +58,10 @@ export class ShareRuntime {
     #rescanTimer = null;
     #state = { connected: false, registered: false, lastError: null, lastPollAt: null, served: 0 };
 
-    constructor({ share, hub, identity, logger }) {
+    // `refresh()` re-reads `{ hub, identity }` from the device's config: the
+    // credentials can be replaced while the unit runs.
+    constructor({ share, hub, identity, logger, refresh = null }) {
+        this.#refresh = refresh;
         this.#share = share;
         this.#hub = hub;
         this.#identity = identity;
@@ -170,7 +174,19 @@ export class ShareRuntime {
             } catch (err) {
                 if (this.#stopped) break;
                 this.#state.connected = false;
-                this.#state.lastError = err.status === 404
+                if (err.status === 401) {
+                    const fresh = this.#refresh?.();
+                    if (fresh?.hub?.token && fresh.hub.token !== this.#hub.token) {
+                        this.#hub = fresh.hub;
+                        this.#identity = fresh.identity;
+                        this.#state.registered = false;
+                        this.#logger.info({ share: this.id }, 'hub credentials changed; checking in again');
+                        continue;
+                    }
+                }
+                this.#state.lastError = err.status === 401
+                    ? `the hub rejected this device's token (${err.message}); \`canvas workspace ${this.#share.workspaceName} share add\` or \`canvas remote device register\` on this machine issues a new one`
+                    : err.status === 404
                     ? `"${this.#share.name}" is not a share of workspace ${this.#share.workspaceName} any more; \`canvas workspace ${this.#share.workspaceName} share remove ${this.#share.name}\` stops serving it, restarting the daemon registers it again`
                     : err.message;
                 // Refused for good until someone acts: do not hammer the hub.

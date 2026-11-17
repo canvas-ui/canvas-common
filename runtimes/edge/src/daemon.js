@@ -97,7 +97,8 @@ export async function main(argv = process.argv.slice(2)) {
                 try { hub = await ensureDeviceToken(share.remote, { logger }); }
                 catch (err) { logger.warn({ share: share.id, remote: share.remote, err: err?.message }, 'device registration failed — serving under the user token'); }
             }
-            const rt = new ShareRuntime({ share, hub, identity: deviceIdentity(hub), logger });
+            const refresh = () => { const current = hubFor(share.remote); return { hub: current, identity: deviceIdentity(current) }; };
+            const rt = new ShareRuntime({ share, hub, identity: deviceIdentity(hub), logger, refresh });
             try {
                 await rt.start();
                 runtimes.set(share.id, rt);
