@@ -42,6 +42,13 @@ export default class WorkspaceServices {
             // Skeleton mirroring: bare directory nodes under the backend's
             // mirror root (documents insert their own paths as they stream in).
             insertBackendPath: (treePath) => this.#workspace.getBackendsTree().insertPath(treePath, { ignoreLocks: true }),
+            // A backend's display name on its mirror node; the node's name stays the address.
+            labelBackendNode: async (treePath, label) => {
+                const tree = this.#workspace.getBackendsTree();
+                await tree.insertPath(treePath, { ignoreLocks: true });
+                const layer = tree.getLayerForPath(treePath);
+                if (layer && layer.label !== label) await tree.updateLayer(layer.id, { label });
+            },
             moveBackendPath: async (from, to, { validateOnly = false } = {}) => {
                 const tree = this.#workspace.getBackendsTree();
                 if (!tree.supportsStorageMoves) throw Object.assign(new Error('Folder moves require canvas-synapsd 3.23.5 or newer'), { statusCode: 503 });

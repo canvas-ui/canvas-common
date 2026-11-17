@@ -434,7 +434,8 @@ export default class WorkspaceBackends {
      * by the canvas-edge share unit running there (`canvas workspace <ws>
      * share add <folder>`). The name is `<share>.<site>` ("wd1t.home"): it is
      * the backend address, the authority of the files' `file://wd1t.home/…`
-     * URLs and the tree node `/device/home/wd1t`. `label` is the display name.
+     * URLs and the tree node `/device/home/wd1t`. `label` is the display name,
+     * shown on that node.
      * Registering a share that exists updates its label and watch setting, so
      * the unit can announce itself on every start.
      */

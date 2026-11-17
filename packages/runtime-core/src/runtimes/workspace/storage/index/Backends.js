@@ -148,6 +148,10 @@ export default class Backends {
             }
         }
 
+        if ('label' in patch && !('enabled' in patch) && fullConfig.enabled !== false && this.#runtime.state.stored.getBackend(name)) {
+            await this.#applyBackendNodeLock(name, true);
+        }
+
         // A share has no watcher to start or stop: the setting only decides
         // whether it tails its source's change log.
         if ('watch' in patch && fullConfig.driver === 'share') {
@@ -338,6 +342,15 @@ export default class Backends {
     async #applyBackendNodeLock(backendName, enabled) {
         const root = this.getBackendRootPath(backendName);
         if (!root) return;
+        // The node shows the backend's label when it has one ("1TB WD" for
+        // wd1t.home, "Financial Reports" for a mount). A locked node takes no
+        // label, so it is released, named and locked again.
+        const label = this.#runtime.state.dataBackends[backendName]?.label;
+        if (enabled && label && this.#runtime.state.labelBackendNode) {
+            await Promise.resolve(this.#runtime.state.unlockBackendNode?.(root, backendName)).catch(() => {});
+            await Promise.resolve(this.#runtime.state.labelBackendNode(root, String(label))).catch((err) =>
+                this.#runtime.state.logger.warn({ workspaceId: this.#runtime.state.workspaceId, backend: backendName, error: err.message }, 'Backend node label update failed'));
+        }
         const hook = enabled ? this.#runtime.state.lockBackendNode : this.#runtime.state.unlockBackendNode;
         if (!hook) return;
         await Promise.resolve(hook(root, backendName)).catch((err) =>

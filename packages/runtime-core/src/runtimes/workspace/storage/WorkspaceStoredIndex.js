@@ -23,7 +23,7 @@ export class WorkspaceStoredIndex {
     static HOME_STORED_BACKEND = HOME_STORED_BACKEND;
     static DATA_BLOB_BACKEND = DATA_BLOB_BACKEND;
 
-    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, moveBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, getOrphanPolicy = null, getCasStores = null, getPrimaryStore = null, onBackendChanged = null, policyDirectoryMove = null, policyRemove = null, onLocationsRemoved = null, onRemovalReady = null, replicaOwnerGuard = null }) {
+    constructor({ rootPath, cachePath, dataPath, homePath, storedRootPath, internalPaths = [], dataBackends = {}, workspaceId, device = null, logger, put, unlink, getBackendsTreeSelector, getDb, describeImapLocation = null, destroyImapLocation = null, lockBackendNode = null, unlockBackendNode = null, insertBackendPath = null, labelBackendNode = null, moveBackendPath = null, pruneBackendPath = null, sweepBackendPaths = null, onResyncStateChange = null, persistBackendConfig = null, getOrphanRetentionDays = null, getOrphanPolicy = null, getCasStores = null, getPrimaryStore = null, onBackendChanged = null, policyDirectoryMove = null, policyRemove = null, onLocationsRemoved = null, onRemovalReady = null, replicaOwnerGuard = null }) {
         this.#runtime = { state: createIndexState() };
         this.#runtime.transfers = new Transfers(this, this.#runtime);
         this.#runtime.objects = new Objects(this, this.#runtime);
@@ -63,6 +63,7 @@ export class WorkspaceStoredIndex {
         this.#runtime.state.lockBackendNode = lockBackendNode;
         this.#runtime.state.unlockBackendNode = unlockBackendNode;
         this.#runtime.state.insertBackendPath = insertBackendPath;
+        this.#runtime.state.labelBackendNode = typeof labelBackendNode === 'function' ? labelBackendNode : null;
         this.#runtime.state.moveBackendPath = moveBackendPath;
         this.#runtime.state.pruneBackendPath = pruneBackendPath;
         this.#runtime.state.sweepBackendPaths = sweepBackendPaths;

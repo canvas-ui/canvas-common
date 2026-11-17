@@ -28,6 +28,7 @@ export function createIndexState() {
         resyncCancels: new Set(),
         backgroundResyncs: new Set(),
         insertBackendPath: null,
+        labelBackendNode: null,
         moveBackendPath: null,
         backendNamespaces: new Map(),
         pruneBackendPath: null,
