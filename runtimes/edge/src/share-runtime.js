@@ -10,6 +10,14 @@ const POLL_WAIT_MS = 25_000;
 const NOTIFY_DEBOUNCE_MS = 500;
 const FOLDER_RETRY_MS = 15_000;
 const RESCAN_EVERY_MS = 6 * 60 * 60_000;
+// Each read holds up to one window (4 MiB) of a file in memory until it is
+// sent, so only this many run at once; the rest wait their turn as requests.
+const MAX_READS = 4;
+// The workspace gives up on a read after two minutes: one that waited nearly
+// that long here is dropped instead of read for nobody.
+const READ_TTL_MS = 100_000;
+// More waiting reads than this are refused at once (`BUSY`) rather than kept.
+const MAX_QUEUED_READS = 256;
 const VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 /*
@@ -56,7 +64,9 @@ export class ShareRuntime {
     #loop = null;
     #notifyTimer = null;
     #rescanTimer = null;
-    #state = { connected: false, registered: false, lastError: null, lastPollAt: null, served: 0 };
+    #reads = [];
+    #reading = 0;
+    #state = { connected: false, registered: false, lastError: null, lastPollAt: null, served: 0, scanned: null, listing: null, lastListedAt: null };
 
     // `refresh()` re-reads `{ hub, identity }` from the device's config: the
     // credentials can be replaced while the unit runs.
@@ -83,6 +93,11 @@ export class ShareRuntime {
         this.#source.on('error', (err) => this.#logger.warn({ share: this.id, err: err?.message }, 'share index error'));
         this.#source.on('offline', (reason) => { if (this.#state.lastError !== reason) this.#logger.warn({ share: this.id, folder: this.folder, reason }, 'share folder is not available; its files stay listed in the workspace'); this.#state.lastError = reason; });
         this.#source.on('change', () => this.#notify());
+        // What the pass over the folder is doing: a line when it starts, every 500 files and when it ends; every file at debug.
+        this.#source.on('walk:start', () => { this.#state.scanned = 0; this.#logger.info({ share: this.id, folder: this.folder }, 'scanning the folder'); });
+        this.#source.on('file', ({ key, size, scanned }) => { this.#state.scanned = scanned; this.#logger.debug({ share: this.id, key, size }, 'scanned'); });
+        this.#source.on('progress', ({ scanned }) => this.#logger.info({ share: this.id, scanned }, 'scanning'));
+        this.#source.on('walk:done', ({ count, complete, ms }) => { this.#state.scanned = null; this.#logger.info({ share: this.id, files: count, complete, seconds: Math.round(ms / 100) / 10 }, 'scan finished'); });
         await this.#source.start();
         this.#rescanTimer = setInterval(() => { void this.#source?.rescan(); }, RESCAN_EVERY_MS);
         this.#rescanTimer.unref?.();
@@ -95,6 +110,7 @@ export class ShareRuntime {
         clearInterval(this.#rescanTimer);
         clearTimeout(this.#notifyTimer);
         this.#abort.abort();
+        this.#reads = [];
         await this.#loop?.catch(() => {});
         // Tell the workspace now; otherwise it waits a minute for the silence to mean something.
         if (this.#state.connected) {
@@ -115,8 +131,10 @@ export class ShareRuntime {
             watch: this.#share.watch !== false,
             // `available`: the folder is there and is the filesystem that was indexed.
             available: !!described, connected: this.#state.connected, registered: this.#state.registered,
-            scanning: this.#source?.scanning === true, files: described?.files ?? null, head: described?.head ?? null,
-            served: this.#state.served, lastPollAt: this.#state.lastPollAt, lastError: this.#state.lastError,
+            scanning: this.#source?.scanning === true, scanned: this.#state.scanned, files: described?.files ?? null, head: described?.head ?? null,
+            // The workspace reading this share's index: files handed over so far, null when it is not listing.
+            listing: this.#state.listing, lastListedAt: this.#state.lastListedAt,
+            served: this.#state.served, reading: this.#reading, queued: this.#reads.length, lastPollAt: this.#state.lastPollAt, lastError: this.#state.lastError,
             state: !described ? 'unavailable' : !this.#state.connected ? 'offline' : this.#source.scanning ? 'scanning' : 'serving',
         };
     }
@@ -170,7 +188,7 @@ export class ShareRuntime {
                 this.#state.lastError = null;
                 this.#state.lastPollAt = new Date().toISOString();
                 backoff = 1000;
-                for (const request of requests) void this.#answer(request);
+                this.#accept(requests);
             } catch (err) {
                 if (this.#stopped) break;
                 this.#state.connected = false;
@@ -198,12 +216,39 @@ export class ShareRuntime {
         }
     }
 
+    // Listings and other small answers go out at once; reads queue behind MAX_READS.
+    #accept(requests) {
+        const at = Date.now();
+        for (const request of requests) {
+            if (request.op !== 'read') void this.#answer(request);
+            else if (this.#reads.length < MAX_QUEUED_READS) this.#reads.push({ request, at });
+            else void this.#refuse(request);
+        }
+        this.#drain();
+    }
+
+    async #refuse(request) {
+        await this.#post(`/${encodeURIComponent(this.#share.name)}/requests/${encodeURIComponent(request.id)}`, {
+            json: { error: 'The share is busy reading; try again', code: 'BUSY' }, signal: this.#abort.signal,
+        }).catch(() => {});
+    }
+
+    #drain() {
+        while (this.#reading < MAX_READS && this.#reads.length) {
+            const { request, at } = this.#reads.shift();
+            if (Date.now() - at > READ_TTL_MS) continue;
+            this.#reading += 1;
+            void this.#answer(request).finally(() => { this.#reading -= 1; this.#drain(); });
+        }
+    }
+
     async #answer(request) {
         const suffix = `/${encodeURIComponent(this.#share.name)}/requests/${encodeURIComponent(request.id)}`;
         try {
             let answer;
             try {
                 const result = await this.#source.handle(request);
+                this.#report(request, result);
                 if (result.stream) {
                     const chunks = [];
                     for await (const chunk of result.stream) chunks.push(chunk);
@@ -219,6 +264,24 @@ export class ShareRuntime {
         }
     }
 
+    // What the workspace asked for: its listing of the index at info (start,
+    // every 5000 files, end), every single request at debug.
+    #report(request, result) {
+        this.#logger.debug({ share: this.id, op: request.op, ...(request.key != null ? { key: request.key } : {}), ...(request.start != null ? { start: request.start, end: request.end } : {}), ...(request.since != null ? { since: request.since } : {}) }, 'request');
+        if (request.op === 'changes' && result.body?.changes?.length) this.#logger.info({ share: this.id, changes: result.body.changes.length }, 'workspace took changes');
+        if (request.op !== 'list') return;
+        if (request.after == null) { this.#state.listing = 0; this.#logger.info({ share: this.id }, 'workspace is listing the share'); }
+        const before = this.#state.listing ?? 0;
+        this.#state.listing = before + (result.body?.objects?.length || 0);
+        if (result.body?.cursor == null) {
+            this.#logger.info({ share: this.id, files: this.#state.listing }, 'workspace listed the share; it now indexes what is new to it');
+            this.#state.listing = null;
+            this.#state.lastListedAt = new Date().toISOString();
+        } else if (Math.floor(this.#state.listing / 5000) > Math.floor(before / 5000)) {
+            this.#logger.info({ share: this.id, files: this.#state.listing }, 'workspace is listing the share');
+        }
+    }
+
     // The index moved on: tell the workspace now instead of at the next poll.
     // A zero-wait check-in does not disturb the long poll in flight.
     #notify() {
@@ -229,7 +292,7 @@ export class ShareRuntime {
             if (!source || this.#stopped) return;
             try {
                 const { requests = [] } = await this.#post(`/${encodeURIComponent(this.#share.name)}/poll`, { json: { source, wait: 0 }, signal: this.#abort.signal }) || {};
-                for (const request of requests) void this.#answer(request);
+                this.#accept(requests);
             } catch { /* the long poll reports failures */ }
         }, NOTIFY_DEBOUNCE_MS);
         this.#notifyTimer.unref?.();

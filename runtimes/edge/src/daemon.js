@@ -20,12 +20,26 @@ const START_RETRY_MS = 60_000;
  * shares of ~/.canvas/config/shares.json (`canvas workspace <ws> share`): local
  * folders a workspace lists and reads in place.
  */
+const LEVELS = { 10: 'trace', 20: 'debug', 30: 'info ', 40: 'warn ', 50: 'error', 60: 'fatal' };
+
+// One pino JSON line as `HH:MM:SS level message  key=value …`.
+function readable(line) {
+    let entry;
+    try { entry = JSON.parse(line); } catch { return line; }
+    const { level, time, msg, pid, hostname, ...fields } = entry;
+    const rest = Object.entries(fields).map(([key, value]) => `${key}=${typeof value === 'object' ? JSON.stringify(value) : value}`).join(' ');
+    return `${new Date(time).toTimeString().slice(0, 8)} ${LEVELS[level] || level} ${msg || ''}${rest ? `  ${rest}` : ''}\n`;
+}
+
 export async function main(argv = process.argv.slice(2)) {
     const foreground = argv.includes('--foreground') || argv.includes('-f');
     fs.mkdirSync(path.dirname(EDGE_PATHS.log), { recursive: true });
-    const logger = foreground
-        ? pino({ level: process.env.LOG_LEVEL || 'info' })
-        : pino({ level: process.env.LOG_LEVEL || 'info' }, pino.destination({ dest: EDGE_PATHS.log, sync: false }));
+    const flag = argv.indexOf('--log-level');
+    const level = argv.includes('--debug') ? 'debug' : (flag >= 0 && argv[flag + 1]) || process.env.LOG_LEVEL || 'info';
+    // A terminal gets readable lines; a pipe (pm2, docker) and the log file get JSON.
+    const logger = !foreground
+        ? pino({ level }, pino.destination({ dest: EDGE_PATHS.log, sync: false }))
+        : process.stdout.isTTY ? pino({ level }, { write: (line) => process.stdout.write(readable(line)) }) : pino({ level });
 
     const runtimes = new Map();
 
