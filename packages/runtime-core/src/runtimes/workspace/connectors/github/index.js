@@ -70,6 +70,7 @@ export default class GithubConnector extends BaseConnector {
     static blurb = 'Issues from the repositories you list, as tasks.';
     static provenanceScheme = 'gh';
     static supports = { prune: true, create: true, update: true, delete: true };
+    static creates = ['task'];
 
     static configFields = [
         { key: 'address', label: 'Account label', placeholder: 'my-org', required: true },
@@ -310,9 +311,9 @@ export default class GithubConnector extends BaseConnector {
     async updateDocument(container, provenanceUrl, patch = {}) {
         const number = this.#issueNumber(provenanceUrl);
         const body = {};
-        if (patch.title !== undefined) body.title = patch.title;
+        if (patch.title != null) body.title = patch.title;
         if (patch.description !== undefined) body.body = patch.description;
-        if (patch.status !== undefined) {
+        if (patch.status != null) {
             if (patch.status === 'completed') { body.state = 'closed'; body.state_reason = 'completed'; }
             else if (patch.status === 'cancelled') { body.state = 'closed'; body.state_reason = 'not_planned'; }
             else { body.state = 'open'; }

@@ -364,11 +364,18 @@ export default class WorkspaceDocuments {
     async #connectorWriteThrough(record, features = []) {
         const id = Number(record?.id);
         if (!Number.isInteger(id) || id <= 0) return null;
-        const patch = record?.data;
-        if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return null;
+        const data = record?.data;
+        if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
 
         const existing = await this.#workspace.get(id).catch(() => null);
         if (!existing) return null;
+        // An update replaces `data`, so a key the record no longer carries was
+        // cleared. Drivers read an absent key as "leave alone"; name the
+        // cleared ones with null.
+        const patch = {
+            ...Object.fromEntries(Object.keys(existing.data || {}).filter((key) => !Object.hasOwn(data, key)).map((key) => [key, null])),
+            ...data,
+        };
 
         const provenanceUrl = (existing.locations || [])
             .map((location) => (typeof location === 'string' ? location : location?.url))
@@ -408,7 +415,11 @@ export default class WorkspaceDocuments {
         let result;
         try {
             result = await connectors.updateDocument(
-                target.driver, target.address, { provenanceUrl }, patch, { features },
+                target.driver, target.address, { provenanceUrl }, patch, {
+                    features,
+                    assertedFeatures: Array.isArray(record.features) ? record.features
+                        : (Array.isArray(record.metadata?.features) ? record.metadata.features : null),
+                },
             );
         } catch (error) {
             // The source refused (revoked token, missing scope, deleted object).

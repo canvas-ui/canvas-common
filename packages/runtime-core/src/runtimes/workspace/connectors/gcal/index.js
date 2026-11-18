@@ -12,6 +12,9 @@
  * token; we restart from a `timeMin` window. Cancelled instances are skipped
  * (v1 keeps no tombstones — see docs/connectors.md).
  *
+ * Write-back (only when readOnly === false, and the consent covered the
+ * read/write calendar scope): create, edit and delete events.
+ *
  * Auth: OAuth refresh-token grant — `config.clientId`, `config.clientSecret`,
  * `config.refreshToken` from an offline-access consent. Access token cached
  * until expiry. Plain fetch, no googleapis dependency.
@@ -19,6 +22,7 @@
 
 import BaseConnector from '../BaseConnector.js';
 import { parseCalendarList } from '../calendar-names.js';
+import { changedFields } from '../patch.js';
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const API = 'https://www.googleapis.com/calendar/v3';
@@ -30,7 +34,8 @@ export default class GcalConnector extends BaseConnector {
     static icon = 'mdi:google';
     static blurb = 'Events from the calendars you list.';
     static provenanceScheme = 'gcal';
-    static supports = { prune: false, create: false, update: false, delete: false };
+    static supports = { prune: false, create: true, update: true, delete: true };
+    static creates = ['event'];
 
     static configFields = [
         { key: 'address', label: 'Account label', placeholder: 'work', required: true },
@@ -39,6 +44,7 @@ export default class GcalConnector extends BaseConnector {
         { key: 'refreshToken', label: 'Refresh token', secret: true, required: true },
         { key: 'calendars', label: 'Calendar ids (one per line, blank = primary; "<id> = <name>" names the calendar in Canvas)', list: true },
         { key: 'initialSyncDays', label: 'Initial history (days)', type: 'number', placeholder: '365' },
+        { key: 'writeBack', label: 'Allow Canvas to create, edit and delete events (needs a refresh token with the read/write calendar scope)', type: 'boolean' },
     ];
 
     #accessToken = null;
@@ -98,6 +104,7 @@ export default class GcalConnector extends BaseConnector {
         return list.map(({ id, calendar }) => ({
             id,
             name: id,
+            writable: this.canWrite,
             calendar: calendar || (id === 'primary' ? this.address : id),
         }));
     }
@@ -141,6 +148,93 @@ export default class GcalConnector extends BaseConnector {
             ? this.#cursor({ ...state, pageToken: page.nextPageToken })
             : this.#cursor({ syncToken: page.nextSyncToken || state.syncToken, pageToken: null });
         return { documents, nextCursor, done: !page.nextPageToken };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Write-back
+    // ─────────────────────────────────────────────────────────────────────────
+
+    async #send(method, pathname, body) {
+        const token = await this.#token();
+        const res = await fetch(`${API}${pathname}`, {
+            method,
+            headers: { 'Authorization': `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+            ...(body ? { body: JSON.stringify(body) } : {}),
+        });
+        if (method === 'DELETE' && (res.status === 204 || res.status === 404 || res.status === 410)) return null;
+        const json = await res.json().catch(() => null);
+        if (!res.ok) {
+            const reason = json?.error?.message || `HTTP ${res.status}`;
+            throw new Error(res.status === 403 && /scope/i.test(reason)
+                ? 'Google refused the change: the refresh token only covers reading. Sign in with Google again in the connector settings with "Create and edit events from Canvas" enabled.'
+                : `gcal ${res.status} ${method} ${pathname}: ${reason}`);
+        }
+        return json;
+    }
+
+    /** Create an event. `data` follows the Event schema ({title, start, end?, allDay?, description?, location?, recurrence?}). */
+    async createDocument(container, data = {}) {
+        if (!data.title || !data.start) throw new Error('event requires title and start');
+        const event = await this.#send('POST', `/calendars/${encodeURIComponent(container.id)}/events`, this.#eventBody(data));
+        return { uid: event.iCalUID || event.id, href: event.htmlLink, document: this.#toDocument(container, event) };
+    }
+
+    /** gcal://<calendar id>/<event id> → container id <calendar id>. */
+    containerIdFromProvenance(provenanceUrl) {
+        const m = /^gcal:\/\/(.+)\/[^/]+$/.exec(String(provenanceUrl || ''));
+        return m ? m[1] : null;
+    }
+
+    #eventPath(container, provenanceUrl) {
+        const eventId = String(provenanceUrl || '').split('/').filter(Boolean).pop();
+        if (!eventId) throw new Error(`Cannot resolve the event id from ${provenanceUrl}`);
+        return `/calendars/${encodeURIComponent(container.id)}/events/${encodeURIComponent(eventId)}`;
+    }
+
+    /**
+     * Change the event behind a gcal:// provenance URL. `patch` uses the
+     * Event data keys: a value sets the field, null or '' clears it, an absent
+     * key leaves it alone. Only fields that differ from the event as Google
+     * has it are sent.
+     */
+    async updateDocument(container, provenanceUrl, patch = {}) {
+        const pathname = this.#eventPath(container, provenanceUrl);
+        const current = await this.#get(pathname);
+        const changed = changedFields(patch, this.#toDocument(container, current)?.data || {}, [['start', 'end', 'allDay']]);
+        const body = this.#eventBody(changed);
+        const event = Object.keys(body).length ? await this.#send('PATCH', pathname, body) : current;
+        return { remote: { id: event.id, status: event.status }, document: this.#toDocument(container, event) };
+    }
+
+    /** Delete the event. No mirror remains; the caller drops the local document. */
+    async deleteDocument(container, provenanceUrl) {
+        await this.#send('DELETE', this.#eventPath(container, provenanceUrl));
+        return { removedRemote: true };
+    }
+
+    // Event data → Google event resource, for the keys `data` carries.
+    #eventBody(data) {
+        const has = (key) => Object.hasOwn(data, key);
+        const empty = (value) => value === undefined || value === null || value === '' || value === false;
+        const body = {};
+        if (has('title') && !empty(data.title)) body.summary = data.title;
+        if (has('description')) body.description = empty(data.description) ? '' : data.description;
+        if (has('location')) body.location = empty(data.location) ? '' : data.location;
+        if (has('recurrence')) body.recurrence = empty(data.recurrence) ? [] : [`RRULE:${data.recurrence}`];
+        if (has('start') && !empty(data.start)) {
+            const allDay = data.allDay === true;
+            const start = new Date(data.start);
+            // Google requires an end: an hour (or the one day) when none is given.
+            const end = empty(data.end) ? new Date(start.getTime() + (allDay ? 86_400_000 : 3_600_000)) : new Date(data.end);
+            // The unused one of date/dateTime is nulled so a patch can switch
+            // an event between timed and all-day.
+            const when = (date) => allDay
+                ? { date: date.toISOString().slice(0, 10), dateTime: null, timeZone: null }
+                : { dateTime: date.toISOString(), date: null, timeZone: 'UTC' };
+            body.start = when(start);
+            body.end = when(end);
+        }
+        return body;
     }
 
     #parseCursor(cursor) {

@@ -74,7 +74,7 @@ function isContentHashKey(key) {
  * one. Uploads live in the blob store under a hash key, so the original name
  * has to come from the record: the document's own filename, then the
  * filename recorded on the source (or any) location, then the source key when
- * it is a real name, then the title. An extension is derived from the mime
+ * it is a real name, then the file's name at another location, then the title. An extension is derived from the mime
  * type when the name has none — a hash-keyed `image/jpeg` would otherwise
  * arrive as an extensionless file nothing opens.
  */
@@ -86,6 +86,11 @@ export function transferFilename(doc, { sourceKey = '', sourceUrl = '' } = {}) {
         locations.find((l) => l.url === sourceUrl)?.metadata?.filename,
         ...[...locations].sort((a, b) => String(a.url || '').localeCompare(String(b.url || ''))).map((l) => l?.metadata?.filename),
         !isContentHashKey(sourceKey) ? String(sourceKey).split('/').pop() : '',
+        // The file's name on another path-keyed backend, when the source
+        // itself is a hash-keyed blob.
+        ...[...locations].map((l) => String(l.url || '')).filter((url) => url.startsWith('stored://')).sort()
+            .map((url) => url.slice('stored://'.length).split('/').slice(1).join('/'))
+            .filter((key) => key && !isContentHashKey(key)).map((key) => key.split('/').pop()),
         doc?.data?.title ?? doc?.metadata?.title ?? doc?.data?.name ?? doc?.data?.subject,
     ];
     let name = '';

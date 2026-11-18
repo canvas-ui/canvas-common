@@ -26,7 +26,7 @@
  *                                   rather than return a partial listing.
  *
  * ── Outbound / write-back (opt-in, `static supports.{create,update,delete}`) ──
- *   createDocument(container, payload)
+ *   createDocument(container, payload, kind)   kind is one of `static creates`
  *   updateDocument(container, provenanceUrl, patch)
  *   deleteDocument(container, provenanceUrl)
  *   containerIdFromProvenance(url)  which container a provenance URL belongs to
@@ -70,6 +70,14 @@ export default class BaseConnector {
     /** Opt-in verbs. A driver that leaves one false gets the base's throw. */
     static supports = { prune: false, create: false, update: false, delete: false };
 
+    /**
+     * Document kinds createDocument accepts, named after their schema:
+     * 'task' (data/schema/task) and/or 'event' (data/schema/event/calendar).
+     * A container may narrow this with its own `creates` (a CalDAV collection
+     * that only holds events).
+     */
+    static creates = [];
+
     constructor(address, config = {}, { logger } = {}) {
         const Driver = new.target;
         if (Driver === BaseConnector) throw new Error('BaseConnector is abstract');
@@ -103,6 +111,7 @@ export default class BaseConnector {
             deleteObject: false,
             prune: supports.prune === true,
             write: write && supports.create === true,
+            creates: write && supports.create === true ? [...this.constructor.creates] : [],
             update: write && supports.update === true,
             delete: write && supports.delete === true,
         };
@@ -122,6 +131,7 @@ export default class BaseConnector {
             blurb: this.blurb || '',
             scheme: this.provenanceScheme,
             supports: { ...this.supports },
+            creates: [...this.creates],
             fields: this.configFields.map((field) => ({ ...field })),
         };
     }
@@ -146,7 +156,7 @@ export default class BaseConnector {
 
     // ── Outbound ─────────────────────────────────────────────────────────────
 
-    async createDocument(_container, _payload) {
+    async createDocument(_container, _payload, _kind) {
         throw new ConnectorNotSupportedError(`${this.driver} does not support creating remote objects`);
     }
 

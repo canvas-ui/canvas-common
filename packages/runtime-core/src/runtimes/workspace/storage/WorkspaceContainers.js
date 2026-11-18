@@ -31,8 +31,8 @@ export default class WorkspaceContainers {
         return (await this.#workspace.getBackend('imap', address)).containers || [];
     }
 
-    // Write-back into a connector container (v1: caldav events on a backend
-    // configured readOnly:false). Remote-first, then mirrored locally.
+    // Write-back into a connector container on a backend configured
+    // readOnly:false. Remote-first, then mirrored locally.
     async createBackendContainerDocument(driver, address, container, payload = {}) {
         if (!isConnectorDriver(driver)) throw new Error(`Backend "${driver}/${address}" does not support document creation`);
         return (await this.#runtime.integrations.connectors()).createDocument(driver, address, container, payload);

@@ -250,7 +250,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
             // never re-derived here, so a new driver needs no edit in this file.
             capabilities: entry.instance
                 ? entry.instance.capabilities()
-                : { sync: true, test: true, containers: true, mutableContainers: false, deleteObject: false, prune: false, write: false, update: false, delete: false },
+                : { sync: true, test: true, containers: true, mutableContainers: false, deleteObject: false, prune: false, write: false, creates: [], update: false, delete: false },
             // Secrets are redacted; the settings panel only needs to know they
             // are set.
             config: this.#redactConfig(config),
@@ -349,28 +349,63 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         return { ok: true };
     }
 
+    /**
+     * A backend's containers. Each reports `writable` and `creates` (the
+     * document kinds a create accepts there, [] when it takes none), so a
+     * destination picker needs nothing but this listing.
+     */
     async listContainers(driver, address) {
         const entry = this.#backends.get(`${driver}:${addressFor(driver, address)}`);
         if (!entry?.instance) throw new Error(`Connector not enabled: ${driver}/${address}`);
-        return entry.instance.listContainers();
+        const containers = await entry.instance.listContainers();
+        return containers.map((container) => ({
+            ...container,
+            writable: container.writable === true,
+            creates: WorkspaceConnectorIndex.#containerCreates(entry.instance, container),
+        }));
+    }
+
+    static #containerCreates(instance, container) {
+        const kinds = instance.capabilities().creates;
+        if (container.writable !== true) return [];
+        return Array.isArray(container.creates) ? kinds.filter((kind) => container.creates.includes(kind)) : kinds;
     }
 
     /**
-     * Write-back: create a document in a connector container (v1: caldav
-     * events). The remote is created FIRST; its returned mirror document is
-     * then ingested through the normal pipeline, so the new event shows up in
-     * Canvas immediately with correct provenance + identity checksum.
+     * Write-back: create a document in a connector container (a GitHub issue,
+     * a calendar event, a CalDAV task). `payload` holds the new document's
+     * data fields plus two reserved keys: `kind` ('task' | 'event', required
+     * when the container takes more than one) and `features` (tags to stamp
+     * on the mirror). The remote is created FIRST; its returned mirror
+     * document is then ingested through the normal pipeline, so the new
+     * document shows up in Canvas immediately with correct provenance +
+     * identity checksum.
      */
     async createDocument(driver, address, containerId, payload = {}) {
         const { entry, name } = this.#writableEntry(driver, address, 'createDocument');
         const container = await this.#resolveContainer(entry, driver, address, containerId);
+        const { kind: requestedKind, features = [], ...data } = payload || {};
+        if (!Array.isArray(features) || features.some((feature) => typeof feature !== 'string')) {
+            throw Object.assign(new Error('features must be an array of strings'), { statusCode: 400 });
+        }
+        const kinds = WorkspaceConnectorIndex.#containerCreates(entry.instance, container);
+        if (kinds.length === 0) {
+            throw Object.assign(new Error(`"${container.name || container.id}" on ${driver}/${address} does not accept new documents`), { statusCode: 400 });
+        }
+        const kind = requestedKind ?? (kinds.length === 1 ? kinds[0] : null);
+        if (!kinds.includes(kind)) {
+            const expected = kinds.map((k) => `"${k}"`).join(' or ');
+            throw Object.assign(new Error(requestedKind === undefined
+                ? `kind is required for "${container.name || container.id}" on ${driver}/${address}: ${expected}`
+                : `"${container.name || container.id}" on ${driver}/${address} cannot create kind "${requestedKind}", use ${expected}`), { statusCode: 400 });
+        }
 
-        const created = await entry.instance.createDocument(container, payload);
+        const created = await entry.instance.createDocument(container, data, kind);
         let docId = null;
         if (created?.document) {
-            docId = await this.#ingest(name, entry, container, created.document);
+            docId = await this.#ingest(name, entry, container, created.document, { assertedFeatures: features });
         }
-        return { uid: created?.uid, href: created?.href, docId };
+        return { kind, uid: created?.uid, href: created?.href, docId };
     }
 
     /**
@@ -379,7 +414,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
      * provenance URL; the driver's returned mirror is re-ingested (same
      * identity checksum → clean upsert).
      */
-    async updateDocument(driver, address, { provenanceUrl, containerId = null }, patch = {}, { features = [] } = {}) {
+    async updateDocument(driver, address, { provenanceUrl, containerId = null }, patch = {}, { features = [], assertedFeatures = null } = {}) {
         const { entry, name } = this.#writableEntry(driver, address, 'updateDocument');
         const container = await this.#resolveContainer(entry, driver, address, containerId, provenanceUrl);
         const updated = await entry.instance.updateDocument(container, provenanceUrl, patch);
@@ -388,7 +423,9 @@ export class WorkspaceConnectorIndex extends EventEmitter {
             // `features` carries any tags the caller sent with the same edit —
             // the write-through path must not drop them just because the write
             // took a detour through the source.
-            docId = await this.#ingest(name, entry, container, updated.document, { features });
+            // `assertedFeatures` is the document's own tag list when the edit
+            // sent one; it replaces the mirror's tags.
+            docId = await this.#ingest(name, entry, container, updated.document, { features, assertedFeatures });
         }
         return { docId, remote: updated?.remote ?? null };
     }
@@ -761,7 +798,7 @@ export class WorkspaceConnectorIndex extends EventEmitter {
         return isDeepStrictEqual(JSON.parse(JSON.stringify(project(previous))), JSON.parse(JSON.stringify(project(incoming))));
     }
 
-    async #ingestDocument(name, entry, container, spec, { features = [], eventProvenance } = {}) {
+    async #ingestDocument(name, entry, container, spec, { features = [], assertedFeatures = null, eventProvenance } = {}) {
         const { schema, metadata = {}, locations = [], containerSegment } = spec;
         const provenance = locations.find((l) => l?.metadata?.provenance)?.url;
         if (!provenance) throw new Error(`Connector document without provenance location (${name})`);
@@ -775,6 +812,9 @@ export class WorkspaceConnectorIndex extends EventEmitter {
             metadata: { ...metadata, source: entry.driver, connector: name, workspaceId: this.#workspaceId },
             locations,
             checksumArray: [WorkspaceConnectorIndex.identityChecksum(provenance)],
+            // Tags are the user's, not the source's: only a write that names
+            // them sets them, a sync leaves the stored ones alone.
+            ...(Array.isArray(assertedFeatures) ? { features: assertedFeatures } : {}),
         };
 
         const contextSpec = entry.instance.treePath?.(container, spec) || getBackendFileContext(entry.driver, entry.address, containerSegment || container.id);

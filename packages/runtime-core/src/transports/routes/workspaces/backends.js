@@ -352,11 +352,25 @@ export default async function workspaceBackendRoutes(fastify) {
         } catch (error) { return fail(request, reply, error); }
     });
 
-    // Write-back: create a document in a connector container (v1: a calendar
-    // event on a rw caldav backend). The remote object is created first, then
-    // mirrored into the index — see WorkspaceConnectorIndex.createDocument.
+    // Write-back: create a document in a connector container (a GitHub issue,
+    // a calendar event, a CalDAV task). Body: the new document's data fields,
+    // plus `kind` ('task' | 'event', required when the container's `creates`
+    // lists more than one) and `features` (tags). The remote object is created
+    // first, then mirrored into the index — see
+    // WorkspaceConnectorIndex.createDocument.
     fastify.post('/:driver/:address/containers/:name/documents', {
         onRequest: [fastify.authenticate, requireWorkspaceWrite()],
+        schema: {
+            description: 'Create a task or an event on a connected service (a GitHub issue, a calendar event, a CalDAV task) and mirror it into the workspace. :name is a container from GET …/containers whose `creates` lists the kind. The body is the document data for that kind (task: title, description, status, dueDate, priority; event: title, start, end, allDay, location, description, recurrence) plus kind and features. Answers { kind, uid, href, docId }.',
+            body: {
+                type: 'object',
+                additionalProperties: true,
+                properties: {
+                    kind: { type: 'string', enum: ['task', 'event'], description: 'Required when the container creates more than one kind.' },
+                    features: { type: 'array', items: { type: 'string' }, description: 'Tags for the mirrored document, e.g. tag/errands.' },
+                },
+            },
+        },
     }, async (request, reply) => {
         try {
             const result = await request.workspace.createBackendContainerDocument(

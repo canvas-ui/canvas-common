@@ -135,10 +135,20 @@ export default class WorkspaceTransfers {
                     let key;
                     let from = null;
                     if (this.#workspace.backendKeepsPaths(target)) {
-                        const source = this.#runtime.state.storedIndex.locationEndpoints(doc).find((e) => e.backend !== target);
-                        if (!source) throw new Error(`Already on "${target}"`);
+                        const endpoints = this.#runtime.state.storedIndex.locationEndpoints(doc);
+                        const elsewhere = endpoints.find((e) => e.backend !== target);
+                        const onTarget = endpoints.find((e) => e.backend === target);
+                        // A file that already lives on the target backend goes
+                        // to the new folder within it: a move renames that
+                        // file, a copy takes its bytes from another backend
+                        // when there is one.
+                        const source = (mode === 'move' ? onTarget || elsewhere : elsewhere || onTarget);
+                        if (!source) throw new Error('Document has no transferable byte location');
                         from = source;
                         key = joinKey(destFolder, destName || transferFilename(doc, { sourceKey: source.key, sourceUrl: source.url }));
+                        if (endpoints.some((e) => e.backend === target && e.key === key)) {
+                            throw Object.assign(new Error(`Already in ${target}/${destFolder || ''}`), { code: 'ALREADY_THERE', target, targetKey: key });
+                        }
                     }
                     const res = await this.#runtime.state.storedIndex.transferDocument(doc, { to: target, mode, key, onConflict, from, fallbackSources: true });
                     if (!res?.ok) {
