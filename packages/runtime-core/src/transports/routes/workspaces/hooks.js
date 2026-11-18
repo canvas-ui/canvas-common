@@ -11,7 +11,7 @@ import { requireWorkspaceRead, requireWorkspaceWrite } from '../../middleware/wo
 import { HOOK_EVENTS, HOOK_ACTIONS, CLASSIFIER_SURFACE, HOOK_CONTEXT_API, generateHookSkeleton } from '../../../runtimes/workspace/services/hooks/meta.js';
 import { resolveRuleFiles, loadRuleFile, explainRule } from '../../../runtimes/workspace/services/hooks/rules.js';
 import { resolveHookFiles } from '../../../runtimes/workspace/services/hooks/files.js';
-import { classifyDocument, normalizeSchemaId } from '../../../runtimes/workspace/db/classifier.js';
+import { classifyDocument } from '../../../runtimes/workspace/db/classifier.js';
 
 function sendBackfillError(request, reply, error) {
   const response = new ResponseObject();
@@ -649,7 +649,7 @@ export default async function workspaceHooksRoutes(fastify) {
   }, async (request, reply) => {
     try {
       const hookService = request.workspace.hooks;
-      const runLog = hookService?.runLogFor(request.workspace);
+      const runLog = hookService?.runLog;
       if (!runLog) {
         const response = new ResponseObject().serverError('Hook service unavailable');
         return reply.code(response.statusCode).send(response.getResponse());

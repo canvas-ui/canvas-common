@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const defaults = { enabled: false, url: '', timeoutMs: 120000, maxBytes: 32 * 1024 ** 2 };
 const fail = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
@@ -135,15 +136,36 @@ export async function checkCaptureService(workspace) {
     return { message: 'Capture service reachable; token accepted.' };
 }
 
-export async function capturePage(workspace, url, { workDir, fallbackBase = 'page', timeoutMs, maxBytes, signal, metadata } = {}) {
+export async function capturePage(workspace, url, { workDir, fallbackBase = 'page', timeoutMs, maxBytes, signal, metadata, logger } = {}) {
     const config = await credentials(workspace);
     const limit = Math.min(maxBytes ?? config.maxBytes, config.maxBytes);
     const timeout = Math.min(timeoutMs ?? config.timeoutMs, config.timeoutMs);
+    const expiresAt = Date.now() + timeout;
     const deadline = AbortSignal.timeout(timeout + 5000);
-    const response = await request(config, '/v1/captures', {
-        method: 'POST', body: JSON.stringify({ url, timeoutMs: timeout, maxBytes: limit }),
-        signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
-    });
+    const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    let response;
+    let remaining = timeout;
+    for (;;) {
+        response = await request(config, '/v1/captures', {
+            method: 'POST', body: JSON.stringify({ url, timeoutMs: remaining, maxBytes: limit }), signal: requestSignal,
+        });
+        if (response.status !== 429) break;
+        // A busy response rejects the capture before a browser starts. Only
+        // this response is retryable; ambiguous failures must not duplicate work.
+        await responseError(response);
+        const retryAfter = response.headers.get('retry-after');
+        const wait = retryAfter && /^\d+$/.test(retryAfter)
+            ? Number(retryAfter) * 1000 : retryAfter ? Date.parse(retryAfter) - Date.now() : NaN;
+        const waitMs = Number.isFinite(wait) ? Math.max(250, wait) : 5000;
+        if (Date.now() + waitMs + 1000 > expiresAt) {
+            throw fail('Capture service is busy; no retry fits within the website capture timeout. Retry when capacity is available or increase the workspace capture timeout.', 429);
+        }
+        logger?.debug?.(`capture service busy; retrying in ${waitMs} ms`);
+        try { await delay(waitMs, undefined, { signal: requestSignal }); }
+        catch { throw fail('Website capture timed out or was cancelled while waiting for capture capacity', 504); }
+        remaining = expiresAt - Date.now();
+        if (remaining < 1000) throw fail('Website capture timed out while waiting for capture capacity', 504);
+    }
     if (!response.ok) throw await responseError(response);
     if (response.headers.get('content-type')?.split(';')[0].trim() !== 'text/html') {
         await response.body?.cancel(); throw fail('Capture service did not return HTML', 502);
