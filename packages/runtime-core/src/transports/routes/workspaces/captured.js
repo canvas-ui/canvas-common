@@ -11,7 +11,7 @@ export default async function capturedRoutes(fastify) {
                 ? ResponseObject.error(error.message, null, error.statusCode)
                 : ResponseObject.fromError(error, 'Website capture request failed');
         }
-        reply.header('Cache-Control', 'no-store').code(response.statusCode).send(response.getResponse());
+        return reply.header('Cache-Control', 'no-store').code(response.statusCode).send(response.getResponse());
     };
     fastify.get('/config', options, handle(workspace => workspace.getCaptureConfig()));
     fastify.put('/config', options, handle((workspace, body) => workspace.saveCaptureConfig(body)));
