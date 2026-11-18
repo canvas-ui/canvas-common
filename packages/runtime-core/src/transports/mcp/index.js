@@ -18,6 +18,23 @@ export const mcpAlias = plugin => async function aliasedRoutes(instance, options
     await plugin(instance, options);
 };
 
+// What a model reads before it has seen a single tool: what Canvas is, the
+// vocabulary the tool names use, and where to start. Tool descriptions carry
+// the detail; this stays short.
+const instructions = `Canvas is the user's personal knowledge store: notes, links, tasks, files, e-mail and messages kept as documents in workspaces. Use it to look up what the user has saved, to save something for them, and to file things where they will find them again.
+
+Vocabulary:
+- A workspace holds documents and trees. Start with workspace_list; a workspace that is not "active" needs workspace_start.
+- A document is typed (schema_list, schema_get) and exists once per content; the same document can be filed under many paths.
+- Trees organise documents by path. In a context tree /work/projects means "work AND projects"; a directory tree has exact folders. path_list shows the paths of a tree.
+- A context is the user's current view: a named pointer at a tree path (context_list, context_get). Its url says what the user is working on right now. context_set_url changes what their apps and mounts show, so call it only when asked to switch.
+
+Finding: document_list for one path or a text search, document_find for several paths, features, dates or relations. document_get returns the fields, document_content_get the bytes of a file.
+
+Saving: document_add creates and files in one call; document_link files an existing document under another path. When the user does not say where, file under the url of their context. Ask before document_delete, path_delete and tree_delete: they remove data for every device.
+
+Everything else (storage backends, shares, rules, tokens, sync) is reachable with api_route_list and api_request.`;
+
 const apiTools = [
     {
         name: 'api_route_list',
@@ -121,7 +138,7 @@ export function installMcp(app) {
     async function dispatch(message, authorization) {
         const { id, method, params } = message;
         const result = value => complete(id, value);
-        if (method === 'server/discover') return result({ supportedVersions: [PROTOCOL_VERSION], capabilities: { tools: {} }, ttlMs: 0, cacheScope: 'private' });
+        if (method === 'server/discover') return result({ supportedVersions: [PROTOCOL_VERSION], capabilities: { tools: {} }, instructions, ttlMs: 0, cacheScope: 'private' });
         if (method === 'tools/list') {
             if (params.cursor !== undefined) return rpcError(id, -32602, 'Invalid cursor: the tool list is not paginated');
             return result({ tools: listing(), ttlMs: 0, cacheScope: 'private' });
