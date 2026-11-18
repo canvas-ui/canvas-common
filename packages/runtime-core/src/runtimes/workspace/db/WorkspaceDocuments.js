@@ -218,10 +218,13 @@ export default class WorkspaceDocuments {
     }
 
     /**
-     * Copy a thread root's CONTEXT placements onto a reply. The ingest-side
+     * Copy a thread root's context membership onto a reply. The ingest-side
      * half of the thread rule: a reply that arrives after its root was curated
-     * lands where the root is. Directory placements are deliberately not
-     * copied — the connector already filed the reply under its channel.
+     * lands where the root is. The layers are copied by id: a context tree
+     * records which layers a document holds, and re-linking through paths
+     * would tick every other layer on a path that shares a folder name.
+     * Directory placements are not copied, the connector already filed the
+     * reply under its channel.
      */
     async inheritThreadMemberships(replyId, rootId) {
         if (this.#workspace.isRemovalHeld(replyId)) return;
@@ -230,14 +233,9 @@ export default class WorkspaceDocuments {
         if (reply === root) return 0;
         let copied = 0;
         for (const placement of await this.#workspace.listDocumentPlacements(root)) {
-            if (placement.type !== 'context') continue;
-            // A context path ANDs the layers along it, so memberships list
-            // every ancestor too; linking the leaves ticks those already.
-            for (const treePath of Workspace.leafPaths(placement.paths)) {
-                if (!treePath || treePath === '/') continue;
-                await this.#runtime.getActiveDb().link(reply, { context: { tree: placement.treeId, path: treePath }, features: [], emitEvent: true });
-                copied++;
-            }
+            if (placement.type !== 'context' || !placement.layers.length) continue;
+            const ticked = await this.#runtime.getActiveDb().linkContextLayers(reply, placement.treeId, placement.layers);
+            copied += ticked.length;
         }
         return copied;
     }
@@ -569,16 +567,22 @@ export default class WorkspaceDocuments {
 
     /**
      * Every place this document is filed: which paths of which trees hold it.
-     * The data behind the Synapses tab, and the basis of the orphan test and of
-     * trash restore provenance.
+     * A context tree entry also carries `layers`, the ids of the layers the
+     * document holds there. `paths` are the paths those layers currently
+     * match; `layers` is what gets copied or restored. The data behind the
+     * Synapses tab, and the basis of the orphan test and of trash restore
+     * provenance.
      */
     async listDocumentPlacements(id) {
         const docId = parseDocumentId(id, 'Document ID');
+        const db = this.#runtime.getActiveDb();
         const placements = [];
         for (const tree of await this.#workspace.listTrees()) {
             if (!tree) { continue; }
             const paths = await this.#workspace.listDocumentTreeMemberships(docId, tree.id);
-            placements.push({ tree: tree.name, treeId: tree.id, type: tree.type, paths });
+            const placement = { tree: tree.name, treeId: tree.id, type: tree.type, paths };
+            if (tree.type === Workspace.CONTEXT_TYPE) { placement.layers = await db.listDocumentContextLayers(docId, tree.id); }
+            placements.push(placement);
         }
         return placements;
     }

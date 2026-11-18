@@ -16,14 +16,14 @@ import { listFiles } from '../fetchers/lib.js';
  *
  * `kind` selects a fetcher driver (services/fetchers/drivers/*): 'auto'
  * classifies by URL shape, then by content type, then falls back to `page`.
- * The drivers own the how (yt-dlp, wget, plain HTTP); this action owns the
+ * The drivers own the how (canvas-captured, yt-dlp, wget, plain HTTP); this action owns the
  * where: placement under a backend, the file document, and idempotency.
  *
  *   auto     — arXiv → PDF; YouTube & co. → video; image/video/PDF URLs → the
  *              file itself; anything else → the page.
  *   file     — the URL's bytes as-is (aliases: image, arxiv).
  *   video    — yt-dlp (best video+audio, merged). `format` overrides.
- *   page     — the page with its images/CSS/JS (wget --page-requisites).
+ *   page     — one offline HTML file from the workspace capture service.
  *   website  — recursive mirror, `depth` levels deep (default 2, max 5).
  *
  * Files land under `folder` (plus the sub-path below the matched `when.path`
@@ -113,7 +113,7 @@ export async function download(action, { workspace, doc, context, scope, logger,
     // Reuse a completed download for this source, rule and destination.
     const ledgerFile = path.join(workspace.varPath, LEDGER_FILE);
     const ledger = readLedger(ledgerFile);
-    const ledgerKey = JSON.stringify([scope.rule?.id || 'rule', doc.id, url, to, destRel, action.insert || null]);
+    const ledgerKey = JSON.stringify([scope.rule?.id || 'rule', doc.id, url, to, destRel, action.insert || null, action.kind || 'auto']);
     const previous = ledger[ledgerKey];
     const finish = async (id) => {
         if (action.deleteSource === true) await workspace.delete(doc.id, { provenance });
@@ -147,10 +147,11 @@ export async function download(action, { workspace, doc, context, scope, logger,
 
     // `fetchers[kind]` lets tests swap a driver's fetch() for a fake.
     const run = fetchers[kind] || ((u, ctx) => fetcher.fetch(u, ctx));
+    const metadata = {};
     let entry;
     try {
         logger.debug(`rule download: ${doc.id} ${kind} ${fetchUrl} → home/${destRel || '.'}`);
-        entry = await run(fetchUrl, { workDir, timeoutMs, signal: controller.signal, maxBytes, fallbackBase, logger, action });
+        entry = await run(fetchUrl, { workspace, metadata, workDir, timeoutMs, signal: controller.signal, maxBytes, fallbackBase, logger, action });
     } catch (err) {
         fs.rmSync(workDir, { recursive: true, force: true });
         throw new Error(`download of ${fetchUrl} failed: ${err.message}`, { cause: err });
@@ -158,7 +159,7 @@ export async function download(action, { workspace, doc, context, scope, logger,
         clearTimeout(abortTimer);
     }
 
-    // Move what was fetched into place. A 'tree' layout (page/website mirror)
+    // Move what was fetched into place. A 'tree' layout (website mirror)
     // keeps its host/path tree below the destination folder; a single file
     // lands directly in it under a collision-free name.
     fs.mkdirSync(destDir, { recursive: true });
@@ -208,7 +209,7 @@ export async function download(action, { workspace, doc, context, scope, logger,
         schema: 'data/schema/file',
         checksumArray: [`sha256/${checksum}`],
         locations: [{ url: `file://{WORKSPACE_ROOT}/home/${relFile}` }],
-        metadata: { contentType, size: stat.size, filename: path.basename(entryFinal), sourceUrl: url, sourceDocumentId: doc.id },
+        metadata: { ...metadata, contentType, size: stat.size, filename: path.basename(entryFinal), sourceUrl: url, sourceDocumentId: doc.id },
         data: { title: title || path.basename(entryFinal) },
     };
     const first = targets[0];

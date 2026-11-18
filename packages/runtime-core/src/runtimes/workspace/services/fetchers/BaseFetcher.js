@@ -33,7 +33,7 @@
  *   entry file (the image, the video, the page's index.html). Throws on
  *   failure; the caller discards workDir either way.
  *
- *   ctx: { workDir, timeoutMs, signal, maxBytes, fallbackBase, logger, action }
+ *   ctx: { workspace, metadata, workDir, timeoutMs, signal, maxBytes, fallbackBase, logger, action }
  *   `action` is the raw rule action for driver-specific options (`format`,
  *   `depth`, …) — read what you need, ignore the rest.
  */

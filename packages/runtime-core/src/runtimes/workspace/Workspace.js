@@ -39,6 +39,7 @@ import WorkspaceCacheMaintenance from './storage/WorkspaceCacheMaintenance.js';
 import WorkspaceDbMaintenance from './db/WorkspaceDbMaintenance.js';
 import WorkspaceBackups from './storage/WorkspaceBackups.js';
 import HookService from './services/hooks/index.js';
+import { getCaptureConfig, saveCaptureConfig, checkCaptureService, capturePage } from './services/capture.js';
 import WorkspaceDotfiles from './services/dotfile/index.js';
 
 // Stable public API and runtime lifecycle. Domain collaborators live beside it.
@@ -504,6 +505,11 @@ class Workspace extends EventEmitter {
     get databaseSettings() { return this.#runtime.config.databaseSettings; }
     setDatabaseSettings(...args) { return this.#runtime.operations.run('config.setDatabaseSettings', () => this.#runtime.config.setDatabaseSettings(...args)); }
     gcOrphanedDocuments(...args) { return this.#runtime.operations.run('config.gcOrphanedDocuments', () => this.#runtime.config.gcOrphanedDocuments(...args)); }
+    getCaptureConfig() { return getCaptureConfig(this); }
+    saveCaptureConfig(config) { return this.#runtime.operations.run('capture.configure', () => saveCaptureConfig(this, config)); }
+    checkCaptureService() { return this.#runtime.operations.run('capture.check', () => checkCaptureService(this)); }
+    capturePage(url, options) { return this.#runtime.operations.run('capture.page', () => capturePage(this, url, options)); }
+
     setServiceConfig(...args) { return this.#runtime.operations.run('config.setServiceConfig', () => this.#runtime.config.setServiceConfig(...args)); }
     setPublicCanvasShares(...args) { return this.#runtime.operations.run('config.setPublicCanvasShares', () => this.#runtime.config.setPublicCanvasShares(...args)); }
     listLinks(...args) { return this.#runtime.operations.run('config.listLinks', () => this.#runtime.config.listLinks(...args)); }

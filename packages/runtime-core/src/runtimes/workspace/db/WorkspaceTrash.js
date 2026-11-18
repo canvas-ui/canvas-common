@@ -98,11 +98,16 @@ export default class WorkspaceTrash {
         if (!old) await db.internalStore.put(this.#trashProvenanceKey(id), {
             trashedAt: new Date().toISOString(), reason: 'source-missing', operationId, placements,
         });
-        for (const placement of placements) for (const path of [...placement.paths].sort((a, b) => b.length - a.length)) {
-            const spec = placement.type === 'context'
-                ? { context: { tree: placement.treeId, path } }
-                : { context: null, directory: { tree: placement.treeId, path } };
-            await db.unlink(id, { ...WorkspaceDocuments.buildWriteSpec(spec.context, spec.directory), emitEvent: false });
+        for (const placement of placements) {
+            // A context tree is unfiled by the layers the document holds; its
+            // paths only describe what those layers match.
+            if (placement.type === Workspace.CONTEXT_TYPE) {
+                await db.unlinkContextLayers(id, placement.treeId, placement.layers || [], { emitEvent: false });
+                continue;
+            }
+            for (const path of placement.paths) {
+                await db.unlink(id, { ...WorkspaceDocuments.buildWriteSpec(null, { tree: placement.treeId, path }), emitEvent: false });
+            }
         }
         await db.link(id, { context: null, directory: this.#workspace.getTrashSelector(), emitEvent: false });
         this.#trashedIds?.add(id);
@@ -180,11 +185,12 @@ export default class WorkspaceTrash {
         await db.link(docId, { context: null, directory: this.#workspace.getTrashSelector() });
         await db.internalStore.put(this.#trashProvenanceKey(docId), {
             trashedAt: new Date().toISOString(),
-            placements: (placementsBefore || []).map(({ tree, treeId, type, paths }) => ({
+            placements: (placementsBefore || []).map(({ tree, treeId, type, paths, layers }) => ({
                 tree, treeId, type,
                 // A context root is not a place to restore to (see #isFiled).
                 paths: paths.filter((path) => !(type === Workspace.CONTEXT_TYPE && path === '/')),
-            })).filter((placement) => placement.paths.length > 0),
+                ...(type === Workspace.CONTEXT_TYPE ? { layers: layers || [] } : {}),
+            })).filter((placement) => placement.paths.length > 0 || placement.layers?.length > 0),
         });
         this.#trashedIds?.add(docId);
         return true;
@@ -241,9 +247,10 @@ export default class WorkspaceTrash {
     }
 
     /**
-     * Put documents back where they were when they were trashed. Missing tree
-     * paths are recreated — a restore whose folder was deleted meanwhile should
-     * still land somewhere, not fail.
+     * Put documents back where they were when they were trashed. Missing
+     * directory paths are recreated, so a restore whose folder was deleted
+     * meanwhile still lands somewhere. Context layers deleted meanwhile are
+     * skipped.
      */
     async restoreFromTrash(ids) {
         const docIds = parseDocumentIdArray(ids, 'Document ID array');
@@ -256,14 +263,17 @@ export default class WorkspaceTrash {
                 const provenance = db.internalStore.get(this.#trashProvenanceKey(docId));
                 let relinked = 0;
                 for (const placement of (provenance?.placements || [])) {
+                    const tree = this.#workspace.getTree(placement.treeId) || this.#workspace.getTree(placement.tree);
+                    if (!tree) { continue; }
+                    // A context tree is restored by the layers the document
+                    // held; its recorded paths only describe what they matched.
+                    if (placement.type === Workspace.CONTEXT_TYPE) {
+                        relinked += (await db.linkContextLayers(docId, tree.id, placement.layers || [])).length;
+                        continue;
+                    }
                     for (const path of placement.paths) {
-                        const tree = this.#workspace.getTree(placement.treeId) || this.#workspace.getTree(placement.tree);
-                        if (!tree) { continue; }
                         if (!tree.pathExists(path)) { await tree.insertPath(path); }
-                        const selector = placement.type === Workspace.DIRECTORY_TYPE
-                            ? { context: null, directory: this.#workspace.getDirectoryTreeSelector(path, tree.name) }
-                            : { context: this.#workspace.getContextTreeSelector(path, tree.name), directory: null };
-                        await db.link(docId, selector);
+                        await db.link(docId, { context: null, directory: this.#workspace.getDirectoryTreeSelector(path, tree.name) });
                         relinked++;
                     }
                 }
