@@ -80,7 +80,24 @@ async function readBody(response, maxBytes) {
     }
 }
 
-function serviceError(status) {
+function serviceError(status, error) {
+    // Format structured fields locally; never copy arbitrary upstream content into rule logs.
+    if (status === 502 && error?.code === 'target_http_error') {
+        const targetStatus = error.targetStatus;
+        const detail = Number.isInteger(targetStatus) && targetStatus >= 100 && targetStatus <= 599 ? ` (HTTP ${targetStatus})` : '';
+        const hint = targetStatus === 401 || targetStatus === 403
+            ? ' The site may require login or reject automated browsers.'
+            : targetStatus === 429 ? ' The site is rate-limiting requests; retry later.' : '';
+        return fail(`Target website did not return a successful page${detail}; capture error: target_http_error.${hint}`, 502);
+    }
+    const captureMessages = {
+        invalid_capture_metadata: 'The capture browser did not report a valid target HTTP status.',
+        invalid_capture: 'The capture service did not produce a valid HTML document.',
+        dns_failed: 'The capture service could not resolve the target host.',
+        blocked_target: 'The capture service blocked the target; only public HTTP(S) websites are allowed.',
+        capture_failed: 'The capture browser failed; check service readiness and target availability.',
+    };
+    if (Object.hasOwn(captureMessages, error?.code || '')) return fail(captureMessages[error.code], 502);
     const messages = {
         400: 'Capture service rejected the URL or limits. Check that workspace limits do not exceed the service limits.',
         401: 'Capture service rejected the token. Update it in this workspace’s Connected services settings.',
@@ -91,11 +108,21 @@ function serviceError(status) {
     return fail(messages[status] || `Capture service failed (HTTP ${status})`, status === 429 ? 429 : 502);
 }
 
+async function responseError(response) {
+    let error;
+    try {
+        if (response.headers.get('content-type')?.split(';')[0].trim() === 'application/json') {
+            error = JSON.parse(await readBody(response, 16384)).error;
+        } else await response.body?.cancel();
+    } catch { /* Malformed or oversized error bodies use the HTTP status message. */ }
+    return serviceError(response.status, error);
+}
+
 export async function checkCaptureService(workspace) {
     const config = await credentials(workspace);
     const signal = AbortSignal.timeout(10000);
     const health = await request(config, '/healthz', { signal });
-    if (!health.ok) { await health.body?.cancel(); throw serviceError(health.status); }
+    if (!health.ok) throw await responseError(health);
     let data;
     try { data = JSON.parse(await readBody(health, 16384)); } catch { throw fail('Capture service returned an invalid health response', 502); }
     if (data.status !== 'ok' || data.api?.major !== 1) throw fail('Capture service does not support capture API v1', 502);
@@ -117,7 +144,7 @@ export async function capturePage(workspace, url, { workDir, fallbackBase = 'pag
         method: 'POST', body: JSON.stringify({ url, timeoutMs: timeout, maxBytes: limit }),
         signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
     });
-    if (!response.ok) { await response.body?.cancel(); throw serviceError(response.status); }
+    if (!response.ok) throw await responseError(response);
     if (response.headers.get('content-type')?.split(';')[0].trim() !== 'text/html') {
         await response.body?.cancel(); throw fail('Capture service did not return HTML', 502);
     }

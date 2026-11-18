@@ -689,7 +689,7 @@ export default async function workspaceTreeRoutes(fastify) {
     onRequest: [fastify.authenticate],
     config: { mcp: {
       name: 'path_delete',
-      description: 'Remove a path from a tree. The documents that were filed under it are kept in the workspace. Without recursive the child paths move up to the parent; with recursive the whole subtree is removed.',
+      description: 'Remove a path from a tree, keeping its documents and stored files. Stale locks from removed storage backends are released automatically. Configured backend and user locks still block removal. With recursive the whole subtree is removed; without it, context children move up and nonempty directory paths are refused.',
       args: { ...arg.workspace, ...arg.tree, ...arg.treePath, recursive: { description: 'Remove the paths below too instead of moving them up to the parent.' } },
       only: ['recursive'],
     } },
@@ -723,8 +723,8 @@ export default async function workspaceTreeRoutes(fastify) {
       const purge = (request.query.purge === true || destroy) && isBackendsPath;
       const result = destroy
         ? await resolved.workspace.destroyBackendsTreePath(path, { recursive: request.query.recursive })
-        : purge
-          ? await resolved.workspace.removeBackendsTreePath(path, { recursive: request.query.recursive })
+        : isBackendsPath
+          ? await resolved.workspace.removeBackendsTreePath(path, { recursive: request.query.recursive, purge })
           : await resolved.tree.removePath(path, request.query.recursive);
       const message = result?.error
         ? null
@@ -738,10 +738,9 @@ export default async function workspaceTreeRoutes(fastify) {
         : new ResponseObject().success(result, message);
       return reply.code(responseObject.statusCode).send(responseObject.getResponse());
     } catch (error) {
-      // A locked node means a backend mapped to this folder is still enabled —
-      // a state conflict, not a server fault.
+      // Configured backend and user locks are state conflicts.
       if (/locked/i.test(error.message || '')) {
-        const conflict = new ResponseObject().conflict('Path is locked — a backend mapped to this folder is enabled; disable it first');
+        const conflict = new ResponseObject().conflict('Path is locked by a configured backend or a user; disable the owning backend or release the user lock first');
         return reply.code(conflict.statusCode).send(conflict.getResponse());
       }
       fastify.log.error(`Remove workspace path error for ID ${request.params.id}: ${error.message}`);

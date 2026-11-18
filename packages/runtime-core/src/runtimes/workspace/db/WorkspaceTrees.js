@@ -82,16 +82,15 @@ export default class WorkspaceTrees {
     }
 
     /**
-     * Remove a folder from the backends tree AND cascade-purge the documents
-     * that lived under it from the index. Backend-ingested docs are re-synced
-     * if the user re-enables the backend, so this lets a user discard the
-     * leftovers of a backend they removed without orphaning index entries.
+     * Remove a folder from the backends tree, preserving its documents unless
+     * purge is requested. Locks belonging to removed storage backends are
+     * released; configured backend and user locks remain protected.
      * Bytes on the backend are NOT touched — see destroyBackendsTreePath for that.
      *
      * Keep the subtree queryable while bounded purge batches run. Remove its
      * now-empty nodes last, so failed deletions also remain reachable for retry.
      */
-    async removeBackendsTreePath(path, { recursive = false } = {}) {
+    async removeBackendsTreePath(path, { recursive = false, purge = false } = {}) {
         const tree = this.#workspace.getBackendsTree();
         const normalizedPath = normalizeBackendsTreePath(path);
         if (normalizedPath === '/') {
@@ -108,6 +107,8 @@ export default class WorkspaceTrees {
         if (!recursive && (await tree.listDirectories(normalizedPath)).length) {
             return { data: null, count: 0, error: 'Directory is not empty', purged: 0 };
         }
+
+        if (!purge) return tree.removePath(normalizedPath, recursive);
 
         const bitmap = recursive
             ? await tree.findRecursive(normalizedPath)

@@ -110,22 +110,55 @@ export async function download(action, { workspace, doc, context, scope, logger,
         return;
     }
 
+    const targets = action.insert
+        ? (Array.isArray(action.insert) ? action.insert : [action.insert]).map((p) => parseLinkTarget(interpolate(String(p), scope)))
+        : [];
+    if (!targets.length) {
+        const c = typeof context?.classify === 'function' ? context.classify() : null;
+        for (const [tree, paths] of Object.entries(c?.eventTreePaths || {})) {
+            if (tree === 'backends') { continue; }
+            for (const p of paths) { targets.push({ tree, path: p }); }
+        }
+    }
+    // Backfills and non-filing events have no insertion selector. Resolve
+    // current placements from the workspace, preserving named tree identity.
+    if (!targets.length) {
+        for (const placement of await workspace.listDocumentPlacements(doc.id)) {
+            if (placement.tree === 'backends') continue;
+            for (const targetPath of placement.paths || []) {
+                const selector = { tree: placement.treeId, path: targetPath };
+                targets.push({ tree: placement.tree, path: targetPath, selector: placement.type === 'directory'
+                    ? { context: null, directory: selector } : { context: selector } });
+            }
+        }
+    }
+    const fileAlongside = async (id) => {
+        for (const target of targets) {
+            const selector = target.selector || (target.tree !== 'context'
+                ? { context: null, directory: directorySelector(target) }
+                : { context: workspace.getContextTreeSelector(target.path) });
+            await workspace.link(id, { ...selector, features: action.tags || [], emitEvent: false, provenance });
+        }
+    };
+
     // Reuse a completed download for this source, rule and destination.
     const ledgerFile = path.join(workspace.varPath, LEDGER_FILE);
     const ledger = readLedger(ledgerFile);
     const ledgerKey = JSON.stringify([scope.rule?.id || 'rule', doc.id, url, to, destRel, action.insert || null, action.kind || 'auto']);
     const previous = ledger[ledgerKey];
-    const finish = async (id) => {
+    const relate = async (id) => {
+        await workspace.assertRelation(id, 'derived-from', doc.id);
+        await workspace.assertRelation(doc.id, 'includes', id);
+    };
+    const finish = async () => {
         if (action.deleteSource === true) await workspace.delete(doc.id, { provenance });
-        else {
-            await workspace.assertRelation(id, 'derived-from', doc.id);
-            await workspace.assertRelation(doc.id, 'includes', id);
-        }
     };
     if (previous?.complete && (to !== 'workspace:home' || fs.existsSync(path.resolve(homeRoot, previous.file)))
         && await workspace.get(previous.documentId)) {
-        await finish(previous.documentId);
-        logger.debug(`rule download: ${url} already downloaded to home/${previous.file}, skipping`);
+        await relate(previous.documentId);
+        await fileAlongside(previous.documentId);
+        await finish();
+        logger.debug(`rule download: ${url} already downloaded (doc ${previous.documentId}), filing and relations reconciled`);
         return { status: 'skipped', reason: 'already downloaded', documentId: previous.documentId };
     }
 
@@ -195,48 +228,31 @@ export async function download(action, { workspace, doc, context, scope, logger,
     const stat = fs.statSync(entryFinal);
     const checksum = sha256(entryFinal);
     const contentType = mimeForFilename(entryFinal);
-    const targets = action.insert
-        ? (Array.isArray(action.insert) ? action.insert : [action.insert]).map((p) => parseLinkTarget(interpolate(String(p), scope)))
-        : [];
-    if (!targets.length) {
-        const c = typeof context?.classify === 'function' ? context.classify() : null;
-        for (const [tree, paths] of Object.entries(c?.eventTreePaths || {})) {
-            if (tree === 'backends') { continue; }
-            for (const p of paths) { targets.push({ tree, path: p }); }
-        }
-    }
+    // Register the physical file synchronously; the home watcher may not have
+    // seen it yet, and transfers require an indexed backend/key source.
+    const source = fs.createReadStream(entryFinal);
+    let stored;
+    try { stored = await workspace.writeBackendObject('file', 'workspace:home', relFile, source); }
+    finally { source.destroy(); }
+    if (!stored?.ok) throw new Error(`Download could not be registered in workspace:home: ${stored?.reason || 'write failed'}`);
     const fileDoc = {
         schema: 'data/schema/file',
         checksumArray: [`sha256/${checksum}`],
-        locations: [{ url: `file://{WORKSPACE_ROOT}/home/${relFile}` }],
+        locations: [{ url: `stored://workspace:home/${relFile}` }],
         metadata: { ...metadata, contentType, size: stat.size, filename: path.basename(entryFinal), sourceUrl: url, sourceDocumentId: doc.id },
         data: { title: title || path.basename(entryFinal) },
     };
-    const first = targets[0];
-    const selector = !first
-        ? {}
-        : first.tree !== 'context' ? { context: null, directory: directorySelector(first) } : { context: first.path };
-    const inserted = await context.insert(fileDoc, selector);
+    // Index and relate before filing or transferring. If a destination fails,
+    // the saved document remains traceable from the source link.
+    const inserted = await context.insert(fileDoc, { context: null });
     const newId = inserted?.id ?? inserted;
     if (!['string', 'number'].includes(typeof newId)) throw new Error('Download was not indexed; source link retained');
-    for (const target of targets.slice(1)) {
-        await workspace.link(newId, {
-            ...(target.tree !== 'context' ? { directory: directorySelector(target) } : { context: workspace.getContextTreeSelector(target.path) }),
-            features: action.tags || [],
-            emitEvent: false,
-            provenance,
-        });
-    }
-    if (first && Array.isArray(action.tags) && action.tags.length && typeof workspace.link === 'function') {
-        await workspace.link(newId, {
-            ...(first.tree !== 'context' ? { directory: directorySelector(first) } : { context: workspace.getContextTreeSelector(first.path) }),
-            features: action.tags, emitEvent: false, provenance,
-        });
-    }
+    await relate(newId);
+    await fileAlongside(newId);
 
     // Another backend than home: hand the bytes over (the index entry follows).
     if (to && to !== 'workspace:home') {
-        const moved = await workspace.transferDocumentBytes({ ...fileDoc, id: newId }, {
+        const moved = await workspace.transferDocumentBytes(await workspace.get(newId), {
             to, mode: 'move', key: relFile, onConflict: action.onConflict || 'rename',
             from: { backend: 'workspace:home', key: relFile },
         });
@@ -246,8 +262,8 @@ export async function download(action, { workspace, doc, context, scope, logger,
 
     ledger[ledgerKey] = { file: relFile, documentId: newId, complete: true, at: new Date().toISOString() };
     writeLedger(ledgerFile, ledger);
-    await finish(newId);
+    await finish();
 
-    logger.debug(`rule download: ${doc.id} ${kind} ${fetchUrl} → home/${relFile} (doc ${newId}, filed at ${targets.map((t) => `${t.tree}:${t.path}`).join(', ') || 'nowhere'})`);
+    logger.debug(`rule download: ${doc.id} ${kind} ${fetchUrl} → ${to || 'workspace:home'} (doc ${newId}, filed at ${targets.map((t) => `${t.tree}:${t.path}`).join(', ') || 'nowhere'})`);
     return { status: 'ok', file: relFile, documentId: newId };
 }
