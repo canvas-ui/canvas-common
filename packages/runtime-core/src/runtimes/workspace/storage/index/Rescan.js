@@ -179,7 +179,8 @@ export default class Rescan {
                 return { backend: backendName, ok: false, offline: true, reason: scanErrors.root };
             }
             if (scanResult.complete === false) {
-                this.#patchResyncState(backendName, { lastError: 'Scan incomplete; absence reconciliation skipped' });
+                // A share still hashing its folder lists what it has so far and is listed again when it is done.
+                this.#patchResyncState(backendName, { lastError: scanErrors?.pending ? null : 'Scan incomplete; absence reconciliation skipped' });
                 return { backend: backendName, ok: false, complete: false, count: files.length, failed, orphaned: 0 };
             }
             const orphaned = await this.#runtime.projection.purgeOrphanedPaths(backendName, files, scanErrors);

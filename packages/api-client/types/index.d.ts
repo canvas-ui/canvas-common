@@ -36,6 +36,8 @@ export interface RequestOptions {
     headers?: Record<string, string>;
     timeout?: number;
     signal?: AbortSignal;
+    /** Return the whole success envelope for this request (`payload`, `count`, `totalCount`). */
+    envelope?: boolean;
 }
 
 export interface CanvasApiClientOptions {

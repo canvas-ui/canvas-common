@@ -227,7 +227,7 @@ export default class DocumentProjection {
      */
     async purgeDeadBackendLocations() {
         const db = this.#runtime.state.getDb();
-        const fileDocs = await db.list({ features: { allOf: ['data/schema/file'] } }).catch(() => []);
+        const fileDocs = await db.list({ features: { allOf: ['data/schema/file'] } }, { limit: 0 }).catch(() => []);
         let swept = 0;
         for (const doc of fileDocs) {
             if (!Array.isArray(doc.locations) || doc.locations.length === 0) { continue; }
@@ -250,6 +250,46 @@ export default class DocumentProjection {
             this.#runtime.state.logger.info({ workspaceId: this.#runtime.state.workspaceId, docs: swept }, 'Resync: purged dead-backend locations');
         }
         return swept;
+    }
+
+    // The documents the backends tree lists under a backend's mirror root, each
+    // with its locations on that backend and whether it is held anywhere else.
+    async #documentsOnBackend(backendName, root) {
+        const db = this.#runtime.state.getDb();
+        const { ids = [] } = await db.listTreeDocuments(BACKENDS_TREE_NAME, { path: root, idsOnly: true });
+        const rows = [];
+        for (const id of ids) {
+            const doc = await db.getDocument(id).catch(() => null);
+            if (!doc) continue;
+            const active = availableLocations(doc);
+            const here = active.filter((l) => (parseLocationUrl(l.url)?.backend || l.metadata?.backend) === backendName);
+            rows.push({ doc, urls: here.map((l) => l.url), elsewhere: active.length > here.length });
+        }
+        return rows;
+    }
+
+    /**
+     * Ids of the documents under a backend's mirror root that live only on
+     * that backend (`exclusive: true`) or have another location too (`false`).
+     */
+    async backendDocumentIds(backendName, root, { exclusive }) {
+        return (await this.#documentsOnBackend(backendName, root)).filter((row) => row.elsewhere !== exclusive).map((row) => row.doc.id);
+    }
+
+    /**
+     * A backend is being removed: every document under its mirror root drops
+     * its locations there. A document held elsewhere just loses them. One held
+     * nowhere else is deleted with `purge`, and otherwise kept as an orphan
+     * that the workspace Trash lists.
+     */
+    async forgetBackendLocations(backendName, root, { purge = false } = {}) {
+        const result = { documents: 0, kept: 0, orphaned: 0, purged: 0 };
+        for (const row of await this.#documentsOnBackend(backendName, root)) {
+            result.documents += 1;
+            if (row.urls.length) await this.#reconcileRemovedLocations(row.doc, row.urls, { forget: true, purge });
+            result[row.elsewhere ? 'kept' : purge ? 'purged' : 'orphaned'] += 1;
+        }
+        return result;
     }
 
     async upsertDocument(storedFile = {}) {
@@ -520,20 +560,23 @@ export default class DocumentProjection {
         const holding = new Set(remaining.map(backendOf).filter(Boolean));
         const relocated = new Set(status === 'not-found'
             ? active.filter(l => removed.has(l.url) && holding.has(backendOf(l))).map(l => l.url) : []);
-        const locations = (doc.locations || []).filter(l => !relocated.has(l.url)).map(l => removed.has(l.url) && isAvailableLocation(l)
+        // A removed backend leaves no address behind on a document that lives
+        // elsewhere; an orphan keeps it, marked, as the record of where it was.
+        const forgotten = options.forget === true && remaining.length > 0;
+        const locations = (doc.locations || []).filter(l => !relocated.has(l.url) && !(forgotten && removed.has(l.url))).map(l => removed.has(l.url) && isAvailableLocation(l)
             ? { ...l, status, statusChangedAt: new Date().toISOString() } : l);
         const currentBackendPaths = await db.listDocumentTreePaths(doc.id, BACKENDS_TREE_NAME).catch(() => []);
 
         // Persist removal intent before changing locations, so restart can finish
         // an interrupted observation without losing its provenance.
         const lost = active.filter(l => removed.has(l.url) && !relocated.has(l.url));
-        const operations = options.notify === false || !lost.length ? [] : await this.#runtime.state.onLocationsRemoved?.({
+        const operations = options.notify === false || forgotten || options.purge === true || !lost.length ? [] : await this.#runtime.state.onLocationsRemoved?.({
             document: doc, removedLocations: lost,
             remainingLocations: remaining, ...options,
         }) || [];
         const ready = async () => { await this.#runtime.state.onRemovalReady?.(operations); return doc.id; };
         if (remaining.length === 0) {
-            const policy = options.keepDocument === true || this.#runtime.state.onLocationsRemoved ? 'keep' : this.#runtime.state.stored.replicas?.owner(`workspace-document:${doc.id}`) ? 'keep' : this.#runtime.state.getOrphanPolicy?.() ?? 'remove';
+            const policy = options.purge === true ? 'remove' : options.keepDocument === true || this.#runtime.state.onLocationsRemoved ? 'keep' : this.#runtime.state.stored.replicas?.owner(`workspace-document:${doc.id}`) ? 'keep' : this.#runtime.state.getOrphanPolicy?.() ?? 'remove';
             if (policy === 'remove') {
                 await db.delete(doc.id);
                 await this.#index.purgeThumbnails([doc]).catch(() => {});
@@ -583,7 +626,7 @@ export default class DocumentProjection {
         if (!Number.isFinite(days) || days < 0) return { purged: 0 };
 
         const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-        const orphans = await db.list({ features: { allOf: [ORPHANED_FEATURE] } }).catch(() => []);
+        const orphans = await db.list({ features: { allOf: [ORPHANED_FEATURE] } }, { limit: 0 }).catch(() => []);
         let purged = 0;
         for (let doc of orphans) {
             if (typeof db.getDocument === 'function') doc = await db.getDocument(doc.id);

@@ -199,19 +199,29 @@ export default async function workspaceBackendRoutes(fastify) {
         } catch (error) { return fail(request, reply, error); }
     });
 
+    // ?documents=keep (default): documents that live nowhere else stay as
+    // orphans in the Trash. ?documents=purge deletes them. Either way a
+    // document with another location only loses this one. The answer counts
+    // what happened: { removed, documents: { documents, kept, orphaned, purged } | null, state }.
+    // state 'running': a backend with many documents is still being worked through.
     fastify.delete('/:driver/:address', {
         onRequest: [fastify.authenticate, requireWorkspaceWrite(), manageMessaging],
+        schema: { querystring: { type: 'object', properties: { documents: { type: 'string', enum: ['keep', 'purge'] } } } },
     }, async (request, reply) => {
         try {
-            const removed = await request.workspace.removeBackend(drv(request.params.driver), arg(request.params.address));
-            return ok(reply, { removed });
+            const result = await request.workspace.removeBackend(drv(request.params.driver), arg(request.params.address), { documents: request.query?.documents || 'keep' });
+            return ok(reply, { removed: Boolean(result), documents: result?.documents ?? null, state: result?.state ?? 'done' });
         } catch (error) { return fail(request, reply, error); }
     });
+
 
     // Documents mirrored under a backend address, filtered by linkage into
     // other trees. ?linked=false → present ONLY on the backend, never filed
     // into any context/directory tree (safe-to-purge candidates);
     // ?linked=true → the inverse; omitted → everything under the address.
+    // ?exclusive=true (storage backends) → the backend holds the document's
+    // only location: what removing it orphans or purges. ?exclusive=false →
+    // the document lives elsewhere too. totalCount counts the matches.
     fastify.get('/:driver/:address/documents', {
         onRequest: [fastify.authenticate, requireWorkspaceRead()],
         schema: {
@@ -219,6 +229,7 @@ export default async function workspaceBackendRoutes(fastify) {
                 type: 'object',
                 properties: {
                     linked: { type: 'boolean' },
+                    exclusive: { type: 'boolean' },
                     limit: { type: 'integer', minimum: 0, default: 200 },
                     offset: { type: 'integer', minimum: 0, default: 0 },
                 },
@@ -226,10 +237,10 @@ export default async function workspaceBackendRoutes(fastify) {
         },
     }, async (request, reply) => {
         try {
-            const { linked = null, limit, offset } = request.query || {};
+            const { linked = null, exclusive = null, limit, offset } = request.query || {};
             const result = await request.workspace.listBackendDocuments(
                 drv(request.params.driver), arg(request.params.address),
-                { linked, limit, offset },
+                { linked, exclusive, limit, offset },
             );
             const response = new ResponseObject().found(result.documents.map(emailListPreview), 'OK', 200, result.count, result.totalCount);
             return reply.code(response.statusCode).send(response.getResponse());

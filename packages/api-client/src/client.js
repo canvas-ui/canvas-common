@@ -103,10 +103,12 @@ export class CanvasApiClient {
      * @param {Object} [options.headers]
      * @param {number} [options.timeout] overrides the client default; 0 disables
      * @param {AbortSignal} [options.signal]
+     * @param {boolean} [options.envelope] return the whole success envelope for this
+     *   request: a list's `count` and `totalCount` live next to its `payload`
      * @returns {Promise<*>} unwrapped envelope payload (or raw body for non-envelope responses)
      * @throws {CanvasError}
      */
-    async request(method, path, { params, data, headers, timeout, signal } = {}) {
+    async request(method, path, { params, data, headers, timeout, signal, envelope = false } = {}) {
         const url = new URL(this.baseUrl + this.apiBase + path);
         const search = toSearchParams(params);
         for (const [k, v] of search) url.searchParams.append(k, v);
@@ -157,7 +159,7 @@ export class CanvasApiClient {
         // the client was built with unwrap: false.
         if (isEnvelope(parsed)) {
             if (parsed.status === STATUS_ERROR) return unwrap(parsed);
-            return this.unwrapEnvelopes ? unwrap(parsed) : parsed;
+            return this.unwrapEnvelopes && !envelope ? unwrap(parsed) : parsed;
         }
         if (res.ok) return parsed;
         const message =

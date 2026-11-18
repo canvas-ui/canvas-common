@@ -71,6 +71,18 @@ test('removeTreePath end-to-end: encoded treeName, raw path, recursive=false on 
     }
 });
 
+test('envelope:true on one request returns its whole envelope: a list total next to the payload', async () => {
+    const srv = await startServer((req, res) => sendEnvelope(res, { payload: [1], count: 1, totalCount: 7163 }));
+    try {
+        const api = new CanvasApiClient({ baseUrl: srv.baseUrl, token: 't' });
+        assert.deepEqual(await api.get('/workspaces'), [1]);
+        const whole = await api.get('/workspaces', { envelope: true });
+        assert.deepEqual([whole.payload, whole.totalCount], [[1], 7163]);
+    } finally {
+        await srv.close();
+    }
+});
+
 test('unwrap:false returns whole success envelopes, still throws on error envelopes', async () => {
     let n = 0;
     const srv = await startServer((req, res) => {

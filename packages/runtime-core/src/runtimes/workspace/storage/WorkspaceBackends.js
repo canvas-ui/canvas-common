@@ -309,12 +309,38 @@ export default class WorkspaceBackends {
      * backend, never filed into any other tree (safe-to-purge candidates);
      * linked=true → the inverse; linked=null → everything under the address.
      */
-    async listBackendDocuments(driver, address, { linked = null, limit = null, offset = 0, parse = true } = {}) {
+    /**
+     * Documents mirrored under a backend. `linked` filters by whether a
+     * document is filed in another tree; `exclusive` (storage backends) by
+     * whether the backend holds its only location (`true`) or it lives
+     * elsewhere too (`false`). `totalCount` counts the matches before paging.
+     */
+    async listBackendDocuments(driver, address, { linked = null, exclusive = null, limit = null, offset = 0, parse = true } = {}) {
         // Storage backends may mirror deeper than /<driver>/<address> (device
         // segment on fs mounts) — ask the index for the canonical node first.
         const path = (driver === 'git' ? gitTreePath(address) : null) || this.#runtime.state.storedIndex?.getBackendTreeRoot(address)
             || `/${normalizeSegment(driver)}/${normalizeSegment(address)}`;
-        return await this.#runtime.getActiveDb().listTreeDocuments(Workspace.BACKENDS_TREE_NAME, { path, linked, limit, offset, parse });
+        const db = this.#runtime.getActiveDb();
+        if (exclusive == null) return await db.listTreeDocuments(Workspace.BACKENDS_TREE_NAME, { path, linked, limit, offset, parse });
+        const matching = await this.#exclusiveDocumentIds(driver, address, exclusive);
+        let ids = matching;
+        if (linked != null && ids.length) {
+            const filed = new Set((await db.listTreeDocuments(Workspace.BACKENDS_TREE_NAME, { path, linked, idsOnly: true })).ids);
+            ids = ids.filter((id) => filed.has(id));
+        }
+        const totalCount = ids.length;
+        ids = ids.slice(offset || 0, limit != null && limit >= 0 ? (offset || 0) + limit : undefined);
+        const fetched = ids.length ? await db.getDocumentsByIdArray(ids, { parse }) : { data: [] };
+        return { documents: (Array.isArray(fetched) ? fetched : fetched?.data ?? []).filter(Boolean), count: ids.length, totalCount };
+    }
+
+    async #exclusiveDocumentIds(driver, address, exclusive) {
+        const unsupported = () => Object.assign(new Error(`exclusive applies to storage backends that mirror their files; ${driver}/${address} is not one`), { statusCode: 400 });
+        if (isConnectorDriver(driver) || driver === 'imap' || !this.#workspace.dataBackends[address]) throw unsupported();
+        if (!this.#runtime.state.storedIndex?.isRunning) await this.#runtime.integrations.startStoredIndex();
+        const ids = await this.#runtime.state.storedIndex.backendDocumentIds(address, { exclusive });
+        if (!ids) throw unsupported();
+        return ids;
     }
 
     async listBackendsByDriver(driver) {
@@ -452,6 +478,7 @@ export default class WorkspaceBackends {
         if (!WorkspaceBackends.#SHARE_NAME.test(name)) {
             throw Object.assign(new Error(`Share name must be <share>.<site> in lowercase letters, digits and dashes (e.g. "nas-accounting.home"), got "${name}"`), { statusCode: 400 });
         }
+        if (this.#removing.has(name)) throw Object.assign(new Error(`Share "${name}" is still being removed; add it again when its documents are gone`), { statusCode: 409 });
         const mode = config.mode ?? 'ro';
         if (mode !== 'ro') throw Object.assign(new Error(`Share mode "${mode}" is not available; shares are read-only ("ro")`), { statusCode: 400 });
         const existing = this.#workspace.dataBackends[name];
@@ -473,6 +500,10 @@ export default class WorkspaceBackends {
         });
         return this.#workspace.getBackend('share', name);
     }
+
+    static #REMOVAL_INLINE = 200;
+    // Backends whose documents are still being swept after removal: their name is not free yet.
+    #removing = new Set();
 
     #shareBackend(address) {
         if (this.#workspace.dataBackends[address]?.driver !== 'share') throw Object.assign(new Error(`Share not found: ${address}`), { statusCode: 404 });
@@ -760,7 +791,17 @@ export default class WorkspaceBackends {
         return this.#workspace.getBackend(driver, address);
     }
 
-    async removeBackend(driver, address) {
+    /**
+     * Remove a backend. `documents` decides what happens to documents that
+     * live nowhere else: `keep` leaves them as orphans the Trash lists,
+     * `purge` deletes them. Documents with another location only lose this one.
+     * Resolves false when there is no such backend, otherwise
+     * `{ documents: { documents, kept, orphaned, purged } | null, state }`:
+     * `state` is `running` when the documents are still being worked through
+     * (a backend with many of them) and `documents` then says what will happen.
+     */
+    async removeBackend(driver, address, { documents = 'keep' } = {}) {
+        if (!['keep', 'purge'].includes(documents)) throw Object.assign(new Error('documents must be keep or purge'), { statusCode: 400 });
         if (isConnectorDriver(driver)) return (await this.#runtime.integrations.connectors()).removeBackend(driver, address);
         if (driver === 'imap') {
             const targets = (await this.#workspace.listImapMailboxes())
@@ -784,13 +825,31 @@ export default class WorkspaceBackends {
             const dataBackends = this.#workspace.dataBackends;
             delete dataBackends[address];
             this.#runtime.config.writeStoredBackends(dataBackends);
-            if (this.#runtime.state.storedIndex?.isRunning) {
-                const root = await this.#runtime.state.storedIndex.forgetBackend(address);
-                if (root) await this.#workspace.removeEmptyBackendRoot(root);
-            }
             this.#workspace.emit('dataBackends.changed', { backend: address, config: null });
+            if (!this.#runtime.state.storedIndex?.isRunning) return { documents: null, state: 'done' };
+            // Counted before the sweep, for the answer a long removal gives ahead of its result.
+            const onlyHere = await this.#runtime.state.storedIndex.backendDocumentIds(address, { exclusive: true });
+            const total = onlyHere && (await this.#runtime.getActiveDb().listTreeDocuments(Workspace.BACKENDS_TREE_NAME, { path: this.#runtime.state.storedIndex.getBackendTreeRoot(address), idsOnly: true })).totalCount;
+            const preview = onlyHere && { documents: total, onlyHere: onlyHere.length, elsewhere: total - onlyHere.length };
+            const purge = documents === 'purge';
+            const sweep = (async () => {
+                const forgotten = await this.#runtime.state.storedIndex.forgetBackend(address, { purge });
+                if (forgotten?.root) await this.#workspace.removeEmptyBackendRoot(forgotten.root);
+                return forgotten?.documents || null;
+            })();
+            // Thousands of documents take minutes: the request answers with what
+            // will happen and the sweep goes on. One cut short by a restart is
+            // finished by the dead-backend sweep of the next home resync, which
+            // keeps (never purges) what it finds.
+            if (preview && preview.documents > WorkspaceBackends.#REMOVAL_INLINE) {
+                this.#removing.add(address);
+                void sweep.catch((error) => this.#workspace.logger?.warn?.({ backend: address, error: error.message }, 'Backend removal sweep failed'))
+                    .finally(() => { this.#removing.delete(address); this.#workspace.emit('dataBackends.changed', { backend: address, config: null }); });
+                return { documents: { documents: preview.documents, kept: preview.elsewhere, orphaned: purge ? 0 : preview.onlyHere, purged: purge ? preview.onlyHere : 0 }, state: 'running' };
+            }
+            return { documents: await sweep, state: 'done' };
         }
-        return true;
+        return { documents: null, state: 'done' };
     }
 
     /**

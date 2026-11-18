@@ -362,14 +362,26 @@ export default class Backends {
      * stops tracking replicas on it, documents lose the locations that pointed
      * at it (the last-location policy applies). Returns its tree root, if any.
      */
-    async forgetBackend(backendName) {
+    // A mirrored backend's documents are the ones under its tree root; one
+    // without a mirror is found by sweeping every file document.
+    async forgetBackend(backendName, { purge = false } = {}) {
         const root = this.getBackendRootPath(backendName);
         await this.#applyBackendNodeLock(backendName, false);
+        const documents = root ? await this.#runtime.projection.forgetBackendLocations(backendName, root, { purge }) : null;
         const { [backendName]: removed, ...rest } = this.#runtime.state.dataBackends;
         this.#runtime.state.dataBackends = rest;
         await this.#runtime.state.stored?.replicas.forgetBackend(backendName);
-        await this.#runtime.projection.purgeDeadBackendLocations();
-        return removed ? root : null;
+        if (!root) await this.#runtime.projection.purgeDeadBackendLocations();
+        return removed ? { root, documents } : null;
+    }
+
+    /**
+     * Ids of a mirrored backend's documents by whether they live only there
+     * (`exclusive: true`) or elsewhere too (`false`). Null for a backend without a tree root.
+     */
+    async backendDocumentIds(backendName, { exclusive }) {
+        const root = this.getBackendRootPath(backendName);
+        return root ? this.#runtime.projection.backendDocumentIds(backendName, root, { exclusive }) : null;
     }
 
     resolveBackendRoot(backendName, config = {}) {
