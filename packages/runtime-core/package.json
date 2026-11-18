@@ -1,6 +1,6 @@
 {
   "name": "@augmentd-labs/canvas-runtime-core",
-  "version": "0.3.60",
+  "version": "0.3.61",
   "description": "Generated production Canvas workspace runtime",
   "type": "module",
   "license": "AGPL-3.0-or-later",
@@ -18,7 +18,7 @@
   "dependencies": {
     "@augmentd-labs/canvas-protocol": "^0.5.1",
     "@augmentd-labs/canvas-synapsd": "github:canvas-ui/canvas-synapsd#main",
-    "@augmentd-labs/canvas-web": "^2.29.2",
+    "@augmentd-labs/canvas-web": "^2.29.3",
     "@fastify/error": "^3.4.1",
     "@fastify/jwt": "^7.2.4",
     "@fastify/static": "^6.12.0",
