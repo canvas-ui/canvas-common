@@ -112,7 +112,7 @@ export class ShareRuntime {
         this.#abort.abort();
         this.#reads = [];
         await this.#loop?.catch(() => {});
-        // Tell the workspace now; otherwise it waits a minute for the silence to mean something.
+        // Tell the workspace now; otherwise it only learns from the silence, seconds later.
         if (this.#state.connected) {
             await this.#transport.fetch(`${this.#base}/${encodeURIComponent(this.#share.name)}/poll`, {
                 method: 'DELETE', headers: { authorization: `Bearer ${this.#hub.token}` }, signal: AbortSignal.timeout(3000),

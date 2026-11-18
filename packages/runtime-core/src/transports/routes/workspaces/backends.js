@@ -60,7 +60,10 @@ export default async function workspaceBackendRoutes(fastify) {
         },
     }, async (request, reply) => {
         try {
-            return ok(reply, await request.workspace.pollShare(arg(request.params.address), request.body.source, { wait: request.body.wait ?? 25000 }));
+            // The connection breaking while the poll waits says the machine is gone.
+            const gone = new AbortController();
+            reply.raw.once('close', () => { if (!reply.raw.writableFinished) gone.abort(); });
+            return ok(reply, await request.workspace.pollShare(arg(request.params.address), request.body.source, { wait: request.body.wait ?? 25000, signal: gone.signal }));
         } catch (error) {
             if (error.statusCode && error.statusCode < 500) {
                 const response = new ResponseObject().error(error.message, null, error.statusCode);
@@ -72,7 +75,7 @@ export default async function workspaceBackendRoutes(fastify) {
     });
 
     // The machine stops serving the share (daemon shutdown, share removed
-    // there): it shows offline at once instead of after a minute of silence.
+    // there): it shows offline at once.
     fastify.delete('/share/:address/poll', {
         onRequest: [fastify.authenticate, requireWorkspaceWrite()],
     }, async (request, reply) => {

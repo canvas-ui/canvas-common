@@ -517,8 +517,8 @@ export default class WorkspaceBackends {
      * scanning, files, device, version }`) and collects the requests queued
      * for it: `{ requests: [{ id, op, … }] }`, at once or after `wait` ms.
      */
-    async pollShare(address, source = {}, { wait } = {}) {
-        try { return await this.#shareBackend(address).poll(source, { wait }); }
+    async pollShare(address, source = {}, { wait, signal } = {}) {
+        try { return await this.#shareBackend(address).poll(source, { wait, signal }); }
         catch (error) { throw Object.assign(error, { statusCode: error.statusCode || ({ SHARE_REPLACED: 409, INVALID_SOURCE: 400, STOPPED: 409 })[error.code] || 500 }); }
     }
 
