@@ -33,7 +33,7 @@ export default async function workspaceTreesRoutes(fastify) {
   fastify.get('/', {
     onRequest: [fastify.authenticate],
     config: { mcp: { name: 'tree_list', args: { ...arg.workspace } } },
-    schema: { description: 'List workspace trees and their types. context trees AND node bitmaps along each path (/foo/bar/baz = foo AND bar AND baz); linking ticks every node and does not retain explicit filing locations. directory trees have filesystem-like exact folder membership; recursive queries OR descendant folders.' },
+    schema: { description: 'List the trees of a workspace with their name, id and type. There are three kinds. A context tree (type "context") is made of shared layers: /foo/bar/baz selects documents that are in foo AND bar AND baz, and filing under a path ticks every layer on it. A directory tree (type "directory") has filesystem-like folders with exact membership; a recursive listing adds the descendant folders. Both are virtual trees: the user, you or automation rules decide what is filed where. The backends tree (name "backends", type "directory") is different: it mirrors what each backend holds (a local folder, an S3 bucket, a mail account, a GitHub or Slack connection, ...) under /<driver>/<address>/..., one node per folder, mailbox or channel, and is kept up to date by sync. Read it to see what arrived from a source; file into a virtual tree, never into backends. A document from a backend shows up in a virtual tree only once it is linked there (document_link, or a rule).' },
   }, async (request, reply) => {
     const workspace = await getWorkspaceInstance(request, reply);
     if (!workspace) return reply;

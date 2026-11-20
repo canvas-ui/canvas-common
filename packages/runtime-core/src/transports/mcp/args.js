@@ -6,6 +6,12 @@
  */
 export const workspace = { ':id': { name: 'workspace', description: 'Workspace name or id, as returned by workspace_list.' } };
 
+/** One backend of a workspace, as backend_list names it. */
+export const backend = {
+    ':driver': { description: 'The backend\'s driver from backend_list, e.g. file, cacache, s3, gdrive, share, imap.' },
+    ':address': { description: 'The backend\'s address from backend_list.' },
+};
+
 export const tree = { ':treeNameOrTreeId': { name: 'tree', description: 'Tree name or id from tree_list. Omit for the default context tree.' } };
 
 export const treePath = { '*': { name: 'path', description: 'Absolute path in the tree, e.g. /work/projects.' } };

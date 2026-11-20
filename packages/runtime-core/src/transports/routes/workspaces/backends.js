@@ -2,6 +2,7 @@ import { emailListPreview } from '../../../runtimes/workspace/connectors/imap/co
 'use strict';
 
 import ResponseObject from '../../ResponseObject.js';
+import * as mcpArg from '../../mcp/args.js';
 import { requireWorkspaceRead, requireWorkspaceWrite, requireWorkspaceAdmin } from '../../middleware/workspace-acl.js';
 import { getServerDevice } from '../../../utils/host-device.js';
 import { describeConnectorDrivers } from '../../../runtimes/workspace/connectors/index.js';
@@ -104,6 +105,11 @@ export default async function workspaceBackendRoutes(fastify) {
     // List every backend across all drivers.
     fastify.get('/', {
         onRequest: [fastify.authenticate, requireWorkspaceRead()],
+        config: { mcp: {
+            name: 'backend_list',
+            description: 'List where a workspace keeps and syncs its data: local folders, the blob store, S3 buckets, Google Drive, shares from other machines, mail accounts and connectors. Each row has driver and address (the pair the other backend tools take), treePath (when set, its node in the "backends" tree, where path_list and document_list show what it holds), status, lastError, whether it is the primary data store, its capabilities and its connection settings without secrets. usage is the last measured size, or null until backend_usage_get has run.',
+            args: { ...mcpArg.workspace },
+        } },
     }, async (request, reply) => {
         try {
             const backends = await request.workspace.listBackends();
@@ -272,10 +278,17 @@ export default async function workspaceBackendRoutes(fastify) {
         } catch (error) { return fail(request, reply, error); }
     });
 
-    // On-demand disk usage of a local storage backend (walks the backend root —
-    // potentially slow on large trees, hence user-triggered, never automatic).
+    // On-demand size of a storage backend with `capabilities.usage`: a walk of
+    // a local folder, or a listing of an S3 prefix (which also returns
+    // `objects`). User-triggered, never automatic. A long S3 listing answers
+    // with the running totals and `measuring: true`; ask again until it is gone.
     fastify.get('/:driver/:address/usage', {
         onRequest: [fastify.authenticate, requireWorkspaceRead()],
+        config: { mcp: {
+            name: 'backend_usage_get',
+            description: 'Measure how much space a backend takes, for backends whose capabilities.usage is true in backend_list: bytes on disk for a local folder or the blob store; bytes and objects under the bucket prefix for S3 (old object versions and unfinished multipart uploads are not counted). Measuring walks the folder or lists the bucket, so it can take a while. When the result has measuring: true the numbers are running totals: call again until it is gone.',
+            args: { ...mcpArg.workspace, ...mcpArg.backend },
+        } },
     }, async (request, reply) => {
         try {
             const usage = await request.workspace.getBackendDiskUsage(drv(request.params.driver), arg(request.params.address));

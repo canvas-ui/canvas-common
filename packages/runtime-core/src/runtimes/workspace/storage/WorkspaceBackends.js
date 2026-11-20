@@ -59,6 +59,7 @@ export default class WorkspaceBackends {
                 online: runtime.online,
                 source: runtime.source || null,
                 cacheStats: runtime.cacheStats || null,
+                diskUsage: runtime.diskUsage || null,
                 // Runtime truth (kernel mount table) beats the stored config —
                 // a folder can become a mountpoint, or stop being one, between
                 // restarts.
@@ -126,6 +127,8 @@ export default class WorkspaceBackends {
             ...features,
             sync: (Boolean(config.resync) || features.blobs === true) && supported,
             test: ['gdrive', 's3'].includes(driver) && supported,
+            // Can report how much space it takes (GET …/usage).
+            usage: ['file', 'cacache', 's3'].includes(driver) && supported,
             containers: false,
             mutableContainers: features.mutableContainers === true && config.readOnly !== true && supported,
             upload: features.upload === true && config.enabled !== false && config.readOnly !== true && supported,
@@ -162,8 +165,8 @@ export default class WorkspaceBackends {
             treePath: this.#runtime.state.storedIndex?.getBackendTreeRoot(name) || null,
             lastSyncAt: status.lastScanAt || null,
             lastError: offline ? null : status.lastError || null,
-            // Last on-demand disk usage ({bytes, files, computedAt}) if computed
-            // this runtime — see getBackendDiskUsage.
+            // Last measured size ({bytes, computedAt}, plus `objects` on S3) if
+            // measured this runtime, see getBackendDiskUsage.
             usage: status.diskUsage || null,
             // The primary data store: where all workspace data is stored by
             // default. Exactly one content-addressed backend has it: the local
@@ -349,7 +352,7 @@ export default class WorkspaceBackends {
 
     async getBackend(driver, address) {
         const match = (await this.#workspace.listBackends()).find((b) => b.driver === driver && b.address === address);
-        if (!match) throw new Error(`Backend not found: ${driver}/${address}`);
+        if (!match) throw Object.assign(new Error(`Backend not found: ${driver}/${address}`), { statusCode: 404 });
         return match;
     }
 
@@ -667,11 +670,12 @@ export default class WorkspaceBackends {
         return this.#workspace.getBackend('gdrive', name);
     }
 
-    /** On-demand on-disk size of a local storage backend (slow walk — user-triggered). */
-    async getBackendDiskUsage(driver, address) {
-        if (driver === 'imap') throw new Error('IMAP backends have no local disk usage');
+    /** On-demand size of a storage backend: a walk of a local folder, a listing
+     * of an S3 prefix. Slow on large ones, so user-triggered. */
+    async getBackendDiskUsage(driver, address, options) {
+        if (driver === 'imap') throw Object.assign(new Error('IMAP backends cannot measure their size'), { statusCode: 400 });
         if (!this.#runtime.state.storedIndex?.isRunning) await this.#runtime.integrations.startStoredIndex();
-        return await this.#runtime.state.storedIndex.getBackendDiskUsage(address);
+        return await this.#runtime.state.storedIndex.getBackendDiskUsage(address, options);
     }
 
     /**

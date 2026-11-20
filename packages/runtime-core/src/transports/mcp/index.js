@@ -26,14 +26,16 @@ const instructions = `Canvas is the user's personal knowledge store: notes, link
 Vocabulary:
 - A workspace holds documents and trees. Start with workspace_list; a workspace that is not "active" needs workspace_start.
 - A document is typed (schema_list, schema_get) and exists once per content; the same document can be filed under many paths.
-- Trees organise documents by path. In a context tree /work/projects means "work AND projects"; a directory tree has exact folders. path_list shows the paths of a tree.
+- Trees organise documents by path, and come in three kinds (tree_list). In a context tree /work/projects means "work AND projects"; a directory tree has exact folders. Those two are virtual: documents are filed there by the user, by you or by rules. The "backends" tree is a directory tree that mirrors the sources themselves (folders, buckets, mail accounts, GitHub, Slack) under /<driver>/<address>; sync maintains it, so read it and file elsewhere. path_list shows the paths of a tree.
 - A context is the user's current view: a named pointer at a tree path (context_list, context_get). Its url says what the user is working on right now. context_set_url changes what their apps and mounts show, so call it only when asked to switch.
 
 Finding: document_list for one path or a text search, document_find for several paths, features, dates or relations. document_get returns the fields, document_content_get the bytes of a file.
 
 Saving: document_add creates and files in one call; document_link files an existing document under another path. When the user does not say where, file under the url of their context. Ask before document_delete, path_delete and tree_delete: they remove data for every device.
 
-Everything else (storage backends, shares, rules, tokens, sync) is reachable with api_route_list and api_request.`;
+Storage: backend_list shows where a workspace keeps and syncs its data (folders, S3, drives, mail accounts), backend_usage_get how much space one takes.
+
+Everything else (adding or changing backends, shares, rules, tokens, sync) is reachable with api_route_list and api_request.`;
 
 const apiTools = [
     {

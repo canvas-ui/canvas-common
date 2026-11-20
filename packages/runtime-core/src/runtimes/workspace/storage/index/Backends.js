@@ -10,6 +10,8 @@ import { HOME_STORED_BACKEND, DATA_BLOB_BACKEND, STORED_DRIVERS, LOCAL_DRIVERS, 
 export default class Backends {
     #index;
     #runtime;
+    // Remote size measurements in flight, by backend name.
+    #measuring = new Map();
     constructor(index, runtime) { this.#index = index; this.#runtime = runtime; }
 
 
@@ -77,26 +79,52 @@ export default class Backends {
     }
 
     /**
-     * On-demand disk usage for a local backend. Uses get-folder-size (cross-
-     * platform, hardlink/inode-aware — stored's commit() hardlinks, so a naive
-     * walk double-counts; `loose` skips unreadable entries). Potentially slow on
-     * large trees (a whole home dir), which is why it only runs when explicitly
-     * requested; the result is cached on the backend status so list/status
-     * reads can show the last computed value.
+     * On-demand size of a backend, cached on the backend status so list/status
+     * reads show the last measured value. Only runs when explicitly requested.
+     *
+     * A local backend (file, cacache) is walked with get-folder-size (cross-
+     * platform, hardlink/inode-aware: stored's commit() hardlinks, so a naive
+     * walk double-counts; `loose` skips unreadable entries).
+     *
+     * A remote backend that can measure itself (S3: one LIST request per 1000
+     * objects under its prefix) runs once in the background however many
+     * callers ask. A caller waits up to `wait` ms for it; after that it gets
+     * the running totals with `measuring: true` and asks again.
      */
-    async getBackendDiskUsage(backendName) {
+    async getBackendDiskUsage(backendName, { wait = 20_000 } = {}) {
         const config = this.#runtime.state.dataBackends[backendName];
-        const isLocal = !!config && LOCAL_DRIVERS.has(config.driver);
-        if (!isLocal) throw new Error(`Backend "${backendName}" has no local disk usage`);
+        if (!config) throw Object.assign(new Error(`Unknown data backend: ${backendName}`), { statusCode: 404 });
+        const record = (measured) => {
+            const usage = { backend: backendName, ...measured, computedAt: new Date().toISOString() };
+            this.#runtime.state.backendStatus.set(backendName, {
+                ...(this.#runtime.state.backendStatus.get(backendName) || {}),
+                diskUsage: usage,
+            });
+            return usage;
+        };
+        if (LOCAL_DRIVERS.has(config.driver)) {
+            return record({ bytes: await getFolderSize.loose(this.resolveBackendRoot(backendName, config)) });
+        }
 
-        const root = this.resolveBackendRoot(backendName, config);
-        const bytes = await getFolderSize.loose(root);
-        const usage = { backend: backendName, bytes, computedAt: new Date().toISOString() };
-        this.#runtime.state.backendStatus.set(backendName, {
-            ...(this.#runtime.state.backendStatus.get(backendName) || {}),
-            diskUsage: usage,
-        });
-        return usage;
+        let run = this.#measuring.get(backendName);
+        if (!run) {
+            const live = this.#runtime.state.stored?.getBackend(backendName);
+            if (typeof live?.usage !== 'function') {
+                const reason = live ? `"${config.driver}" backends cannot measure their size` : `Backend "${backendName}" is not connected; enable it to measure its size`;
+                throw Object.assign(new Error(reason), { statusCode: live ? 400 : 409 });
+            }
+            run = { bytes: 0, objects: 0 };
+            run.done = live.usage({ onProgress: (totals) => Object.assign(run, totals) })
+                .then(record)
+                .finally(() => this.#measuring.delete(backendName));
+            this.#measuring.set(backendName, run);
+        }
+        let timer;
+        const pending = new Promise((resolve) => { timer = setTimeout(resolve, wait, null); });
+        try {
+            return await Promise.race([run.done, pending])
+                || { backend: backendName, bytes: run.bytes, objects: run.objects, measuring: true };
+        } finally { clearTimeout(timer); }
     }
 
     /**
