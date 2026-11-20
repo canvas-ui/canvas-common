@@ -595,8 +595,6 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
   // ── List documents ──────────────────────────────────────────────────────
 
   fastify.get('/', {
-    // Fast gzip keeps complete cached emails affordable on mobile links.
-    compress: { encodings: ['gzip'], threshold: 1024, zlibOptions: { level: 1 } },
     onRequest: [fastify.authenticate],
     config: { mcp: {
       name: 'document_list',

@@ -23,6 +23,7 @@ import registerWorkspace from '../../../transports/websocket/channels/workspace.
 import registerContext from '../../../transports/websocket/channels/context.js';
 import { enforceWorkspaceTokenScope } from '../../../transports/middleware/workspace-acl.js';
 import { MEDIA_TICKET_SUFFIX } from '../../../transports/lib/media-ticket.js';
+import { installResponseCompression } from '../../../transports/lib/response-compression.js';
 import { resolveAclAccess, shareKeyGrant } from '../security/access.js';
 import { isHubCredential, verifyHubCredential } from '../../../utils/hub-credential.js';
 import { writePrivateJsonSync } from '../../../utils/private-file.js';
@@ -100,6 +101,7 @@ export async function createWorkspaceHost({ root, name, ownerId = null, inferd =
   const policyListeners = new Set();
   const https = httpsOptions(config.tls);
   const app = Fastify({ logger, disableRequestLogging: !requestLogging, bodyLimit: 1024 * 1024 * 1024, ignoreTrailingSlash: true, ...(https ? { https } : {}) });
+  installResponseCompression(app);
   const mcp = installMcp(app);
   await app.register(jwt, { secret: config.jwtSecret });
   await app.register(socketIO, { transports: ['websocket'], maxHttpBufferSize: 1024 * 1024 });

@@ -43,6 +43,53 @@ const DEFAULT_TIMEOUT_S = 600;
 const MAX_TIMEOUT_S = 3600;
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
 const LEDGER_FILE = 'download-ledger.json';
+const activeDownloads = new WeakMap();
+
+function pageTitle(value) {
+    return typeof value === 'string' ? value.normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase() : '';
+}
+
+// A workspace has one runtime process. Reserve both identities before awaiting
+// anything, so overlapping events cannot capture the same URL or title twice.
+export async function download(action, options) {
+    const { workspace, doc } = options;
+    let active = activeDownloads.get(workspace);
+    if (!active) { active = new Map(); activeDownloads.set(workspace, active); }
+    const keys = [`url:${typeof doc?.data?.url === 'string' ? doc.data.url.trim() : doc?.id}`];
+    const title = pageTitle(doc?.data?.title);
+    if (title) keys.push(`title:${title}`);
+    const pending = keys.map(key => active.get(key)).filter(Boolean);
+    let release;
+    const done = new Promise(resolve => { release = resolve; });
+    for (const key of keys) active.set(key, done);
+    try {
+        await Promise.all(pending);
+        return await downloadUnlocked(action, options);
+    } finally {
+        release();
+        for (const key of keys) if (active.get(key) === done) active.delete(key);
+    }
+}
+
+async function findSavedPage(workspace, url, title) {
+    // Include unfiled captures: a prior run may have indexed its HTML and then
+    // failed to file or transfer it. Exact comparisons avoid fuzzy FTS matches.
+    for (let offset = 0; ; offset += 200) {
+        const batch = await workspace.list({ features: { allOf: ['data/schema/file', 'data/mime/text/html'] }, context: null, directory: null,
+            applyCanvasQuerySpec: false, order: 'asc', limit: 200, offset });
+        if (batch?.error) throw new Error(String(batch.error));
+        const docs = Array.isArray(batch) ? batch : batch.data;
+        for (const saved of docs) {
+            if (saved.metadata?.contentType !== 'text/html' || !saved.metadata?.capture) continue;
+            const sameUrl = saved.metadata.sourceUrl === url;
+            const sameTitle = title && pageTitle(saved.data?.title) === title;
+            if (!sameUrl && !sameTitle) continue;
+            const endpoints = await workspace.documentByteEndpoints(saved, { readable: true });
+            if (endpoints.length) return { saved, endpoints, reason: sameUrl ? 'URL' : 'title' };
+        }
+        if (docs.length < 200) return null;
+    }
+}
 
 // ── Placement ────────────────────────────────────────────────────────────────
 
@@ -76,7 +123,7 @@ function readLedger(file) {
 function writeLedger(file, ledger) {
     try {
         fs.mkdirSync(path.dirname(file), { recursive: true });
-        fs.writeFileSync(file, JSON.stringify(ledger, null, 2));
+        fs.writeFileSync(file, JSON.stringify({ ...readLedger(file), ...ledger }, null, 2));
     } catch { /* best effort */ }
 }
 
@@ -86,7 +133,7 @@ function sha256(file) {
 
 // ── The action ───────────────────────────────────────────────────────────────
 
-export async function download(action, { workspace, doc, context, scope, logger, provenance, helpers, fetchers = {} }) {
+async function downloadUnlocked(action, { workspace, doc, context, scope, logger, provenance, helpers, fetchers = {} }) {
     const { interpolate, expandKeyTemplate, parseLinkTarget, directorySelector } = helpers;
     if (!doc?.id) { logger.debug('rule download: event carries no document, skipping'); return; }
     if (doc.schema === 'data/schema/file') return { status: 'skipped', error: 'Already a downloaded file' };
@@ -163,6 +210,32 @@ export async function download(action, { workspace, doc, context, scope, logger,
     }
 
     const kind = await resolveKind(url, action.kind, fetchers.probe);
+    if (kind === 'page') {
+        const existing = await findSavedPage(workspace, url, pageTitle(doc.data?.title));
+        if (existing) {
+            const { saved, endpoints, reason } = existing;
+            const name = action.key
+                ? sanitizeSegment(render(action.key).replace(/\{\{\s*ext\s*\}\}/g, '.html'), 'page.html')
+                : path.basename(saved.metadata.filename || endpoints[0].key);
+            let key = joinKey(destRel, name);
+            await relate(saved.id);
+            await fileAlongside(saved.id);
+            const keepsPaths = workspace.backendKeepsPaths(to);
+            if (!endpoints.some(e => e.backend === to && (!keepsPaths || e.key === key))) {
+                const copied = await workspace.transferDocumentBytes(saved, {
+                    to, mode: 'copy', key, onConflict: action.onConflict || 'rename', from: endpoints[0],
+                });
+                const delivered = copied?.locations?.find(location => location.backend === to && location.synced
+                    && (!keepsPaths || location.key === key || copied.added?.includes(location.url)));
+                if (!delivered) throw new Error(`Download delivery to ${to} is not complete; source link retained`);
+                key = delivered.key;
+            }
+            writeLedger(ledgerFile, { [ledgerKey]: { file: key, documentId: saved.id, complete: true, at: new Date().toISOString() } });
+            await finish();
+            logger.debug(`rule download: ${url} reusing saved page by ${reason} (doc ${saved.id}), filing and relations reconciled`);
+            return { status: 'skipped', reason: `saved page with matching ${reason}`, documentId: saved.id };
+        }
+    }
     const fetcher = getFetcher(kind);
     const fetchUrl = fetcher.resolveUrl(url);
     const timeoutMs = Math.min(Math.max(5, Number(action.timeout) || DEFAULT_TIMEOUT_S), MAX_TIMEOUT_S) * 1000;
@@ -260,8 +333,7 @@ export async function download(action, { workspace, doc, context, scope, logger,
         if (moved) { logger.debug(`rule download: ${relFile} moved on to ${to}`); }
     }
 
-    ledger[ledgerKey] = { file: relFile, documentId: newId, complete: true, at: new Date().toISOString() };
-    writeLedger(ledgerFile, ledger);
+    writeLedger(ledgerFile, { [ledgerKey]: { file: relFile, documentId: newId, complete: true, at: new Date().toISOString() } });
     await finish();
 
     logger.debug(`rule download: ${doc.id} ${kind} ${fetchUrl} → ${to || 'workspace:home'} (doc ${newId}, filed at ${targets.map((t) => `${t.tree}:${t.path}`).join(', ') || 'nowhere'})`);
