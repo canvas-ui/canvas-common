@@ -12,6 +12,10 @@ import { parseDocumentIdQuery } from '../../lib/document-id-query.js';
 import { stripDeviceFeatureTags } from '../../../utils/device-features.js';
 import { parseByteRange } from '../../lib/http-range.js';
 import { resolveContentType } from '../../lib/mime.js';
+import { attachmentDisposition } from '../../lib/content-disposition.js';
+import { zipStream, ZIP_MAX_BYTES } from '../../lib/zip-stream.js';
+import { docEntries, docName, docContentType, resolveDocContent, httpError } from '../../webdav/vfs-shared.js';
+import { Readable } from 'node:stream';
 import { normalizeSchemaId } from '../../../runtimes/workspace/db/classifier.js';
 import { PREDICATES, listPredicates } from '@augmentd-labs/canvas-synapsd/src/indexes/edges/predicates.js';
 import Identity from '@augmentd-labs/canvas-synapsd/src/schemas/core/Identity.js';
@@ -1706,7 +1710,7 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
       const mime = resolveContentType(attachment ? (attachment.contentType || attachment.mimeType) : doc.metadata?.contentType, filename);
       reply.header('Content-Type', mime);
       if (request.query.download !== undefined) {
-        reply.header('Content-Disposition', `attachment; filename="${filename.replace(/"/g, '')}"`);
+        reply.header('Content-Disposition', attachmentDisposition(filename));
       }
 
       // Only answer 206 when the resolver actually served the window — a backend
@@ -1725,6 +1729,116 @@ export default async function workspaceDocumentRoutes(fastify, _options) {
         : error.statusCode === 400 ? new ResponseObject().badRequest(error.message)
           : new ResponseObject().serverError('Failed to read document content');
       return reply.code(r.statusCode).send(r.getResponse());
+    }
+  });
+
+  // ── A document as a file, and a selection of them as one archive ──────────
+  // What a file manager would be handed: a stored file's own bytes under its
+  // own name, and for the rest the same rendering the WebDAV mount serves
+  // (note → .note.md, link/tab → .url, e-mail → .eml, anything else → .json).
+  // Both accept the media-ticket cookie, because a browser download and a
+  // drag out of the page cannot send an Authorization header.
+
+  const ARCHIVE_MAX_DOCUMENTS = 1000;
+
+  async function documentAsFile(workspace, doc, name) {
+    const content = await resolveDocContent(workspace, doc, name);
+    // A file with no reachable copy must fail, never arrive as its JSON record
+    // under the file's name.
+    if (!content.stream && doc.schema === 'data/schema/file') throw httpError(404, `No reachable copy of "${name}"`);
+    return content;
+  }
+
+  function fileRouteError(fastify, reply, error, fallback) {
+    fastify.log.error(error);
+    const r = error.statusCode === 404 ? new ResponseObject().notFound(error.message)
+      : error.statusCode === 400 ? new ResponseObject().badRequest(error.message)
+        : new ResponseObject().serverError(fallback);
+    return reply.code(r.statusCode).send(r.getResponse());
+  }
+
+  fastify.get('/:docId/file', {
+    onRequest: [authenticateContent],
+    schema: { params: { type: 'object', required: ['id', 'docId'], properties: { id: { type: 'string' }, docId: { type: 'string' } } } },
+  }, async (request, reply) => {
+    try {
+      const workspace = await getWorkspaceInstance(request, reply);
+      if (!workspace) return reply;
+
+      let documentId;
+      try { documentId = parseDocumentId(request.params.docId, 'Document ID parameter'); }
+      catch (e) { const r = new ResponseObject().badRequest(e.message); return reply.code(r.statusCode).send(r.getResponse()); }
+
+      const doc = await workspace.get(documentId);
+      if (!doc) { const r = new ResponseObject().notFound('Document not found'); return reply.code(r.statusCode).send(r.getResponse()); }
+
+      const name = docName(doc);
+      const content = await documentAsFile(workspace, doc, name);
+      reply.header('Content-Type', docContentType(doc, name));
+      reply.header('Content-Disposition', attachmentDisposition(name));
+      reply.header('Cache-Control', 'private, no-store');
+      if (Number.isFinite(content.size)) reply.header('Content-Length', content.size);
+      return reply.send(content.stream || content.buffer);
+    } catch (error) {
+      return fileRouteError(fastify, reply, error, 'Failed to read document as a file');
+    }
+  });
+
+  fastify.get('/archive', {
+    onRequest: [authenticateContent],
+    schema: {
+      params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
+      querystring: {
+        type: 'object',
+        required: ['ids'],
+        properties: {
+          ids: { type: 'string', description: 'Comma-separated document ids' },
+          name: { type: 'string', description: 'Archive file name without the extension' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const workspace = await getWorkspaceInstance(request, reply);
+      if (!workspace) return reply;
+
+      let ids;
+      try { ids = [...new Set(parseDocumentIdArray(request.query.ids.split(',').filter(Boolean), 'ids'))]; }
+      catch (e) { const r = new ResponseObject().badRequest(e.message); return reply.code(r.statusCode).send(r.getResponse()); }
+      if (ids.length === 0 || ids.length > ARCHIVE_MAX_DOCUMENTS) {
+        const r = new ResponseObject().badRequest(`ids must name 1 to ${ARCHIVE_MAX_DOCUMENTS} documents`);
+        return reply.code(r.statusCode).send(r.getResponse());
+      }
+
+      const docs = [];
+      for (const id of ids) {
+        const doc = await workspace.get(id);
+        if (!doc) { const r = new ResponseObject().notFound(`Document ${id} not found`); return reply.code(r.statusCode).send(r.getResponse()); }
+        docs.push(doc);
+      }
+      const files = docEntries(docs);
+      if (files.reduce((sum, file) => sum + file.size, 0) > ZIP_MAX_BYTES - 1024 * files.length) {
+        const r = new ResponseObject().error('The selection is larger than a 4 GiB archive can hold', null, 413);
+        return reply.code(413).send(r.getResponse());
+      }
+
+      // Entries open one at a time, as the archive reaches them. A document
+      // that fails to read ends the stream, so the download fails rather than
+      // completing without it.
+      async function* entries() {
+        for (const file of files) {
+          const content = await documentAsFile(workspace, file.doc, file.name);
+          yield { name: file.name, mtime: file.mtime, content: content.stream || content.buffer };
+        }
+      }
+
+      const archive = String(request.query.name || '').replace(/[\\/:*?"<>|]/g, ' ').trim() || 'canvas-documents';
+      reply.header('Content-Type', 'application/zip');
+      reply.header('Content-Disposition', attachmentDisposition(`${archive}.zip`));
+      reply.header('Cache-Control', 'private, no-store');
+      return reply.send(Readable.from(zipStream(entries()), { objectMode: false }));
+    } catch (error) {
+      return fileRouteError(fastify, reply, error, 'Failed to build the archive');
     }
   });
 

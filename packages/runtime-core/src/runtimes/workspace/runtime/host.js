@@ -22,6 +22,7 @@ import webdavRoutes from '../../../transports/routes/webdav.js';
 import registerWorkspace from '../../../transports/websocket/channels/workspace.js';
 import registerContext from '../../../transports/websocket/channels/context.js';
 import { enforceWorkspaceTokenScope } from '../../../transports/middleware/workspace-acl.js';
+import { MEDIA_TICKET_SUFFIX } from '../../../transports/lib/media-ticket.js';
 import { resolveAclAccess, shareKeyGrant } from '../security/access.js';
 import { isHubCredential, verifyHubCredential } from '../../../utils/hub-credential.js';
 import { writePrivateJsonSync } from '../../../utils/private-file.js';
@@ -146,10 +147,10 @@ export async function createWorkspaceHost({ root, name, ownerId = null, inferd =
   app.decorate('authenticate', authenticate); app.decorate('authenticateClient', authenticate);
   app.addHook('onRequest', async (req, reply) => {
     const url = req.url.split('?')[0];
-    // Only the content route accepts media tickets; its onRequest validates
-    // the cookie before the shared scope checks and document ACL checks run.
+    // The media-ticket routes validate the cookie in their own onRequest,
+    // before the shared scope checks and document ACL checks run.
     const mediaContent = ['GET', 'HEAD'].includes(req.method)
-      && /^\/rest\/v2\/workspaces\/[^/]+\/documents\/\d+\/content$/.test(url);
+      && MEDIA_TICKET_SUFFIX.test(url.replace(/^\/rest\/v2\/workspaces\/[^/]+/, ''));
     if (url.startsWith('/rest/v2/') && !PUBLIC_ROUTES.includes(url) && !mediaContent) {
       await authenticate(req, reply);
       if (!reply.sent) await enforceWorkspaceTokenScope(req, reply);

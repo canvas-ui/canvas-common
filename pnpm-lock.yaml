@@ -18,8 +18,8 @@ importers:
         specifier: github:canvas-ui/canvas-synapsd#main
         version: https://codeload.github.com/canvas-ui/canvas-synapsd/tar.gz/770a1dd5482417ebbfbd62f90b88b6a14da49efb(@types/node@26.6.4)
       '@augmentd-labs/canvas-web':
-        specifier: ^2.29.4
-        version: 2.29.4
+        specifier: ^2.29.5
+        version: 2.29.5
       '@canvas-local/undici':
         specifier: npm:undici@^6.21.3
         version: undici@6.29.0
@@ -166,8 +166,8 @@ importers:
         specifier: github:canvas-ui/canvas-synapsd#main
         version: https://codeload.github.com/canvas-ui/canvas-synapsd/tar.gz/770a1dd5482417ebbfbd62f90b88b6a14da49efb(@types/node@26.6.4)
       '@augmentd-labs/canvas-web':
-        specifier: ^2.29.4
-        version: 2.29.4
+        specifier: ^2.29.5
+        version: 2.29.5
       '@fastify/error':
         specifier: ^3.4.1
         version: 3.4.1
@@ -369,8 +369,8 @@ packages:
   '@augmentd-labs/canvas-web@2.15.0':
     resolution: {integrity: sha512-PSmxpltIDOsQt1JmKDKOrrAIbYOEBQGUcaYoygKteSuBgPwlGIghMtskhZqxYNwI0Me9ipSIGAuxWnP04Sm64w==}
 
-  '@augmentd-labs/canvas-web@2.29.4':
-    resolution: {integrity: sha512-JZfGoGnqjTHsbSPvTNEcgvx1h+XlnNizWRxSAzx8fpIOlbF7ac/Umf4pz1erOPtLpAeC9ZPEff29OcjzazaomA==}
+  '@augmentd-labs/canvas-web@2.29.5':
+    resolution: {integrity: sha512-4780Dtm/l7mkiR66RI9QWwgajBAJ8PUr81aYUt4gcO6Hy+s68kbsyPlxdCes8ewcIsCyuiEOdYm53doZHiMTvg==}
 
   '@aws-sdk/checksums@3.1001.3':
     resolution: {integrity: sha512-CcAkVyEUKGngbEqJdVdSc53Iy52+XzVL5NIcTen2BlK8UByNC1DThVtf5VKSrNzyA+SqyTvs+3S+knVBbOUizQ==}
@@ -3225,7 +3225,7 @@ snapshots:
 
   '@augmentd-labs/canvas-web@2.15.0': {}
 
-  '@augmentd-labs/canvas-web@2.29.4': {}
+  '@augmentd-labs/canvas-web@2.29.5': {}
 
   '@aws-sdk/checksums@3.1001.3':
     dependencies:
