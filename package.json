@@ -25,7 +25,7 @@
     "globals": "^16.5.0",
     "prettier": "^3.6.2"
   },
-  "version": "0.3.73",
+  "version": "0.3.74",
   "exports": {
     "./*": "./packages/runtime-core/src/*",
     "./host": "./packages/runtime-core/src/runtimes/workspace/runtime/host.js"
@@ -47,7 +47,7 @@
   "dependencies": {
     "@augmentd-labs/canvas-protocol": "^0.5.1",
     "@augmentd-labs/canvas-synapsd": "github:canvas-ui/canvas-synapsd#main",
-    "@augmentd-labs/canvas-web": "^2.29.7",
+    "@augmentd-labs/canvas-web": "^2.29.8",
     "@fastify/error": "^3.4.1",
     "@fastify/jwt": "^7.2.4",
     "@fastify/static": "^6.12.0",
