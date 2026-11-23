@@ -26,6 +26,8 @@ export async function readSendReceipt(root, requestId, principal) {
 
 // A durable send fence, not an automatic retry queue. SMTP cannot promise
 // exactly-once delivery after a timeout. Never repeat an ambiguous attempt.
+// `deliver` marks a failure it knows sent nothing with `notSent` (the reason):
+// that attempt leaves no fence, so it can be corrected and sent again.
 export async function sendOnce(root, requestId, input, deliver) {
     if (!/^[\w-]{16,128}$/.test(requestId || '')) throw messageError('A stable requestId (16–128 letters, digits, _ or -) is required');
     const key = crypto.createHash('sha256').update(requestId).digest('hex');
@@ -49,7 +51,12 @@ export async function sendOnce(root, requestId, input, deliver) {
     await syncDirectory(root);
     let result;
     try { result = { ...await deliver(), requestId }; }
-    catch {
+    catch (error) {
+        if (error?.notSent) {
+            await fs.rm(target, { force: true });
+            await syncDirectory(root);
+            throw messageError(`Not sent: ${error.notSent}. Nothing left Canvas, so it is safe to correct this and send again.`, 422);
+        }
         result = { status: 'unknown', requestId, message: 'Delivery could not be confirmed. Check the conversation before starting a new send.' };
     }
     const temp = `${target}.${crypto.randomUUID()}.tmp`;

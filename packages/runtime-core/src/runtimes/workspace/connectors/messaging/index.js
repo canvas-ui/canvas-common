@@ -66,9 +66,16 @@ export async function sendWorkspaceMessage(workspace, mail, connectors, input, p
         principal: principal.id || 'user',
     };
     return sendOnce(path.join(workspace.varPath, 'message-outbox'), input.requestId, normalized, async () => {
-        const sent = driver === 'imap'
-            ? await deliverEmail(config, prepared)
-            : await instance.sendMessage(prepared, input.requestId);
+        let sent;
+        try {
+            sent = driver === 'imap'
+                ? await deliverEmail(config, prepared)
+                : await instance.sendMessage(prepared, input.requestId);
+        } catch (error) {
+            logger.warn({ err: error, workspaceId: workspace.id, driver, address, requestId: input.requestId, notSent: error?.notSent || null },
+                error?.notSent ? 'Message not sent' : 'Message delivery unconfirmed');
+            throw error;
+        }
         const result = { status: sent.status, providerMessageId: sent.providerMessageId, driver, address,
             ...(sent.warnings ? { warnings: sent.warnings } : {}),
             ...(sent.accepted ? { accepted: sent.accepted, rejected: sent.rejected } : {}) };

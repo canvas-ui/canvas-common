@@ -2,6 +2,7 @@ import { messageImages } from './images.js';
 import { MAX_FILE_BYTES } from './files.js';
 import nodemailer from 'nodemailer';
 import addressparser from 'nodemailer/lib/addressparser/index.js';
+import SMTPConnection from 'nodemailer/lib/smtp-connection/index.js';
 import crypto from 'node:crypto';
 import { convert as htmlToText } from 'html-to-text';
 import { messageError } from './outbox.js';
@@ -180,17 +181,58 @@ export async function prepareEmail(config, input, parent = null, { loadAttachmen
     return { raw: built.message, envelope: { from: own, to: recipients }, messageId, to, cc, subject };
 }
 
-export async function deliverEmail(config, prepared) {
+/**
+ * Why an SMTP attempt that failed in `stage` did not hand the message over, or
+ * null when it may have. Before the envelope is sent nothing has left; after
+ * that only an explicit refusal by the server (a response code) is certain. A
+ * connection lost while the message is in flight is not: the server may have
+ * taken it without its confirmation arriving.
+ */
+export function smtpNotSent(error, stage, smtp) {
+    // eslint-disable-next-line no-control-regex
+    const said = String(error?.response || '').replace(/[\x00-\x1f\x7f]+/g, ' ').trim().slice(0, 300);
+    const detail = said || String(error?.message || error?.code || 'unknown error').slice(0, 300);
+    if (stage === 'connect') return `could not connect to ${smtp.host}:${smtp.port} (${detail})`;
+    if (stage === 'login') return `the mail server rejected the login for ${smtp.user} (${detail})`;
+    if (Number.isInteger(error?.responseCode) || error?.code === 'EENVELOPE') return `the mail server refused the message (${detail})`;
+    return null;
+}
+
+/**
+ * One SMTP delivery. A failure that is known not to have sent anything throws
+ * with `notSent` set to the reason; any other failure is ambiguous.
+ */
+export async function deliverEmail(config, prepared, { Connection = SMTPConnection } = {}) {
     const smtp = config.smtp;
-    const transport = nodemailer.createTransport({
+    const connection = new Connection({
         host: smtp.host, port: smtp.port, secure: smtp.secure,
         requireTLS: !smtp.secure,
-        ...(smtp.user ? { auth: { user: smtp.user, pass: smtp.password } } : {}),
         connectionTimeout: 15000, greetingTimeout: 15000, socketTimeout: 30000,
-        disableFileAccess: true, disableUrlAccess: true,
     });
+    // The connection reports a failure through the pending callback or as an
+    // event, depending on where it happens: whichever comes first settles the step.
+    let fail = null;
+    connection.on('error', (error) => fail?.(error));
+    connection.on('end', () => fail?.(new Error('The mail server closed the connection')));
+    const step = (run) => new Promise((resolve, reject) => {
+        fail = reject;
+        run((error, value) => (error ? reject(error) : resolve(value)));
+    });
+    let stage = 'connect';
     try {
-        const info = await transport.sendMail({ raw: prepared.raw, envelope: prepared.envelope });
+        await step((done) => connection.connect(done));
+        if (smtp.user) {
+            stage = 'login';
+            await step((done) => connection.login({ user: smtp.user, pass: smtp.password }, done));
+        }
+        stage = 'send';
+        const info = await step((done) => connection.send(prepared.envelope, prepared.raw, done));
         return { status: 'accepted', providerMessageId: prepared.messageId, accepted: info.accepted || [], rejected: info.rejected || [] };
-    } finally { transport.close(); }
+    } catch (error) {
+        const notSent = smtpNotSent(error, stage, smtp);
+        throw notSent ? Object.assign(error, { notSent }) : error;
+    } finally {
+        fail = null;
+        connection.close();
+    }
 }

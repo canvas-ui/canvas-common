@@ -65,7 +65,7 @@ export default async function messageRoutes(app) {
             rateLimit: { max: 20, timeWindow: '1 minute' },
             mcp: {
                 name: 'message_send',
-                description: 'Send a message to people outside Canvas through a connected e-mail, Slack or WhatsApp account, or reply to a message document. This communicates externally as that account, so use it only when the user asked for it. For a new message give driver, address and the recipients (to for e-mail, target for Slack and WhatsApp); for a reply give replyToDocumentId and the account and thread are resolved for you. "accepted" in the answer means the provider took the message, not that it was delivered.',
+                description: 'Send a message to people outside Canvas through a connected e-mail, Slack or WhatsApp account, or reply to a message document. This communicates externally as that account, so use it only when the user asked for it. For a new message give driver, address and the recipients (to for e-mail, target for Slack and WhatsApp); for a reply give replyToDocumentId and the account and thread are resolved for you. "accepted" in the answer means the provider took the message, not that it was delivered. An error starting with "Not sent" means nothing went out: fix what it names and send again with the same requestId. "unknown" means it may have gone out: check with message_send_status, never resend.',
                 args: {
                     ...arg.workspace,
                     requestId: { description: 'A new UUID for this message. After a timeout or error, retry with the same requestId so the message is not sent twice.' },
