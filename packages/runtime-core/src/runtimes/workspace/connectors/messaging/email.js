@@ -207,6 +207,8 @@ export async function deliverEmail(config, prepared, { Connection = SMTPConnecti
     const connection = new Connection({
         host: smtp.host, port: smtp.port, secure: smtp.secure,
         requireTLS: !smtp.secure,
+        // The account's certificate setting covers its SMTP server too, read as ImapBackend reads it.
+        tls: { rejectUnauthorized: config.allowSelfSigned === false },
         connectionTimeout: 15000, greetingTimeout: 15000, socketTimeout: 30000,
     });
     // The connection reports a failure through the pending callback or as an
