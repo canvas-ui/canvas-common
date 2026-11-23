@@ -25,6 +25,22 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
  * config: { host, port=993, tls=true, allowSelfSigned=false, user, password,
  *           folder='INBOX', account?, pollInterval?, initialSyncDays?, lastUid? }
  */
+const SENT_FOLDER_NAMES = ['sent', 'sent items', 'sent messages', 'sent mail'];
+
+/**
+ * The folder path a sent message belongs in: `preferred` when the account has
+ * it, else the folder the server marks \Sent (RFC 6154), else one with a
+ * usual name. Null when the account has none of these.
+ */
+export function sentFolderOf(folders, preferred = '') {
+    const usable = folders.filter((folder) => folder.selectable !== false);
+    const wanted = String(preferred || '').trim().toLowerCase();
+    const found = (wanted && usable.find((folder) => folder.path.toLowerCase() === wanted))
+        || usable.find((folder) => (folder.attributes || []).some((a) => String(a).toLowerCase() === '\\sent'))
+        || usable.find((folder) => SENT_FOLDER_NAMES.includes(folder.name.toLowerCase()));
+    return found?.path || null;
+}
+
 export default class ImapBackend extends StorageBackend {
     #pollTimer = null;
     #lastUid = 0;
@@ -135,10 +151,28 @@ export default class ImapBackend extends StorageBackend {
         }));
     }
 
-    async appendSent(raw, folder) {
-        return this.#withConnection((imap) => new Promise((resolve, reject) => {
-            imap.append(raw, { mailbox: folder, flags: ['\\Seen'] }, (error, uid) => error ? reject(error) : resolve(uid || null));
-        }));
+    /**
+     * Save a sent message to the account's Sent folder (see sentFolderOf).
+     * Resolves with the folder used and the message's UID there, when the
+     * server reports one. Without a Sent folder it rejects with `noSentFolder`
+     * and the names of the folders the account does have.
+     */
+    async appendSent(raw, preferred) {
+        return this.#withConnection(async (imap) => {
+            const folders = await new Promise((resolve, reject) => {
+                imap.getBoxes((error, boxes) => (error ? reject(error) : resolve(this.#flattenBoxes(boxes))));
+            });
+            const folder = sentFolderOf(folders, preferred);
+            if (!folder) {
+                throw Object.assign(new Error('The IMAP account has no Sent folder'), {
+                    noSentFolder: true, folders: folders.filter((f) => f.selectable).map((f) => f.path),
+                });
+            }
+            const uid = await new Promise((resolve, reject) => {
+                imap.append(raw, { mailbox: folder, flags: ['\\Seen'] }, (error, id) => (error ? reject(error) : resolve(id || null)));
+            });
+            return { folder, uid };
+        });
     }
 
     async delete(key) {

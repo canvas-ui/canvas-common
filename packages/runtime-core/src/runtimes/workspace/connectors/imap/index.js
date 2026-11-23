@@ -1149,12 +1149,20 @@ export class WorkspaceMailIndex extends EventEmitter {
 
     async storeSentMessage(config, raw, { provenance, fileDeliveryRules } = {}) {
         let uid = null;
+        let sentFolder = null;
         const warnings = [];
-        const folder = config.smtp.sentFolder || 'Sent';
-        if (config.smtp.appendSent) {
-            try { uid = await new ImapBackend('sent-copy', this.#resolveCredentials(config)).appendSent(raw, folder); }
-            catch { warnings.push('Message accepted, but saving a copy to the IMAP Sent folder failed.'); }
+        if (config.smtp.sentCopy !== false) {
+            try {
+                const saved = await new ImapBackend('sent-copy', this.#resolveCredentials(config)).appendSent(raw, config.smtp.sentFolder);
+                uid = saved.uid;
+                sentFolder = saved.folder;
+            } catch (error) {
+                warnings.push(error?.noSentFolder
+                    ? `Message sent, but no copy was saved on the mail server: the account has no Sent folder. Name one under "Sent folder" in the account's settings${error.folders?.length ? ` (it has: ${error.folders.slice(0, 20).join(', ')})` : ''}.`
+                    : `Message sent, but saving a copy to the IMAP Sent folder failed: ${String(error?.message || error).slice(0, 200)}`);
+            }
         }
+        const folder = sentFolder || config.smtp.sentFolder || 'Sent';
         const item = await this.#prepareMessage({ raw, account: config.account || config.user, folder, uid });
         if (!uid) item.emailDoc.locations = item.emailDoc.locations.filter((l) => !l.url.startsWith('imap://'));
         item.emailDoc.metadata.outgoing = true;
@@ -1165,7 +1173,7 @@ export class WorkspaceMailIndex extends EventEmitter {
             features: item.features, emitEvent: true, ...(provenance ? { provenance } : {}),
         });
         await this.#linkThread(docId, item.emailDoc.data);
-        return { docId, warnings };
+        return { docId, warnings, ...(sentFolder ? { sentFolder } : {}) };
     }
 
     async listMailboxes() {

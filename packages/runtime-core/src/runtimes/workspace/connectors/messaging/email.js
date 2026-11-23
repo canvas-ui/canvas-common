@@ -27,8 +27,10 @@ export function normalizeSmtp(input = {}, previous = {}) {
         host: String(smtp.host || '').trim(), port: Number(smtp.port || 587),
         secure: smtp.secure === true, user: String(smtp.user || '').trim(),
         password: typeof smtp.password === 'string' ? smtp.password : '',
-        from: String(smtp.from || '').trim(), sentFolder: String(smtp.sentFolder || 'Sent').trim(),
-        appendSent: smtp.appendSent === true,
+        from: String(smtp.from || '').trim(),
+        // A copy of each sent message goes to the account's IMAP Sent folder:
+        // `sentFolder` when the server has it, otherwise the one it marks as Sent.
+        sentCopy: smtp.sentCopy !== false, sentFolder: String(smtp.sentFolder || '').trim(),
     };
     if (!Number.isInteger(out.port) || out.port < 1 || out.port > 65535) throw messageError('Invalid SMTP port');
     if (out.enabled && (!out.host || emailAddresses(out.from).length !== 1 || !/^[^\s@]+@[^\s@]+$/.test(emailAddresses(out.from)[0] || ''))) throw messageError('SMTP host and one From address are required');
