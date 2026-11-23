@@ -179,8 +179,21 @@ export async function prepareEmail(config, input, parent = null, { loadAttachmen
         ...(parentId ? { inReplyTo: parentId, references } : {}),
         disableFileAccess: true, disableUrlAccess: true,
     };
-    const built = await nodemailer.createTransport({ streamTransport: true, buffer: true, newline: 'windows' }).sendMail(mail);
+    const transport = nodemailer.createTransport({ streamTransport: true, buffer: true, newline: 'windows' });
+    transport.use('stream', (composed, done) => { quoteFilenames(composed.message); done(); });
+    const built = await transport.sendMail(mail);
     return { raw: built.message, envelope: { from: own, to: recipients }, messageId, to, cc, subject };
+}
+
+// nodemailer leaves a file name without special characters unquoted
+// (`filename=invoice.pdf`). That is valid, but mail clients always quote it and
+// some intake systems only recognise an attachment by the quoted form.
+function quoteFilenames(node) {
+    if (node.filename) {
+        const buildHeaders = node.buildHeaders.bind(node);
+        node.buildHeaders = () => buildHeaders().replace(/\b((?:file)?name)=([^\s";]+)/g, '$1="$2"');
+    }
+    for (const child of node.childNodes || []) quoteFilenames(child);
 }
 
 /**
